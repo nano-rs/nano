@@ -22,6 +22,7 @@ mod sql_transform;
 // NAN-5445: enterprise-only (stripped from the mirror).
 #[cfg(feature = "enterprise")]
 mod storage_tiering;
+mod ttl_recalc;
 mod ttl_repair;
 mod tracking;
 mod types;
@@ -63,6 +64,9 @@ pub use dict_source_user::{
 pub use prevalence_cadence::prevalence_refresh_minutes_from_env;
 #[cfg(feature = "enterprise")]
 pub use storage_tiering::StorageTieringOutcome;
+pub use ttl_recalc::{
+    plan_ttl_recalculate_only, report_ttl_recalc, TtlRecalcOutcome, TTL_RECALC_HEALTH_KEY, TTL_RECALC_TABLES,
+};
 pub use ttl_repair::{
     plan_ttl_repairs, report_ttl_repairs, saved_settings_retention, TtlRepair, TtlRepairInput, TtlRepairOutcome, TTL_REPAIR_MARKER,
     TTL_RESTORED_HEALTH_KEY,

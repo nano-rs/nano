@@ -3,7 +3,8 @@
 // and fields pass through unchanged. Plus the caps.
 import { describe, expect, it } from 'vitest';
 import {
-  createGate, FILTERED, issueKey, memoryCounterStore, scrubCrumb, scrubLog, scrubPayload, scrubText,
+  createGate, FILTERED, issueKey, memoryCounterStore, scrubCrumb, scrubLog, scrubPayload,
+  scrubReplayRecordingEvent, scrubText,
   type SentryPayload,
 } from './scrub';
 
@@ -102,6 +103,33 @@ describe('payload paths', () => {
     expect(log.message).toBe(`rate limited alice, Cookie: ${FILTERED}`);
     expect(log.attributes?.user).toBe('alice');
   });
+
+  it('replay recording events scrub URLs, tokens, JWTs, headers, and secret keys', () => {
+    const rec = scrubReplayRecordingEvent({
+      type: 5,
+      timestamp: 1700000000,
+      data: {
+        tag: 'breadcrumb',
+        payload: {
+          category: 'navigation',
+          message: 'GET /api/oidc/callback?token=tok999&page=2 with nit_ABCDEFGHIJ0123456789',
+          data: {
+            from: '/login?code=c0de123',
+            to: '/hunts?tab=findings',
+            authorization: 'Bearer abcdefghijklmnop',
+            jwt: 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcdefghijk',
+            note: 'jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcdefghijk',
+          },
+        },
+      },
+    });
+    const text = JSON.stringify(rec);
+    for (const secret of ['tok999', 'nit_ABCDEFGHIJ', 'c0de123', 'abcdefghijklmnop', 'eyJhbGci']) {
+      expect(text, secret).not.toContain(secret);
+    }
+    expect(text).toContain('/hunts?tab=findings');
+    expect(text).toContain('page=2');
+  });
 });
 
 describe('gate', () => {
@@ -132,5 +160,18 @@ describe('gate', () => {
     expect(g.log({ message: 'a', attributes: {} })?.attributes).toMatchObject({ run_id: 'run-1' });
     expect(g.log({ message: 'b' })).not.toBeNull();
     expect(g.log({ message: 'c' })).toBeNull();
+  });
+
+  it('caps error-only replays per session (default 3) and skips benign noise', () => {
+    const store = memoryCounterStore();
+    const g = gate({ store });
+    expect(g.replay(err('ResizeObserver loop completed with undelivered notifications.'))).toBe(false);
+    expect(store.get('replays')).toBe(0);
+    expect(g.replay(err('real crash 1'))).toBe(true);
+    expect(g.replay(err('real crash 2'))).toBe(true);
+    expect(g.replay(err('real crash 3'))).toBe(true);
+    expect(g.replay(err('real crash 4'))).toBe(false);
+    // Persisted counter survives page reload within the same browser session.
+    expect(gate({ store }).replay(err('after reload'))).toBe(false);
   });
 });

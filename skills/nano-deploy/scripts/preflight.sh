@@ -209,7 +209,7 @@ needs_avx2=0
 [[ ",$roles," == *,clickhouse,* || ",$roles," == *,keeper,* ]] && needs_avx2=1
 if [[ "$(uname -m)" == x86_64 && $needs_avx2 == 1 ]]; then
     if grep -qw avx2 /proc/cpuinfo 2>/dev/null; then row avx2 PASS "AVX2 present (required by ClickHouse/Keeper)"
-    else row avx2 FAIL "no AVX2: ClickHouse 26.6+ needs it (on Proxmox/VMware set CPU type host or x86-64-v3)"; fi
+    else row avx2 FAIL "no AVX2: ClickHouse 26.6+ needs it (on Proxmox/VMware set CPU type host; x86-64-v3 lacks pclmulqdq)"; fi
 fi
 
 # --- memory (smallest of physical and cgroup limit) ------------------------

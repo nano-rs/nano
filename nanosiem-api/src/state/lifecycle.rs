@@ -209,7 +209,7 @@ impl AppState {
             let mut backoff_secs = 1u64;
 
             loop {
-                let mut listener = match sqlx::postgres::PgListener::connect_with(&pool).await {
+                let mut listener = match nanosiem_core::db::listener::dedicated_listener(&pool).await {
                     Ok(l) => {
                         backoff_secs = 1;
                         l
@@ -241,7 +241,7 @@ impl AppState {
 
                 loop {
                     match tokio::time::timeout(
-                        tokio::time::Duration::from_secs(300),
+                        nanosiem_core::db::listener::LISTENER_KEEPALIVE,
                         listener.recv(),
                     )
                     .await
@@ -276,11 +276,21 @@ impl AppState {
                             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                             break;
                         }
+                        // NAN-5957 review: an idle keepalive checks the
+                        // session in place instead of dropping and reopening
+                        // the listener (which held two sessions for a
+                        // moment, on every replica at once).
                         Err(_) => {
-                            tracing::debug!(
-                                "PgListener case_changes keepalive timeout, reconnecting"
-                            );
-                            break;
+                            if let Err(e) =
+                                nanosiem_core::db::listener::ping(&mut listener).await
+                            {
+                                tracing::warn!(
+                                    "PgListener case_changes keepalive failed: {}, reconnecting",
+                                    e
+                                );
+                                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                                break;
+                            }
                         }
                     }
                 }

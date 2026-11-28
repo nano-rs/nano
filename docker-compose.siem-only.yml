@@ -60,6 +60,14 @@ x-agentlane-base-env: &agentlane-base-env
   NANO_AGENTLANE_NODE_URLS: ${NANO_AGENTLANE_NODE_URLS:-}
   NANO_AGENTLANE_MAX_ACTIVE_TOKENS_OVERRIDE: ${NANO_AGENTLANE_MAX_ACTIVE_TOKENS_OVERRIDE:-}
 
+# NAN-5948: read by nano-api and nano-jobs, same meaning as in
+# docker-compose.opensource.yml (x-nano-vector-render-env). This stack ships no
+# Vector, but a Vector you run elsewhere can still fetch config from nano-api:
+# "true" lets one with no nano release label (an upstream or custom build)
+# install it. Off by default.
+x-nano-custom-vector-env: &nano-custom-vector-env
+  NANO_ALLOW_CUSTOM_VECTOR: ${NANO_ALLOW_CUSTOM_VECTOR:-false}
+
 services:
   postgres:
     # Pinned by digest (NAN-1258): a tag alone (`postgres:17`) can be silently
@@ -355,7 +363,7 @@ services:
     security_opt:
       - no-new-privileges:true
     environment:
-      <<: *agentlane-base-env
+      <<: [*agentlane-base-env, *nano-custom-vector-env]
       DATABASE_URL: postgres://${POSTGRES_USER:-nanosiem}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-nanosiem}
       PG_MAX_CONNECTIONS: ${NANO_API_PG_MAX_CONNECTIONS:-${PG_MAX_CONNECTIONS:-14}}
       PG_MIN_CONNECTIONS: ${PG_MIN_CONNECTIONS:-2}
@@ -479,11 +487,15 @@ services:
     image: ${NANO_IMAGE_PREFIX:-ghcr.io/nano-rs/nano}-jobs:${NANO_VERSION:?NANO_VERSION is required (install.sh sets it from the images lock)}
     container_name: nano-jobs
     restart: unless-stopped
+    # NAN-6046: the jobs shutdown drains running detection rules for up to
+    # 30 s, then releases their claims. Docker's default 10 s killed it first
+    # and the next start read each running rule as a crash ("[crash?]").
+    stop_grace_period: 45s
     logging: *verbose-logging
     security_opt:
       - no-new-privileges:true
     environment:
-      <<: *agentlane-base-env
+      <<: [*agentlane-base-env, *nano-custom-vector-env]
       DATABASE_URL: postgres://${POSTGRES_USER:-nanosiem}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-nanosiem}
       PG_MAX_CONNECTIONS: ${NANO_JOBS_PG_MAX_CONNECTIONS:-${PG_MAX_CONNECTIONS:-16}}
       PG_MIN_CONNECTIONS: ${PG_MIN_CONNECTIONS:-2}

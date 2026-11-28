@@ -8,6 +8,7 @@ import {
   applyCsp,
   assertInlineScriptsAllowed,
   extractInlineScripts,
+  isSentryReplayBuildEnabled,
   scriptSrcOf,
   sentryConnectOrigin,
 } from './csp';
@@ -75,5 +76,39 @@ describe('sentry connect-src', () => {
     expect(html).toContain("connect-src 'self' https://o1.ingest.us.sentry.io;");
     expect(html).not.toContain('publickey');
     expect(applyCsp(indexHtml, false)).toContain("connect-src 'self';");
+  });
+
+  it('adds worker-src blob: strictly in Replay-enabled builds and leaves customer CSP byte-identical', () => {
+    const origins = sentryConnectOrigin('https://publickey@o1.ingest.us.sentry.io/42');
+    const customerHtml = applyCsp(indexHtml, false);
+    const dsnOnlyHtml = applyCsp(indexHtml, false, origins, false);
+    const replayOnHtml = applyCsp(indexHtml, false, origins, true);
+
+    expect(customerHtml).not.toContain('worker-src');
+    expect(dsnOnlyHtml).not.toContain('worker-src');
+    expect(applyCsp(indexHtml, false, [], false)).toBe(customerHtml);
+    expect(replayOnHtml).toContain("worker-src 'self' blob:;");
+  });
+
+  it('gates build-time Replay strictly on DSN, flag=1, and explicit internal/e2e environment', () => {
+    const dsn = 'https://publickey@o1.ingest.us.sentry.io/42';
+    expect(isSentryReplayBuildEnabled({})).toBe(false);
+    expect(isSentryReplayBuildEnabled({ VITE_NANO_SENTRY_DSN: dsn, VITE_NANO_SENTRY_REPLAY: '1' })).toBe(false);
+    expect(isSentryReplayBuildEnabled({ VITE_NANO_SENTRY_DSN: dsn, VITE_NANO_SENTRY_REPLAY: '1', VITE_NANO_SENTRY_ENVIRONMENT: '' })).toBe(false);
+    expect(isSentryReplayBuildEnabled({ VITE_NANO_SENTRY_DSN: dsn, VITE_NANO_SENTRY_REPLAY: '1', VITE_NANO_SENTRY_ENVIRONMENT: 'production' })).toBe(false);
+    expect(isSentryReplayBuildEnabled({ VITE_NANO_SENTRY_DSN: dsn, VITE_NANO_SENTRY_REPLAY: '1', VITE_NANO_SENTRY_ENVIRONMENT: 'customer' })).toBe(false);
+    expect(isSentryReplayBuildEnabled({ VITE_NANO_SENTRY_DSN: dsn, VITE_NANO_SENTRY_REPLAY: '1', VITE_NANO_SENTRY_ENVIRONMENT: 'staging' })).toBe(false);
+    expect(isSentryReplayBuildEnabled({ VITE_NANO_SENTRY_DSN: dsn, VITE_NANO_SENTRY_REPLAY: '1', VITE_NANO_SENTRY_ENVIRONMENT: 'tenant' })).toBe(false);
+    expect(isSentryReplayBuildEnabled({ VITE_NANO_SENTRY_DSN: dsn, VITE_NANO_SENTRY_REPLAY: '0', VITE_NANO_SENTRY_ENVIRONMENT: 'e2e' })).toBe(false);
+    expect(isSentryReplayBuildEnabled({ VITE_NANO_SENTRY_DSN: dsn, VITE_NANO_SENTRY_REPLAY: '1', VITE_NANO_SENTRY_ENVIRONMENT: 'e2e' })).toBe(true);
+    expect(isSentryReplayBuildEnabled({ VITE_NANO_SENTRY_DSN: dsn, VITE_NANO_SENTRY_REPLAY: '1', VITE_NANO_SENTRY_ENVIRONMENT: 'internal' })).toBe(true);
+    expect(isSentryReplayBuildEnabled({ VITE_NANO_SENTRY_DSN: dsn, VITE_NANO_SENTRY_REPLAY: '1', VITE_NANO_SENTRY_ENVIRONMENT: 'local' })).toBe(true);
+    // Explicit rate <= 0 disables build-time Replay and CSP worker-src too.
+    expect(isSentryReplayBuildEnabled({ VITE_NANO_SENTRY_DSN: dsn, VITE_NANO_SENTRY_REPLAY: '1', VITE_NANO_SENTRY_ENVIRONMENT: 'e2e', VITE_NANO_SENTRY_REPLAY_ON_ERROR_RATE: '0' })).toBe(false);
+    expect(isSentryReplayBuildEnabled({ VITE_NANO_SENTRY_DSN: dsn, VITE_NANO_SENTRY_REPLAY: '1', VITE_NANO_SENTRY_ENVIRONMENT: 'e2e', VITE_NANO_SENTRY_REPLAY_ON_ERROR_RATE: '0.0' })).toBe(false);
+    expect(isSentryReplayBuildEnabled({ VITE_NANO_SENTRY_DSN: dsn, VITE_NANO_SENTRY_REPLAY: '1', VITE_NANO_SENTRY_ENVIRONMENT: 'e2e', VITE_NANO_SENTRY_REPLAY_ON_ERROR_RATE: '-0.25' })).toBe(false);
+    expect(isSentryReplayBuildEnabled({ VITE_NANO_SENTRY_DSN: dsn, VITE_NANO_SENTRY_REPLAY: '1', VITE_NANO_SENTRY_ENVIRONMENT: 'e2e', VITE_NANO_SENTRY_REPLAY_ON_ERROR_RATE: '0.25' })).toBe(true);
+    expect(isSentryReplayBuildEnabled({ VITE_NANO_SENTRY_DSN: dsn, VITE_NANO_SENTRY_REPLAY: '1', VITE_NANO_SENTRY_ENVIRONMENT: 'e2e', VITE_NANO_SENTRY_REPLAY_ON_ERROR_RATE: '1' })).toBe(true);
+    expect(isSentryReplayBuildEnabled({ VITE_NANO_SENTRY_DSN: dsn, VITE_NANO_SENTRY_REPLAY: '1', VITE_NANO_SENTRY_ENVIRONMENT: 'e2e', VITE_NANO_SENTRY_REPLAY_ON_ERROR_RATE: '' })).toBe(true);
   });
 });

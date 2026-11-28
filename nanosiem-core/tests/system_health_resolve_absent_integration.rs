@@ -12,8 +12,7 @@ use nanosiem_core::system_health::{
 };
 
 async fn fresh_pg() -> sqlx::PgPool {
-    let url = std::env::var("NANOSIEM_TEST_DATABASE_URL")
-        .expect("NANOSIEM_TEST_DATABASE_URL must target a disposable PostgreSQL");
+    let url = nanosiem_test_db::require_pg_url();
     let admin = sqlx::PgPool::connect(&url).await.unwrap();
     let name = format!("sh_{}", &uuid::Uuid::now_v7().simple().to_string()[18..]);
     sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}"))).execute(&admin).await.unwrap();

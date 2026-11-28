@@ -256,12 +256,12 @@ fn ocsf_logs_ddl(db: &str) -> String {
 
 impl Live {
     async fn connect(tag: &str, owner_count: usize) -> Option<Self> {
-        let url = std::env::var("NANOSIEM_TEST_CLICKHOUSE_URL").ok()?;
+        let url = nanosiem_test_db::ch_url().ok()?;
         let mut admin = crate::db::clickhouse_transport::client().with_url(url);
-        if let Ok(user) = std::env::var("NANOSIEM_TEST_CLICKHOUSE_USER") {
+        if let Some(user) = nanosiem_test_db::ch_user() {
             admin = admin.with_user(user);
         }
-        if let Ok(password) = std::env::var("NANOSIEM_TEST_CLICKHOUSE_PASSWORD") {
+        if let Some(password) = nanosiem_test_db::ch_password() {
             admin = admin.with_password(password);
         }
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
@@ -557,14 +557,19 @@ async fn under_the_cap_a_reduction_run_is_unchanged() {
 // ---------------------------------------------------------------------------
 
 /// A fresh PostgreSQL database with the nano schema, on the DISPOSABLE server
-/// `NANOSIEM_TEST_PG_URL` (`postgres://user:pass@host:port`).
+/// from `nanosiem_test_db::pg_url()` (any database on it; a scratch one is
+/// created per call).
 async fn fresh_pg(tag: &str) -> Option<sqlx::PgPool> {
-    let base = std::env::var("NANOSIEM_TEST_PG_URL").ok()?;
-    let admin = sqlx::PgPool::connect(&format!("{base}/postgres")).await.expect("connect PG");
+    let base = nanosiem_test_db::pg_url().ok()?;
+    let admin = nanosiem_test_db::connect_pg(nanosiem_test_db::pg_pool_options(2), &base).await;
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
     let db = format!("nan5751_{tag}_{nanos}");
     sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {db}"))).execute(&admin).await.expect("create db");
-    let pg = sqlx::PgPool::connect(&format!("{base}/{db}")).await.expect("connect test db");
+    let pg = nanosiem_test_db::connect_pg(
+        nanosiem_test_db::pg_pool_options(10),
+        &nanosiem_test_db::with_database(&base, &db),
+    )
+    .await;
     crate::db::run_postgres_migrations(&pg).await.expect("migrations");
     Some(pg)
 }
@@ -584,8 +589,17 @@ async fn the_coverage_incomplete_alert_fires_once_per_overflowing_window() {
 }
 
 async fn coverage_incomplete_alert_case(mode: &str) {
-    let Some(pg) = fresh_pg(mode).await else { return };
+    // Both databases (and the helper's safety check on both URLs) before
+    // creating a scratch database on either, so a run with only one of them
+    // configured leaves nothing behind.
+    if nanosiem_test_db::pg_url().is_err() || nanosiem_test_db::ch_url().is_err() {
+        return;
+    }
     let Some(mut live) = Live::connect(mode, 0).await else { return };
+    let Some(pg) = fresh_pg(mode).await else {
+        live.drop().await;
+        return;
+    };
     let pool = crate::db::DualPool::for_live_tests(pg.clone(), live.admin.clone().with_database(&live.db));
     let mut svc = DetectionService::with_dual_pool_prevalence_and_profile(
         &pool,

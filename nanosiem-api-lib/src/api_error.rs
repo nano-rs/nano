@@ -998,6 +998,17 @@ impl From<nanosiem_core::ParserRepositoryError> for ApiError {
             ParserRepositoryError::YamlParse(msg) => {
                 ApiError::BadRequest(format!("YAML parse error: {}", msg))
             }
+            // NAN-6036: the caller's request was refused (for example a source
+            // configuration that cannot feed the chosen ingestion method). It
+            // fell through to the catch-all and reached the UI as a 500
+            // "Internal server error: Invalid request: ...". It is a 400, the
+            // status `ParserRepositoryError::status_code` already documents.
+            ParserRepositoryError::InvalidRequest(msg) => ApiError::BadRequest(msg),
+            // NAN-2202 documents this as a 403 matching `From<TierError>`; it
+            // also fell through to the 500 catch-all.
+            ParserRepositoryError::TierLimitExceeded(msg) => {
+                ApiError::Forbidden(format!("Tier limit exceeded: {}", msg))
+            }
             _ => ApiError::InternalError(err.to_string()),
         }
     }
@@ -1258,6 +1269,37 @@ mod tests {
         let text = error.to_string();
         assert!(text.contains("Mars/Olympus_Mons"), "{text}");
         assert!(text.contains("America/New_York"), "{text}");
+    }
+
+    // NAN-6036: a refused parser-repository import request is a 400 carrying
+    // the reason, never a 500 "Internal server error: Invalid request: ...".
+    #[test]
+    fn parser_repository_invalid_request_maps_to_bad_request() {
+        let error: ApiError = nanosiem_core::ParserRepositoryError::InvalidRequest(
+            "dispatch_source_config_id config_type 'vector' is incompatible".to_string(),
+        )
+        .into();
+
+        assert_eq!(error.status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(error.code(), "BAD_REQUEST");
+        let text = error.to_string();
+        assert!(
+            text.contains("config_type 'vector' is incompatible"),
+            "{text}"
+        );
+        assert!(!text.contains("Internal"), "{text}");
+        assert!(!text.contains("Invalid request: "), "{text}");
+    }
+
+    // NAN-6036: the tier cap on import is the 403 NAN-2202 documents.
+    #[test]
+    fn parser_repository_tier_limit_maps_to_forbidden() {
+        let error: ApiError =
+            nanosiem_core::ParserRepositoryError::TierLimitExceeded("10 data sources".to_string())
+                .into();
+
+        assert_eq!(error.status_code(), StatusCode::FORBIDDEN);
+        assert!(error.to_string().contains("10 data sources"));
     }
 
     #[test]

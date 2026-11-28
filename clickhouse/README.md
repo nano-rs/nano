@@ -79,8 +79,8 @@ Fields:
 Captures logs that failed to ingest for troubleshooting:
 - **Partitioning**: Daily partitions by timestamp
 - **Ordering**: (timestamp, error_type)
-- **TTL**: 30 days
-- **Indexes**: Set index on error_type; token bloom filter on error_message
+- **TTL**: 90 days
+- **Indexes**: Set index on error_type; text index on `lower(error_message)` (migration 204, NAN-5919). Search it with `lower(error_message) LIKE '%word%'` or `hasToken(lower(error_message), 'word')`
 
 Fields:
 - `id` - Unique error identifier

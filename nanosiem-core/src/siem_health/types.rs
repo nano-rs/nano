@@ -539,6 +539,26 @@ pub struct InsertIntegrityMetrics {
     /// system.errors counter for CACHE_DICTIONARY_UPDATE_FAIL (code 510),
     /// 24h-recency-gated — the hash_prevalence_dict collateral signature.
     pub cache_dictionary_update_fails: u64,
+    /// NAN-5976: error counters left out of the two fields above because
+    /// their last occurrence fell inside a rollout window that
+    /// `scripts/nano upgrade` recorded and the error was not happening before
+    /// that upgrade. Shown on the page, never scored. `serde(default)` so
+    /// earlier reports still deserialize.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub upgrade_transient_errors: Vec<UpgradeTransientError>,
+    /// The two counters above per ClickHouse node, with when each last fired
+    /// on that node (ClickHouse's own `last_error_time`). Collector-internal
+    /// input for the NAN-5976 rule; never stored in a report.
+    #[serde(skip)]
+    pub error_counter_samples: Vec<ErrorCounterSample>,
+    /// `system.dictionaries` on every ClickHouse node: which nodes showed any
+    /// dictionary row, and how many dictionaries are unhealthy (FAILED*, or
+    /// any `last_exception`, the `dict_is_unhealthy` rule). `None` when the
+    /// probe could not run, which keeps every error counted (NAN-5976). A node
+    /// missing from `hosts` (no rows: the SHOW DICTIONARIES grant is missing,
+    /// NAN-1437) also keeps its errors counted. Never stored in a report.
+    #[serde(skip)]
+    pub dictionary_check: Option<DictionaryCheck>,
     /// Dictionaries referenced by the logs table's MATERIALIZED columns that are
     /// currently unhealthy: either `FAILED*` status, OR a non-empty
     /// `last_exception` at any status. The second case catches a degraded
@@ -631,6 +651,39 @@ pub struct DictionaryMemory {
     pub status: String,
     pub element_count: u64,
     pub bytes_allocated: u64,
+}
+
+/// NAN-5976: the per-node dictionary health check.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct DictionaryCheck {
+    /// Nodes that returned at least one `system.dictionaries` row.
+    pub hosts: Vec<String>,
+    /// Unhealthy dictionaries across those nodes.
+    pub unhealthy: u64,
+}
+
+/// NAN-5976: one ClickHouse node's `system.errors` row for an error counter.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ErrorCounterSample {
+    pub host: String,
+    pub name: String,
+    pub value: u64,
+    /// When it last fired on that node: `system.errors.last_error_time` as
+    /// Unix seconds, taken in the same query. 0 means unknown.
+    pub last_error_unix: u64,
+}
+
+/// NAN-5976: a ClickHouse error counter the upgrade's own rollout caused.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UpgradeTransientError {
+    /// `system.errors` name, e.g. `MEMORY_LIMIT_EXCEEDED`.
+    pub name: String,
+    /// Occurrences in the 24 h probe window (cumulative since ClickHouse started).
+    pub count: u64,
+    /// When it last happened.
+    pub last_at: DateTime<Utc>,
+    /// The upgrade run whose rollout window it fell in.
+    pub upgrade_run_id: String,
 }
 
 /// An unhealthy ClickHouse dictionary referenced by the logs table DDL — either

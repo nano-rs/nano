@@ -15,8 +15,8 @@ export const SENTRY_TEST_TRIGGER: boolean = SENTRY_ENABLED && import.meta.env.VI
 export const SENTRY_TEST_PATH = '/_sentry-test';
 
 export function startErrorTracking(): void {
-  if (!SENTRY_ENABLED) return;
-  const dsn = import.meta.env.VITE_NANO_SENTRY_DSN as string;
+  const dsn = import.meta.env.VITE_NANO_SENTRY_DSN as string | undefined;
+  if (!dsn) return;
   void import('./sentry')
     .then((m) => {
       m.initSentry(dsn);

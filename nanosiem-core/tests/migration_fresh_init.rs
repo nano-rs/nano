@@ -12,8 +12,10 @@
 //!   4. Env-var kill switch — `NANOSIEM_MIGRATION_MODE=legacy` overrides
 //!      detection on a fresh DB.
 //!
-//! Prerequisites: a Postgres reachable at `TEST_DATABASE_URL`
-//! (default: postgres://nanosiem:nanosiem@localhost:5432/postgres).
+//! Prerequisites: a throwaway Postgres reachable at `TEST_DATABASE_URL`.
+//! There is no localhost default (NAN-5964): unset means every test here
+//! skips, so a plain `cargo test` never drops a database on a developer's
+//! own stack.
 //! The test creates a uniquely-named throwaway database (`nanosiem_nan749_test`)
 //! and drops/recreates the public schema between scenarios. SKIP via
 //! SKIP_DB_TESTS=1.
@@ -29,8 +31,28 @@ use sqlx::{Executor, PgPool};
 const TEST_DB_NAME: &str = "nanosiem_nan749_test";
 
 fn admin_url() -> String {
-    std::env::var("TEST_DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://nanosiem:nanosiem@localhost:5432/postgres".to_string())
+    nanosiem_test_db::require_pg_url()
+}
+
+/// Whether these DB tests run. They need `TEST_DATABASE_URL` (no localhost
+/// default, NAN-5964) plus `NANOSIEM_ALLOW_DESTRUCTIVE_TESTS`, and honor
+/// `SKIP_DB_TESTS`. These tests are not
+/// `#[ignore]`d, so an unset URL skips instead of failing a plain `cargo test`.
+fn db_tests_enabled() -> bool {
+    if std::env::var("SKIP_DB_TESTS").is_ok() {
+        eprintln!("SKIP_DB_TESTS set: skipping NAN-749 integration test");
+        return false;
+    }
+    if nanosiem_test_db::pg_url().is_err() {
+        eprintln!("TEST_DATABASE_URL not set: skipping NAN-749 integration test (no localhost default)");
+        return false;
+    }
+    // It drops and recreates a database, so it also needs the opt-in.
+    if !matches!(std::env::var("NANOSIEM_ALLOW_DESTRUCTIVE_TESTS").as_deref(), Ok("1" | "true")) {
+        eprintln!("NANOSIEM_ALLOW_DESTRUCTIVE_TESTS not set: skipping NAN-749 integration test");
+        return false;
+    }
+    true
 }
 
 fn test_db_url() -> String {
@@ -108,12 +130,11 @@ async fn migration_row_count(pool: &PgPool) -> i64 {
 
 #[tokio::test]
 async fn nan749_fresh_init_path_creates_open_schema_and_backfills_history() {
-    if std::env::var("SKIP_DB_TESTS").is_ok() {
-        eprintln!("SKIP_DB_TESTS set — skipping NAN-749 integration test");
+    if !db_tests_enabled() {
         return;
     }
     if let Err(e) = recreate_test_db().await {
-        eprintln!("Could not (re)create test DB at {}: {}", admin_url(), e);
+        eprintln!("Could not (re)create test DB at TEST_DATABASE_URL: {}", e);
         eprintln!("Run a Postgres reachable via TEST_DATABASE_URL or SKIP_DB_TESTS=1");
         return;
     }
@@ -340,11 +361,11 @@ async fn version_present(pool: &PgPool, version: i64) -> bool {
 
 #[tokio::test]
 async fn nan926_repair_deletes_poisoned_185_when_187_absent() {
-    if std::env::var("SKIP_DB_TESTS").is_ok() {
+    if !db_tests_enabled() {
         return;
     }
     if let Err(e) = recreate_test_db().await {
-        eprintln!("Could not (re)create test DB at {}: {}", admin_url(), e);
+        eprintln!("Could not (re)create test DB at TEST_DATABASE_URL: {}", e);
         return;
     }
 
@@ -370,11 +391,11 @@ async fn nan926_repair_deletes_poisoned_185_when_187_absent() {
 
 #[tokio::test]
 async fn nan926_repair_leaves_healthy_185_alone() {
-    if std::env::var("SKIP_DB_TESTS").is_ok() {
+    if !db_tests_enabled() {
         return;
     }
     if let Err(e) = recreate_test_db().await {
-        eprintln!("Could not (re)create test DB at {}: {}", admin_url(), e);
+        eprintln!("Could not (re)create test DB at TEST_DATABASE_URL: {}", e);
         return;
     }
 
@@ -407,11 +428,11 @@ async fn nan926_repair_is_noop_when_187_already_landed() {
     // pathological case the safe move is "do nothing", because we'd be
     // deleting the row that records the new 185 application. The 187-absent
     // signal is what makes this safe; this test pins the behavior.
-    if std::env::var("SKIP_DB_TESTS").is_ok() {
+    if !db_tests_enabled() {
         return;
     }
     if let Err(e) = recreate_test_db().await {
-        eprintln!("Could not (re)create test DB at {}: {}", admin_url(), e);
+        eprintln!("Could not (re)create test DB at TEST_DATABASE_URL: {}", e);
         return;
     }
 
@@ -435,11 +456,11 @@ async fn nan926_repair_is_noop_without_sqlx_migrations_table() {
     // Fresh DB: the migrator hasn't bootstrapped _sqlx_migrations yet. The
     // repair must not fail with "relation does not exist" — it should
     // detect the missing table and return Ok.
-    if std::env::var("SKIP_DB_TESTS").is_ok() {
+    if !db_tests_enabled() {
         return;
     }
     if let Err(e) = recreate_test_db().await {
-        eprintln!("Could not (re)create test DB at {}: {}", admin_url(), e);
+        eprintln!("Could not (re)create test DB at TEST_DATABASE_URL: {}", e);
         return;
     }
     let pool = fresh_schema_pool().await.expect("fresh schema");

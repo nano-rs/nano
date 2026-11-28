@@ -18,7 +18,7 @@ use nanosiem_core::schema::{validate_active_schema_table, OcsfProfile, UdmProfil
 
 fn client() -> clickhouse::Client {
     clickhouse::Client::default()
-        .with_url(std::env::var("CLICKHOUSE_TEST_URL").unwrap_or_else(|_| "http://localhost:8123".into()))
+        .with_url(nanosiem_test_db::require_ch_url())
         .with_user(std::env::var("CLICKHOUSE_ADMIN_USER").unwrap_or_else(|_| "nanosiem_admin".into()))
         .with_password(
             std::env::var("CLICKHOUSE_ADMIN_PASSWORD")
@@ -40,6 +40,14 @@ async fn logs_table_available(c: &clickhouse::Client) -> bool {
 
 #[tokio::test]
 async fn udm_boot_validation_passes_against_real_logs_table() {
+    // NAN-5964: no localhost default, and this test writes data, so it
+    // also needs the destructive-test opt-in.
+    if nanosiem_test_db::ch_url().is_err()
+        || !matches!(std::env::var("NANOSIEM_ALLOW_DESTRUCTIVE_TESTS").as_deref(), Ok("1" | "true"))
+    {
+        eprintln!("Skipping: set CLICKHOUSE_TEST_URL to a throwaway ClickHouse and NANOSIEM_ALLOW_DESTRUCTIVE_TESTS=1");
+        return;
+    }
     if std::env::var("SKIP_DB_TESTS").is_ok() {
         eprintln!("Skipping (SKIP_DB_TESTS set)");
         return;
@@ -62,6 +70,14 @@ async fn udm_boot_validation_passes_against_real_logs_table() {
 
 #[tokio::test]
 async fn ocsf_profile_against_udm_table_fails_fast() {
+    // NAN-5964: no localhost default, and this test writes data, so it
+    // also needs the destructive-test opt-in.
+    if nanosiem_test_db::ch_url().is_err()
+        || !matches!(std::env::var("NANOSIEM_ALLOW_DESTRUCTIVE_TESTS").as_deref(), Ok("1" | "true"))
+    {
+        eprintln!("Skipping: set CLICKHOUSE_TEST_URL to a throwaway ClickHouse and NANOSIEM_ALLOW_DESTRUCTIVE_TESTS=1");
+        return;
+    }
     if std::env::var("SKIP_DB_TESTS").is_ok() {
         return;
     }

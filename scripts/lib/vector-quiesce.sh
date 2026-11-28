@@ -27,6 +27,12 @@
 # for its direct senders the stop itself is the close. The drain is bounded.
 
 NANO_VQ_MARKER=/run/nano-ingest/closed
+# NAN-5966: the "run: ..." hints print the caller's full `docker compose ...`
+# (its project and files; a bare `docker compose` finds no stack in an install
+# folder). The caller may define nano_vq_compose_text; this is the fallback.
+if ! declare -F nano_vq_compose_text >/dev/null 2>&1; then
+    nano_vq_compose_text() { printf 'docker compose'; }
+fi
 NANO_VQ_STOP_TIMEOUT="${NANO_VQ_STOP_TIMEOUT:-120}"
 NANO_VQ_CLOSED=0
 # Set once this shell started closing ingest: its exit paths must reopen.
@@ -281,7 +287,7 @@ nano_vq_reopen() {
         if ((rc == 0)); then
             log "reopened Vector's published ingest ports"
         else
-            warn "could not confirm Vector reopened its published ports; run: docker compose exec vector sh /etc/vector/.nano/ingest-gate.sh open"
+            warn "could not confirm Vector reopened its published ports; run: $(nano_vq_compose_text) exec vector sh /etc/vector/.nano/ingest-gate.sh open"
         fi
     fi
     if ((NANO_VQ_CLOSED)); then
@@ -300,7 +306,7 @@ nano_vq_reopen() {
             NANO_VQ_NGINX_STOPPED=0
             log "started nginx again"
         else
-            warn "could not start nginx again; run: docker compose up -d nginx"
+            warn "could not start nginx again; run: $(nano_vq_compose_text) up -d --no-deps nginx"
             return 1
         fi
     fi
@@ -309,7 +315,7 @@ nano_vq_reopen() {
         ((NANO_VQ_CLOSED)) && log "reopened ingest at nginx"
         NANO_VQ_CLOSED=0
     else
-        warn "could not reopen ingest at nginx; run: docker compose exec nginx rm -f $NANO_VQ_MARKER"
+        warn "could not reopen ingest at nginx; run: $(nano_vq_compose_text) exec nginx rm -f $NANO_VQ_MARKER"
         return 1
     fi
 }

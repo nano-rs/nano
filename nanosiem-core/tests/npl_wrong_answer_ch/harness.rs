@@ -133,12 +133,12 @@ pub fn npl(profile: Profile, template: &str) -> String {
 impl Ch {
     /// `None` when no disposable ClickHouse is configured.
     pub async fn connect(tag: &str) -> Option<Self> {
-        let url = std::env::var("NANOSIEM_TEST_CLICKHOUSE_URL").ok()?;
+        let url = nanosiem_test_db::ch_url().ok()?;
         let mut client = nanosiem_core::db::clickhouse_transport::client().with_url(url);
-        if let Ok(user) = std::env::var("NANOSIEM_TEST_CLICKHOUSE_USER") {
+        if let Some(user) = nanosiem_test_db::ch_user() {
             client = client.with_user(user);
         }
-        if let Ok(password) = std::env::var("NANOSIEM_TEST_CLICKHOUSE_PASSWORD") {
+        if let Some(password) = nanosiem_test_db::ch_password() {
             client = client.with_password(password);
         }
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();

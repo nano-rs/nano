@@ -49,7 +49,7 @@ async fn active(pool: &sqlx::PgPool, id: Uuid) -> Option<String> {
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn publish_refuses_a_revision_that_moved_and_creates_nothing() {
     let pool = common::migrated_pool().await;
     let versions = LogSourceVersionRepository::new(pool.clone());
@@ -64,7 +64,7 @@ async fn publish_refuses_a_revision_that_moved_and_creates_nothing() {
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn publish_waits_for_and_then_rejects_a_save_holding_the_row() {
     let pool = common::migrated_pool().await;
     let versions = LogSourceVersionRepository::new(pool.clone());
@@ -88,7 +88,7 @@ async fn publish_waits_for_and_then_rejects_a_save_holding_the_row() {
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn discard_resets_to_the_active_version_under_the_same_lock() {
     let pool = common::migrated_pool().await;
     let versions = LogSourceVersionRepository::new(pool.clone());

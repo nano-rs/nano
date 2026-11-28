@@ -958,8 +958,7 @@ mod sync_integration_tests {
     #[ignore = "requires migrated PostgreSQL"]
     async fn catalog_replace_is_locked_atomic_and_removes_absent_objects() {
         const TEST_LOCK: i64 = 0x4d49_5452_4554_4553;
-        let url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://nanosiem:nanosiem@localhost:5432/nanosiem".to_string());
+        let url = nanosiem_test_db::require_pg_url();
         let pool = PgPool::connect(&url)
             .await
             .expect("connect to test PostgreSQL");

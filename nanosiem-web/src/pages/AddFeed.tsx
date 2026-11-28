@@ -92,6 +92,15 @@ import { parserSlug, systemSource, useSourceCatalog } from '@/lib/source-catalog
 import { Link } from 'react-router-dom';
 import { DeployGatePanel } from '@/components/add-data/DeployGatePanel';
 import { computeDeployGate, type GateAction } from '@/components/add-data/deploy-gate';
+import {
+  libraryNeedsConfigDeploy,
+  sourceConfigPairing,
+  transportChoiceLocked,
+  wizardAddsRoutingRule,
+  wizardRedeploysConfig,
+  wizardSourceType,
+  type SourceConfigPairing,
+} from '@/components/add-data/source-config-pairing';
 import { connectDetailQueryKey } from '@/lib/api/log-source-connect';
 import { describeSampleSplit, detectWrappedLines, joinWrappedLines } from '@/lib/sample-wrap';
 import { isIncompleteDraftStatus, parserDraftIncomplete } from '@/lib/parser-draft-verdict';
@@ -440,6 +449,25 @@ export function AddFeed() {
   const testsRun = tests.length > 0;
 
   const sourceConfig = sourceConfigs.find((c) => c.id === sourceConfigId);
+  // NAN-6036: the wizard adds a routing rule to the chosen source configuration
+  // (and a library import binds to it), which needs source_configs:edit.
+  // A rule on a deployed configuration and any redeploy also need
+  // source_configs:deploy, and redeploying one with a stored credential needs
+  // credentials:use (the same grants as ingestion-proposals.ts).
+  const canEditSourceConfigs = hasPermission('source_configs:edit');
+  const canDeploySourceConfigs = hasPermission('source_configs:deploy');
+  const canUseCredentials = hasPermission('credentials:use');
+  const pairingFor = useCallback(
+    (config: SourceConfigWithEvents) =>
+      sourceConfigPairing(config, { repositorySource, canEditSourceConfigs, canDeploySourceConfigs, canUseCredentials }),
+    [canDeploySourceConfigs, canEditSourceConfigs, canUseCredentials, repositorySource],
+  );
+  // NAN-6036: `routed` for push and custom sources; a library source read
+  // through a source configuration keeps the method it was imported with.
+  // A source that already exists (imported here, or resumed) keeps its stored
+  // method: a save from Review must not move it to another lane.
+  const [persistedSourceType, setPersistedSourceType] = useState<string | null>(null);
+  const savedSourceType = persistedSourceType ?? wizardSourceType(transport, sourceConfig, { repositorySource });
   const namespaceFull =
     nsPrefix === 'default'
       ? 'default'
@@ -826,7 +854,7 @@ export function AddFeed() {
         description: description || undefined,
         namespace: namespaceFull,
         timezone,
-        source_type: 'routed',
+        source_type: savedSourceType,
         // NAN-1906: carry the picked transport into the draft too, so a feed
         // later deployed from this draft still shows its real transport. May be
         // unset while the source config hasn't been chosen yet.
@@ -858,7 +886,7 @@ export function AddFeed() {
     } finally {
       setSavingDraft(false);
     }
-  }, [matchValuesFor, category, description, feedId, name, namespaceFull, product, settleAutoPersist, sourceConfigId, timezone, toast, transport, vendor, vrl]);
+  }, [matchValuesFor, category, description, feedId, name, namespaceFull, product, savedSourceType, settleAutoPersist, sourceConfigId, timezone, toast, transport, vendor, vrl]);
 
   // ------------ Auto-persist draft (NAN-1920) ------------
   // Persist the in-progress feed as a `lifecycle_status='draft'` log source as
@@ -877,7 +905,7 @@ export function AddFeed() {
         description: description || undefined,
         namespace: namespaceFull,
         timezone,
-        source_type: 'routed',
+        source_type: savedSourceType,
         dispatch_source_config_id: transport === 'pull' ? sourceConfigId || undefined : undefined,
         parser_vrl: vrl,
         category: category || undefined,
@@ -894,7 +922,7 @@ export function AddFeed() {
     } finally {
       autoPersistInFlight.current = false;
     }
-  }, [matchValuesFor, category, description, draftId, feedId, name, namespaceFull, product, sourceConfigId, timezone, transport, vendor, vrl]);
+  }, [matchValuesFor, category, description, draftId, feedId, name, namespaceFull, product, savedSourceType, sourceConfigId, timezone, transport, vendor, vrl]);
 
   // Debounced trigger: create the draft ~1.2s after the user pauses once Step 1
   // is valid, rather than on every keystroke. Re-arms while `!draftId`; once the
@@ -945,8 +973,10 @@ export function AddFeed() {
       //    source config (matches old wizard's two-call submit). Non-fatal: a
       //    duplicate or inactive transport shouldn't block the log-source
       //    create. A pushed source needs no rule: its ingest token decides it.
+      // NAN-6036: only when it adds something (see wizardAddsRoutingRule):
+      // never a second copy, never on a library import, never on Vector/OTLP.
       let routingRuleCreated = false;
-      if (transport === 'pull') try {
+      if (transport === 'pull' && sourceConfig && wizardAddsRoutingRule(sourceConfig, repositorySource, feedId, existingRules)) try {
         await api.createRoutingRule(sourceConfigId, {
           match_field: 'source_type',
           match_type: 'exact',
@@ -970,12 +1000,15 @@ export function AddFeed() {
       //    the NAN-1084 JOIN instead of falling back to `source_type` → "HTTP".
       //    Inert for routing: source/router codegen keys on `source_type`
       //    ('routed'), never the dispatch id, for a routed parser.
+      //    NAN-6036: a library source read through a source configuration
+      //    keeps the method it was imported with (`savedSourceType`), so this
+      //    save does not move it off its configuration's route.
       const payload = {
         name,
         description: description || undefined,
         namespace: namespaceFull,
         timezone,
-        source_type: 'routed',
+        source_type: savedSourceType,
         dispatch_source_config_id: transport === 'pull' ? sourceConfigId : undefined,
         parser_vrl: vrl,
         category: category || undefined,
@@ -1004,7 +1037,9 @@ export function AddFeed() {
       //    promises a live feed; this matches the meloD concierge flow that
       //    redeploys the source config after creating its routing rule, and
       //    deploys the log source so the central router picks up match_values.
-      if (routingRuleCreated) {
+      // NAN-6036: never deploy a configuration that is not live yet, or one
+      // with no route of its own (Vector/OTLP); see wizardRedeploysConfig.
+      if (routingRuleCreated && sourceConfig && wizardRedeploysConfig(sourceConfig, repositorySource)) {
         try {
           await api.deploySourceConfig(sourceConfigId);
         } catch (err) {
@@ -1063,7 +1098,7 @@ export function AddFeed() {
     } finally {
       setDeploying(false);
     }
-  }, [matchValuesFor, canDeploy, category, description, entryPath, feedId, name, namespaceFull, navigate, product, sampleText, settleAutoPersist, sourceConfigId, timezone, toast, transport, vendor, vrl]);
+  }, [matchValuesFor, canDeploy, category, description, entryPath, existingRules, feedId, name, namespaceFull, navigate, product, repositorySource, savedSourceType, sampleText, settleAutoPersist, sourceConfig, sourceConfigId, timezone, toast, transport, vendor, vrl]);
 
   // ------------ Connect (NAN-4912): the draft exists before any parser ------------
   // Creates the draft now if auto-persist has not, and flushes the current
@@ -1077,7 +1112,7 @@ export function AddFeed() {
       description: description || undefined,
       namespace: namespaceFull,
       timezone,
-      source_type: 'routed',
+      source_type: savedSourceType,
       dispatch_source_config_id: transport === 'pull' ? sourceConfigId || undefined : undefined,
       parser_vrl: vrl,
       category: category || undefined,
@@ -1105,7 +1140,7 @@ export function AddFeed() {
     } finally {
       setEnsuringDraft(false);
     }
-  }, [matchValuesFor, category, description, feedId, name, namespaceFull, product, settleAutoPersist, sourceConfigId, timezone, toast, transport, vendor, vrl]);
+  }, [matchValuesFor, category, description, feedId, name, namespaceFull, product, savedSourceType, settleAutoPersist, sourceConfigId, timezone, toast, transport, vendor, vrl]);
 
   // ------------ Step 1: catalog choice (main's chooseCatalog) ------------
   const chooseCatalog = useCallback((id: string) => {
@@ -1138,25 +1173,43 @@ export function AddFeed() {
   // its Connect step can finish without the parse step (main's NAN-4847).
   const [preparing, setPreparing] = useState(false);
   const [repositoryDeployed, setRepositoryDeployed] = useState(false);
+  // NAN-6036: the last Transport → Continue failure, shown on the step. The
+  // choices stay as they were; once the source exists the user may go on.
+  const [prepareError, setPrepareError] = useState<string | null>(null);
+  const nextStepAfterTransport = transport === 'push' ? 2 : repositorySource ? 4 : 3;
   const prepareConnection = useCallback(async () => {
     setPreparing(true);
+    setPrepareError(null);
     try {
       let id: string | null = draftIdRef.current;
       if (repositorySource && !id) {
         const parser = catalog.data?.find((p) => p.id === catalogType);
         if (!parser) throw new Error('Choose an available repository source.');
+        // NAN-6036: the ingestion method must match the chosen source
+        // configuration (the import refuses any other pairing, NAN-943).
+        let ingestionMethod = 'routed';
+        if (transport === 'pull') {
+          if (!sourceConfig) throw new Error('Choose a source configuration.');
+          const pairing = pairingFor(sourceConfig);
+          if (!pairing.usable) throw new Error(pairing.reason);
+          ingestionMethod = pairing.ingestionMethod;
+        }
         const imported = await api.parserRepositories.importParser(parser.repository_id, parser.file_path, {
           import_type: 'linked',
           source_type: feedId,
-          ingestion_method: 'routed',
+          ingestion_method: ingestionMethod,
           dispatch_source_config_id: transport === 'pull' ? sourceConfigId || undefined : undefined,
         });
         id = imported.log_source_id;
         draftIdRef.current = id;
         setDraftId(id);
+        setPersistedSourceType(ingestionMethod);
       } else {
         id = await ensureDraft();
-        if (!id) return;
+        if (!id) {
+          setPrepareError('The source could not be saved. Your choices are kept; check the message and try again.');
+          return;
+        }
       }
       if (repositorySource && id && !repositoryDeployed) {
         // NAN-5079: a library parser is checked against its bundled samples;
@@ -1167,13 +1220,23 @@ export function AddFeed() {
         setRepositoryDeployed(true);
       }
       void queryClient.invalidateQueries({ queryKey: CONNECT_STATUS_QUERY_KEY });
-      setActiveStep(transport === 'push' ? 2 : repositorySource ? 4 : 3);
+      setActiveStep(nextStepAfterTransport);
     } catch (err) {
-      toast({ title: 'Could not prepare the ingest path', description: err instanceof Error ? err.message : 'Try again.', variant: 'destructive' });
+      const message = err instanceof Error ? err.message : 'Try again.';
+      setPrepareError(message);
+      toast({ title: 'Could not prepare the ingest path', description: message, variant: 'destructive' });
     } finally {
       setPreparing(false);
     }
-  }, [catalog.data, catalogType, ensureDraft, feedId, queryClient, repositoryDeployed, repositorySource, sourceConfigId, toast, transport]);
+  }, [catalog.data, catalogType, ensureDraft, feedId, nextStepAfterTransport, pairingFor, queryClient, repositoryDeployed, repositorySource, sourceConfig, sourceConfigId, toast, transport]);
+  // NAN-6036: once the source exists, a failed go-live does not trap the user
+  // on Transport. The next step can finish it (Review publishes again; Connect
+  // works on a saved source).
+  const skipPrepare = useCallback(() => {
+    setPrepareError(null);
+    void queryClient.invalidateQueries({ queryKey: CONNECT_STATUS_QUERY_KEY });
+    setActiveStep(nextStepAfterTransport);
+  }, [nextStepAfterTransport, queryClient]);
 
   // ------------ `?source=<slug>` (NAN-2946): an existing source opens on Connect ------------
   const requestedSource = searchParams.get(ADD_DATA_SOURCE_PARAM);
@@ -1260,6 +1323,7 @@ export function AddFeed() {
         setDescription(source.description ?? '');
         setVrl(source.parser_vrl ?? '');
         setTimezone(source.timezone ?? 'UTC');
+        setPersistedSourceType(source.source_type || null);
         const prefix = NAMESPACE_PREFIXES.find((item) => item.id !== 'default' && source.namespace?.startsWith(item.label));
         setNsPrefix(prefix?.id ?? 'default');
         setNsSuffix(prefix ? source.namespace.slice(prefix.label.length) : '');
@@ -1403,6 +1467,10 @@ export function AddFeed() {
               otherTargets={otherTargets}
               onUseTarget={(target) => { identifierTouched.current = true; setFeedId(target); }}
               feedId={feedId}
+              pairingFor={pairingFor}
+              choicesLocked={transportChoiceLocked({ sourceExists: !!draftId, repositorySource, persistedSourceType })}
+              prepareError={prepareError}
+              onSkipPrepare={draftId ? skipPrepare : undefined}
             />
             </div>
           )}
@@ -1434,6 +1502,10 @@ export function AddFeed() {
               // source was enrolled. A draft receives as soon as it exists, so Finish only needs
               // the token saved; the list then offers "Build parser" for the unparsed source.
               canFinish={tokenSaved}
+              onSkip={connectionLocked ? undefined : () => {
+                void queryClient.invalidateQueries({ queryKey: CONNECT_STATUS_QUERY_KEY });
+                navigate(finishHref);
+              }}
             />
             </div>
           )}
@@ -1487,6 +1559,21 @@ export function AddFeed() {
           )}
           {revealedStep >= 5 && (needsParserWork || transport === 'pull') && (
             <div className={READABLE_COLUMN}>
+            {/* NAN-6036: the import added this source's routing rule to the pull
+                configuration, but the wizard does not deploy shared configurations
+                (that would also push anyone else's unsaved edits live). */}
+            {draftId && sourceConfig && libraryNeedsConfigDeploy(sourceConfig, repositorySource) && (
+              <div className="mb-2 rounded-md border border-border bg-card/40 px-3 py-2 text-[11.5px]" role="status" data-testid="config-deploy-needed">
+                <span className="text-foreground">One more step: </span>
+                <span className="text-muted-foreground">
+                  deploy <span className="font-mono text-foreground/80">{sourceConfig.name}</span> so it starts sending data to this source.
+                  We added the rule it needs, but did not deploy it for you, since other people may have changes waiting on it.{' '}
+                </span>
+                <Link to={`/ingestion/source-configurations/${encodeURIComponent(sourceConfig.id)}`} className="text-primary hover:underline">
+                  Open the source configuration
+                </Link>
+              </div>
+            )}
             <Step3Deploy
               expanded={activeStep === 4}
               onActivate={() => setActiveStep(4)}
@@ -1517,7 +1604,13 @@ export function AddFeed() {
           <Button
             variant="outline"
             size="sm"
+            // NAN-6036: not while a token is being created; leaving then loses
+            // a one-time secret the server still stores.
+            disabled={credentialBusy}
+            title={credentialBusy ? 'Wait for the token to finish' : undefined}
+            data-testid="add-feed-cancel"
             onClick={() => {
+              if (credentialBusy) return;
               if (!credentialIssued || tokenSaved || window.confirm('The token is shown once. Leave without copying it?')) navigate('/ingestion/log-sources');
             }}
           >
@@ -1753,20 +1846,32 @@ function SourceConfigCard({
   config,
   selected,
   onSelect,
+  disabledReason,
+  frozen,
 }: {
   config: SourceConfigWithEvents;
   selected: boolean;
   onSelect: () => void;
+  /** The Transport choice is locked: other cards cannot be picked, without a per-card reason. */
+  frozen?: boolean;
+  /** NAN-6036: why this configuration cannot be used here (shown on the card). */
+  disabledReason?: string;
 }) {
   const Icon = SOURCE_ICON_FOR_TYPE(config.config_type);
   const events = formatEventsCount(config.events_24h);
+  const disabled = !!disabledReason || !!frozen;
   return (
     <button
       type="button"
       onClick={onSelect}
+      disabled={disabled}
+      aria-disabled={disabled || undefined}
+      data-testid={`source-config-${config.id}`}
       className={cn(
         'flex items-start gap-2.5 p-2.5 rounded-md border text-left transition-colors',
-        selected ? 'border-primary bg-primary/[0.08]' : 'border-border bg-card hover:border-input hover:bg-foreground/[0.03]',
+        disabled
+          ? 'border-border bg-card opacity-60 cursor-not-allowed'
+          : selected ? 'border-primary bg-primary/[0.08]' : 'border-border bg-card hover:border-input hover:bg-foreground/[0.03]',
       )}
     >
       <div
@@ -1788,6 +1893,9 @@ function SourceConfigCard({
         <div className="text-[10.5px] font-mono text-muted-foreground mt-0.5">
           {events ? `${events} · 24h` : 'no traffic yet'}
         </div>
+        {disabledReason && (
+          <div className="text-[11px] text-muted-foreground mt-1" data-testid={`source-config-${config.id}-reason`}>{disabledReason}</div>
+        )}
       </div>
     </button>
   );
@@ -2073,6 +2181,10 @@ function TransportStep({
   otherTargets,
   onUseTarget,
   feedId,
+  pairingFor,
+  choicesLocked,
+  prepareError,
+  onSkipPrepare,
 }: {
   locked: boolean;
   expanded: boolean;
@@ -2092,9 +2204,19 @@ function TransportStep({
   otherTargets: RoutingRule[];
   onUseTarget: (target: string) => void;
   feedId: string;
+  /** NAN-6036: whether each source configuration can be used for this source. */
+  pairingFor: (config: SourceConfigWithEvents) => SourceConfigPairing;
+  /** NAN-6036: the source exists with a fixed transport; the choice can no longer change here. */
+  choicesLocked: boolean;
+  /** NAN-6036: the last Continue failed with this message; the choices above are kept. */
+  prepareError: string | null;
+  /** Set once the source exists: lets the user go on even though the last step failed. */
+  onSkipPrepare?: () => void;
 }) {
   const value = transport === 'pull' ? 'pull' : protocol;
-  const ok = transport === 'push' || !!sourceConfigId;
+  const selectedConfig = sourceConfigs.find((c) => c.id === sourceConfigId);
+  const selectedPairing = selectedConfig ? pairingFor(selectedConfig) : null;
+  const ok = transport === 'push' || (!!selectedConfig && !!selectedPairing?.usable);
   return (
     <StepCard locked={locked} n={3} title="How will you send it?" eyebrow="STEP 3 · Transport" expanded={expanded} ok={!expanded && ok} onActivate={onActivate}
       summary={<span className="font-mono text-[11px] text-muted-foreground">Transport: {transport === 'pull' ? 'Source configuration' : PROTOCOL_LABEL[protocol]}</span>}
@@ -2102,7 +2224,14 @@ function TransportStep({
         {preparing ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : null}
         {transport === 'push' ? 'Continue · connect' : 'Continue · sample & parse'} <ArrowRight className="w-3.5 h-3.5" />
       </Button></>}>
-      <RadioGroup value={value} onValueChange={(next) => {
+      {choicesLocked && (
+        <div className="mb-2 text-[10.5px] text-muted-foreground leading-relaxed" data-testid="transport-locked">
+          This source is already saved with this way of sending data, so it can't change here. Press Continue to go on.
+          To change it later, edit the source on its Log Sources page.
+        </div>
+      )}
+      <RadioGroup disabled={choicesLocked} value={value} onValueChange={(next) => {
+        if (choicesLocked) return;
         if (next === 'pull') setTransport('pull');
         else { setTransport('push'); setProtocol(next as DirectProtocol); }
       }} aria-label="Transport">
@@ -2137,12 +2266,39 @@ function TransportStep({
             </div>
           ) : (
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-              {sourceConfigs.map((c) => (
-                <SourceConfigCard key={c.id} config={c} selected={sourceConfigId === c.id} onSelect={() => setSourceConfigId(c.id)} />
-              ))}
+              {sourceConfigs.map((c) => {
+                const pairing = pairingFor(c);
+                return (
+                  <SourceConfigCard
+                    key={c.id}
+                    config={c}
+                    selected={sourceConfigId === c.id}
+                    onSelect={() => { if (!choicesLocked) setSourceConfigId(c.id); }}
+                    disabledReason={pairing.usable ? undefined : pairing.reason}
+                    frozen={choicesLocked && sourceConfigId !== c.id}
+                  />
+                );
+              })}
             </div>
           )}
           {sourceConfigId && otherTargets.length > 0 && <ExistingTargetsPanel targets={otherTargets} onUseTarget={onUseTarget} />}
+        </div>
+      )}
+      {prepareError && (
+        <div className="mt-3 rounded-md border border-destructive/40 bg-destructive/[0.06] px-3 py-2 text-[11.5px]" role="alert" data-testid="transport-error">
+          <div className="text-foreground">Could not finish this step: {prepareError}</div>
+          {onSkipPrepare ? (
+            <div className="mt-1.5 flex flex-wrap items-center gap-2">
+              <span className="text-muted-foreground">The source is saved. Try again, or go on and finish setup on the next step.</span>
+              <Button size="sm" variant="outline" className="h-6 px-2 text-[11px]" onClick={onSkipPrepare} data-testid="transport-skip">
+                Continue without this
+              </Button>
+            </div>
+          ) : (
+            <div className="mt-1 text-muted-foreground">
+              Your choices are kept. The source has to be created before you can go on, so change a choice above and press Continue again.
+            </div>
+          )}
         </div>
       )}
     </StepCard>
@@ -2169,6 +2325,7 @@ function Step4Connect({
   onContinue,
   onFinish,
   canFinish,
+  onSkip,
 }: {
   expanded: boolean;
   onActivate: () => void;
@@ -2187,6 +2344,11 @@ function Step4Connect({
   onContinue?: () => void;
   onFinish: () => void;
   canFinish: boolean;
+  /**
+   * NAN-6036: finish without a token. Offered only while no token was issued
+   * here (an issued token is shown once, so leaving then needs the "saved" tick).
+   */
+  onSkip?: () => void;
 }) {
   // Credential first, then data: the summary names the credential's own state
   // until one is ready, never "waiting for first event" before it exists.
@@ -2205,6 +2367,14 @@ function Step4Connect({
         <Link to={INGEST_CREDENTIALS_PATH} target="_blank" rel="noopener noreferrer" className="text-[10.5px] text-primary hover:underline">Log Sources → Credentials</Link>
         <div className="flex-1" />
         {onContinue && <Button size="sm" className="h-8 gap-1.5" onClick={onContinue} data-testid="connect-continue">Continue · sample & parse <ArrowRight className="w-3.5 h-3.5" /></Button>}
+        {!canFinish && onSkip && (
+          <Button size="sm" variant="ghost" className="h-8" onClick={onSkip} data-testid="connect-skip" title="The source is saved. You can create a token later under Log Sources → Credentials.">
+            Skip for now
+          </Button>
+        )}
+        {!canFinish && !onSkip && (
+          <span className="text-[11px] text-muted-foreground" data-testid="connect-finish-hint">Wait for the token, then confirm you saved it to finish. It is shown only once.</span>
+        )}
         <Button size="sm" variant={onContinue ? 'outline' : 'default'} className="h-8 gap-1.5" onClick={onFinish} disabled={!canFinish} data-testid="connect-finish">Finish</Button>
       </>}
     >
@@ -2366,14 +2536,22 @@ function Step2Parse(props: Step2Props) {
           </div>
           <div className="flex-1" />
           <TimezonePicker value={timezone} onChange={setTimezone} placement="up" />
+          {/* NAN-6036: parser errors no longer trap the user here. Review still
+              blocks publishing until they are fixed, but the draft can be saved
+              and finished later. */}
+          {errors > 0 && entryPath !== 'manual' && (
+            <span className="text-[11px] text-muted-foreground" data-testid="parse-continue-hint">
+              The parser has errors. You can go on and save a draft; publishing waits until they are fixed.
+            </span>
+          )}
           <Button
-            variant="default"
+            variant={errors > 0 && entryPath !== 'manual' ? 'outline' : 'default'}
             size="sm"
             className="h-8 gap-1.5"
             onClick={onContinue}
-            disabled={errors > 0 && entryPath !== 'manual'}
+            data-testid="parse-continue"
           >
-            Continue · review
+            {errors > 0 && entryPath !== 'manual' ? 'Continue anyway · review' : 'Continue · review'}
             <ArrowRight className="w-3.5 h-3.5" />
           </Button>
         </>

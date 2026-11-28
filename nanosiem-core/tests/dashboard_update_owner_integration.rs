@@ -69,7 +69,7 @@ fn add_panel() -> UpdateDashboard {
 }
 
 #[tokio::test]
-#[ignore = "requires a disposable Postgres (DATABASE_URL)"]
+#[ignore = "requires a disposable Postgres (NANOSIEM_TEST_DATABASE_URL)"]
 async fn a_non_owner_cannot_add_a_panel_to_a_shared_dashboard() {
     let pool = common::migrated_pool().await;
     let repo = DashboardRepository::new(pool.clone());
@@ -95,7 +95,7 @@ async fn a_non_owner_cannot_add_a_panel_to_a_shared_dashboard() {
 }
 
 #[tokio::test]
-#[ignore = "requires a disposable Postgres (DATABASE_URL)"]
+#[ignore = "requires a disposable Postgres (NANOSIEM_TEST_DATABASE_URL)"]
 async fn the_owner_and_an_admin_can_add_a_panel() {
     let pool = common::migrated_pool().await;
     let repo = DashboardRepository::new(pool.clone());

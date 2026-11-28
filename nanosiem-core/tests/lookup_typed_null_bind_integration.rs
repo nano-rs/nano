@@ -26,7 +26,7 @@ fn rec(pairs: &[(&str, serde_json::Value)]) -> HashMap<String, serde_json::Value
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn ragged_numeric_column_inserts_typed_null_not_500() {
     let pool = common::migrated_pool().await;
     let repo = LookupRepository::new(pool.clone());

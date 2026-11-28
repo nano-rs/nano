@@ -4,7 +4,7 @@
 //! (NAN-5027) and the API-key grant clamp (NAN-5044), exercised as a
 //! LOW-PRIVILEGE delegated caller against a real migrated PostgreSQL.
 //!
-//! `TEST_DATABASE_URL=... cargo test -p nanosiem-api-lib --test principal_authority_integration -- --ignored`
+//! `NANOSIEM_TEST_DATABASE_URL=... cargo test -p nanosiem-api-lib --test principal_authority_integration -- --ignored`
 
 use nanosiem_api_lib::{grant_authz, AuthContext};
 use nanosiem_core::auth::permissions;
@@ -15,9 +15,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 async fn pool() -> PgPool {
-    PgPool::connect(&std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL is required"))
-        .await
-        .unwrap()
+    nanosiem_test_db::require_pg_pool(10).await
 }
 
 async fn user(pool: &PgPool, status: &str) -> Uuid {
@@ -148,7 +146,7 @@ async fn manage(auth: &AuthContext, pool: &PgPool, target: Uuid) -> Result<(), S
 }
 
 #[tokio::test]
-#[ignore = "requires TEST_DATABASE_URL pointing at a disposable fully migrated PostgreSQL database"]
+#[ignore = "requires NANOSIEM_TEST_DATABASE_URL pointing at a disposable fully migrated PostgreSQL database"]
 async fn delegated_users_edit_cannot_take_over_a_more_privileged_account() {
     let pool = pool().await;
     let helpdesk = user(&pool, "active").await;
@@ -172,7 +170,7 @@ async fn delegated_users_edit_cannot_take_over_a_more_privileged_account() {
 }
 
 #[tokio::test]
-#[ignore = "requires TEST_DATABASE_URL pointing at a disposable fully migrated PostgreSQL database"]
+#[ignore = "requires NANOSIEM_TEST_DATABASE_URL pointing at a disposable fully migrated PostgreSQL database"]
 async fn delegated_users_edit_still_manages_principals_it_covers() {
     let pool = pool().await;
     let helpdesk = user(&pool, "active").await;
@@ -189,7 +187,7 @@ async fn delegated_users_edit_still_manages_principals_it_covers() {
 }
 
 #[tokio::test]
-#[ignore = "requires TEST_DATABASE_URL pointing at a disposable fully migrated PostgreSQL database"]
+#[ignore = "requires NANOSIEM_TEST_DATABASE_URL pointing at a disposable fully migrated PostgreSQL database"]
 async fn system_accounts_and_missing_targets_are_refused() {
     let pool = pool().await;
     let caller = user(&pool, "active").await;
@@ -203,7 +201,7 @@ async fn system_accounts_and_missing_targets_are_refused() {
 }
 
 #[tokio::test]
-#[ignore = "requires TEST_DATABASE_URL pointing at a disposable fully migrated PostgreSQL database"]
+#[ignore = "requires NANOSIEM_TEST_DATABASE_URL pointing at a disposable fully migrated PostgreSQL database"]
 async fn a_key_minted_before_demotion_cannot_re_promote_its_owner() {
     let pool = pool().await;
     let owner = user(&pool, "active").await;
@@ -272,7 +270,7 @@ async fn a_key_minted_before_demotion_cannot_re_promote_its_owner() {
 }
 
 #[tokio::test]
-#[ignore = "requires TEST_DATABASE_URL pointing at a disposable fully migrated PostgreSQL database"]
+#[ignore = "requires NANOSIEM_TEST_DATABASE_URL pointing at a disposable fully migrated PostgreSQL database"]
 async fn narrow_group_and_role_editors_cannot_strip_authority_they_lack() {
     let pool = pool().await;
     let editor = user(&pool, "active").await;

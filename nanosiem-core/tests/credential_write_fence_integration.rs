@@ -27,7 +27,7 @@ fn ring(active: &str, keys: &[(&str, u8)]) -> EncryptionService {
 
 /// A pool that declares `key` as its write key, like every api/jobs pool.
 async fn writer_pool(key: &str) -> PgPool {
-    let url = std::env::var("DATABASE_URL").unwrap();
+    let url = nanosiem_test_db::require_pg_url();
     rotation::declare_write_key(PgPoolOptions::new().max_connections(3), key.to_owned())
         .connect(&url)
         .await
@@ -58,7 +58,7 @@ async fn cleanup(pool: &PgPool, prefix: &str, keys: &[&str], nodes: &[&str]) {
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn a_paused_writer_holding_a_retired_key_is_refused() {
     let pool = common::migrated_pool().await;
     let s = &Uuid::new_v4().simple().to_string()[..10];
@@ -99,7 +99,7 @@ async fn a_paused_writer_holding_a_retired_key_is_refused() {
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn retirement_waits_for_an_in_flight_writer_then_refuses() {
     let pool = common::migrated_pool().await;
     let s = &Uuid::new_v4().simple().to_string()[..10];
@@ -139,7 +139,7 @@ async fn retirement_waits_for_an_in_flight_writer_then_refuses() {
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn boot_refuses_a_retired_active_key_and_unregistered_keys_cannot_write() {
     let pool = common::migrated_pool().await;
     let s = &Uuid::new_v4().simple().to_string()[..10];
@@ -173,7 +173,7 @@ async fn boot_refuses_a_retired_active_key_and_unregistered_keys_cannot_write() 
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn every_present_secret_column_carries_the_write_fence() {
     let pool = common::migrated_pool().await;
     for target in rotation::TARGETS {
@@ -204,7 +204,7 @@ async fn every_present_secret_column_carries_the_write_fence() {
 /// Codex fence review P2: retirement's confirming scan runs on its own
 /// transaction's connection, so a single-connection pool still retires.
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn retirement_works_on_a_single_connection_pool() {
     let pool = common::migrated_pool().await;
     let s = &Uuid::new_v4().simple().to_string()[..10];
@@ -212,7 +212,7 @@ async fn retirement_works_on_a_single_connection_pool() {
     let node = format!("snode-{s}");
     let current = ring(&k_new, &[(&k_new, 12), (&k_old, 11)]);
     CredentialKeyRepository::new(pool.clone()).register(&current, &node, "jobs").await.unwrap();
-    let url = std::env::var("DATABASE_URL").unwrap();
+    let url = nanosiem_test_db::require_pg_url();
     let one = PgPoolOptions::new()
         .max_connections(1)
         .acquire_timeout(Duration::from_secs(5))

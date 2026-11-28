@@ -138,9 +138,21 @@ def test_wizard_http_json_bad_vrl_then_publish_and_search_ocsf(
         api_bad = expect(client.api.post("/api/log-sources/validate-vrl", json={"vrl_code": BAD_VRL}), 200)
         assert api_bad["valid"] is False and api_bad.get("errors"), api_bad
         page.screenshot("deep-wizard-bad-vrl.png", full_page=False)
-        review = {"role": "button", "name": "Continue · review", "exact": True}
-        assert page.attr(review, "disabled") is not None, "the wizard continues to publish with a VRL compile error"
         publish = {"role": "button", "name": "Publish source", "exact": True}
+        # NAN-6036 (RC3): the user can go on with a parse error; Review must still block Publish.
+        anyway = {"role": "button", "name": "Continue anyway · review", "exact": True}
+        assert page.attr(anyway, "disabled") is None, "Continue anyway is disabled"
+        assert page.count({"testid": "parse-continue-hint"}), "no plain hint about the parse error"
+        page.click(anyway)
+        page.wait_for({"testid": "deploy-gate"}, timeout_ms=30_000)
+        # The parser row itself blocks (not just any gate row), and the gate names it as the reason.
+        page.wait_attr({"testid": "gate-parser"}, "data-status", "block", timeout_ms=30_000)
+        parser_row = " ".join(page.texts({"testid": "gate-parser"}))
+        assert "VRL syntax" in parser_row and "error" in parser_row, parser_row
+        gate_status = " ".join(page.texts({"testid": "gate-status"}))
+        assert gate_status.startswith("Blocked") and "VRL syntax" in gate_status, gate_status
+        page.screenshot("deep-wizard-bad-vrl-review.png", full_page=False)
+        assert page.attr(publish, "disabled") is not None, "Review lets a VRL compile error publish"
         timeline.step("bad VRL refused", errors=api_bad["errors"][:2])
 
         # The fixed parser: valid, its sample test passes, then publish.
@@ -156,9 +168,18 @@ def test_wizard_http_json_bad_vrl_then_publish_and_search_ocsf(
         assert api_test["success"] is True, api_test
         page.click({"role": "button", "name": "Continue · review", "exact": True})
         page.wait_for({"testid": "deploy-gate"})
+        # Same source and sample with the VRL fixed: the parser row clears and Publish enables,
+        # so the compile error was what held it.
+        page.wait_attr({"testid": "gate-parser"}, "data-status", "ok", timeout_ms=30_000)
+        page.wait_attr({"testid": "gate-tests"}, "data-status", "ok", timeout_ms=60_000)
+        gate_rows = {"css": '[data-testid="deploy-gate"] [data-status]'}
+        eventually(lambda: "pending" not in page.attrs(gate_rows, "data-status"),
+                   timeout=30, interval=1, desc="no gate check still pending")
         warn = {"role": "checkbox", "name": uilib.rx("^Publish anyway")}
         if page.count(warn):
             page.click(warn)
+        eventually(lambda: page.attr(publish, "disabled") is None, timeout=30, interval=1,
+                   desc="Publish source enabled once the VRL is fixed")
         page.click(publish)
         page.wait_url(r"/ingestion/log-sources/")
         src = eventually(lambda: source_by_route(client, rk), timeout=60, interval=1, desc="published",

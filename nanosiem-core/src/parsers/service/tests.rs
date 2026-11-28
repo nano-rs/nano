@@ -8,7 +8,7 @@ use super::*;
 
 fn test_service() -> ParserService {
     // Create a mock pool (won't be used for validation tests)
-    let pool = sqlx::PgPool::connect_lazy("postgresql://localhost/test").unwrap();
+    let pool = sqlx::PgPool::connect_lazy("postgresql://unused@127.0.0.1:1/unused").unwrap();
     ParserService::new(pool)
 }
 

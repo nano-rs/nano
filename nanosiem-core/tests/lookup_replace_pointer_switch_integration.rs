@@ -12,7 +12,7 @@
 //! registry UPDATE for this one table, so the publish transaction fails after
 //! every new row is already staged in ClickHouse.
 //!
-//! `#[ignore]`d like the other DB suites: needs Postgres (`DATABASE_URL`) and
+//! `#[ignore]`d like the other DB suites: needs Postgres (`NANOSIEM_TEST_DATABASE_URL`) and
 //! ClickHouse (`CLICKHOUSE_TEST_URL` / `_USER` / `_PASSWORD`).
 
 mod common;
@@ -50,15 +50,15 @@ fn rec(pairs: &[(&str, serde_json::Value)]) -> HashMap<String, serde_json::Value
 
 fn ch_client() -> clickhouse::Client {
     let url =
-        std::env::var("CLICKHOUSE_TEST_URL").unwrap_or_else(|_| "http://localhost:8123".into());
+        nanosiem_test_db::require_ch_url();
     let mut client = clickhouse::Client::default()
         .with_url(url)
         .with_database("nanosiem")
         .with_compression(clickhouse::Compression::None);
-    if let Ok(user) = std::env::var("CLICKHOUSE_TEST_USER") {
+    if let Some(user) = nanosiem_test_db::ch_user() {
         client = client.with_user(user);
     }
-    if let Ok(password) = std::env::var("CLICKHOUSE_TEST_PASSWORD") {
+    if let Some(password) = nanosiem_test_db::ch_password() {
         client = client.with_password(password);
     }
     client
@@ -73,7 +73,7 @@ async fn ch_row_names(ch: &clickhouse::Client, like: &str) -> Vec<String> {
 }
 
 #[tokio::test]
-#[ignore = "requires Postgres (DATABASE_URL) and ClickHouse (CLICKHOUSE_TEST_URL)"]
+#[ignore = "requires Postgres (NANOSIEM_TEST_DATABASE_URL) and ClickHouse (CLICKHOUSE_TEST_URL)"]
 async fn pg_failure_after_staging_keeps_old_generation_and_schema() {
     let pool = common::migrated_pool().await;
     let ch = ch_client();
@@ -230,7 +230,7 @@ async fn pg_failure_after_staging_keeps_old_generation_and_schema() {
 }
 
 #[tokio::test]
-#[ignore = "requires Postgres (DATABASE_URL) and ClickHouse (CLICKHOUSE_TEST_URL)"]
+#[ignore = "requires Postgres (NANOSIEM_TEST_DATABASE_URL) and ClickHouse (CLICKHOUSE_TEST_URL)"]
 async fn concurrent_readers_see_one_complete_generation_during_replace() {
     let pool = common::migrated_pool().await;
     let svc = LookupService::new(ClickHouseLookupRepository::new(pool, ch_client()));
@@ -363,7 +363,7 @@ async fn concurrent_readers_see_one_complete_generation_during_replace() {
 }
 
 #[tokio::test]
-#[ignore = "requires Postgres (DATABASE_URL) and ClickHouse (CLICKHOUSE_TEST_URL)"]
+#[ignore = "requires Postgres (NANOSIEM_TEST_DATABASE_URL) and ClickHouse (CLICKHOUSE_TEST_URL)"]
 async fn append_queued_behind_replace_writes_the_new_generation() {
     let pool = common::migrated_pool().await;
     let svc = LookupService::new(ClickHouseLookupRepository::new(pool.clone(), ch_client()));
@@ -454,7 +454,7 @@ async fn append_queued_behind_replace_writes_the_new_generation() {
 }
 
 #[tokio::test]
-#[ignore = "requires Postgres (DATABASE_URL) and ClickHouse (CLICKHOUSE_TEST_URL)"]
+#[ignore = "requires Postgres (NANOSIEM_TEST_DATABASE_URL) and ClickHouse (CLICKHOUSE_TEST_URL)"]
 async fn failed_cleanup_is_reclaimed_by_a_later_reconciler_pass() {
     let pool = common::migrated_pool().await;
     let ch = ch_client();

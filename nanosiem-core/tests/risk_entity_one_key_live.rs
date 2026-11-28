@@ -18,10 +18,10 @@
 //!   docker run -d --name risk-ch -p 127.0.0.1:18923:8123 \
 //!     -e CLICKHOUSE_USER=nanosiem -e CLICKHOUSE_PASSWORD=nanosiem \
 //!     clickhouse/clickhouse-server:26.10.4.207   # any 25.x+ (stable JSON type)
-//!   RISK_ONE_KEY_CH_URL=http://127.0.0.1:18923 \
+//!   CLICKHOUSE_TEST_URL=http://127.0.0.1:18923 \
 //!     cargo test -p nanosiem-core --test risk_entity_one_key_live -- --ignored --nocapture
 //!
-//! Env: RISK_ONE_KEY_CH_URL (required: no default, so it can never hit a
+//! Env: CLICKHOUSE_TEST_URL (required: no default, so it can never hit a
 //! developer stack by accident), user/password nanosiem/nanosiem.
 
 use std::collections::{BTreeMap, HashMap};
@@ -45,8 +45,7 @@ fn db() -> &'static str {
 }
 
 fn ch_url() -> String {
-    std::env::var("RISK_ONE_KEY_CH_URL")
-        .expect("set RISK_ONE_KEY_CH_URL to a THROWAWAY ClickHouse (see module docs)")
+    nanosiem_test_db::require_ch_url()
 }
 
 fn root_client() -> Client {
@@ -276,7 +275,7 @@ fn expected_types() -> BTreeMap<&'static str, &'static str> {
 /// combined score, typed `hostname`; the #9968 fixes hold (email, no domain,
 /// dotless hosts not `user`). Every builder reader agrees, on both profiles.
 #[tokio::test]
-#[ignore = "requires a throwaway ClickHouse (RISK_ONE_KEY_CH_URL) — run with --ignored"]
+#[ignore = "requires a throwaway ClickHouse (CLICKHOUSE_TEST_URL) — run with --ignored"]
 async fn one_value_stamped_two_ways_is_one_entity_with_the_combined_score() {
     DB.scope("risk_one_key_split_nan5659", split_case()).await
 }
@@ -364,7 +363,7 @@ async fn split_case() {
 /// notable rule's dedup and cooldown key on `risk_entity_field = entity` (the
 /// value), clears and score weights on the value.
 #[tokio::test]
-#[ignore = "requires a throwaway ClickHouse (RISK_ONE_KEY_CH_URL) — run with --ignored"]
+#[ignore = "requires a throwaway ClickHouse (CLICKHOUSE_TEST_URL) — run with --ignored"]
 async fn upgrade_keeps_entity_keys_and_scores_from_v2032() {
     DB.scope("risk_one_key_upgrade_nan5659", upgrade_case()).await
 }

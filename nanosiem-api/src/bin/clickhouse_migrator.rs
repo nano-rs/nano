@@ -1078,6 +1078,35 @@ async fn run() -> Result<()> {
             None
         }
     };
+    // NAN-5907: the event tables only recalculate TTL info on MATERIALIZE TTL
+    // (a retention change no longer rewrites every part). Before the TTL
+    // repair and the NANO_RETENTION_DAYS apply, which both MODIFY TTL.
+    // Resolves `<t>` or `<t>_local` (never a Distributed name); never fatal.
+    let ttl_recalc = migrator.ensure_ttl_recalculate_only().await;
+    if let Some(reason) = &ttl_recalc.skipped {
+        tracing::warn!("NAN-5907: materialize_ttl_recalculate_only step skipped this run (retried next run; retention changes are refused until it succeeds): {reason}");
+    } else if !ttl_recalc.failed.is_empty() {
+        tracing::warn!(
+            failed = ?ttl_recalc.failed.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(),
+            applied = ?ttl_recalc.applied,
+            "NAN-5907: materialize_ttl_recalculate_only could not be set on some tables (retried next run; retention changes on them are refused until it succeeds)"
+        );
+    } else if !ttl_recalc.applied.is_empty() {
+        tracing::info!(
+            applied = ?ttl_recalc.applied,
+            already_set = ttl_recalc.already_set,
+            "NAN-5907: materialize_ttl_recalculate_only applied"
+        );
+    }
+    // SIEM Health notice while it is skipped or failing; resolved on success.
+    match Database::connect(&config.postgres_url).await {
+        Ok(pg_db) => {
+            nanosiem_core::db::clickhouse_migrate::report_ttl_recalc(pg_db.pool(), &ttl_recalc).await;
+            pg_db.close().await;
+        }
+        Err(e) => tracing::warn!(error = %e, "NAN-5907: PostgreSQL unreachable; TTL setting health notice not updated"),
+    }
+
     // Runs BEFORE the NANO_RETENTION_DAYS apply at the end of this function.
     let ttl_repair = migrator.repair_legacy_warm_ttl(saved_retention).await;
     if let Some(reason) = &ttl_repair.skipped {

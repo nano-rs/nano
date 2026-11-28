@@ -11,10 +11,13 @@ members = [
     # NAN-4914: declarative connector engine (open core). Library + operator
     # CLI only; not built into any release image yet (phase 4 adds the runner).
     "nano-connector",
+    # NAN-5967: test-only DB URL / pool helper. Dev-dependency only, never in
+    # a release binary.
+    "nanosiem-test-db",
 ]
 
 [workspace.package]
-version = "2.0.36"
+version = "2.0.37"
 edition = "2021"
 authors = ["NanoSIEM Team"]
 license = "AGPL-3.0-or-later"

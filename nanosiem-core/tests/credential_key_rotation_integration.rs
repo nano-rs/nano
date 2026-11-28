@@ -113,7 +113,7 @@ async fn cleanup(pool: &PgPool, seeded: &[&Seeded], key_ids: &[&str]) {
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn rotation_rewraps_mixed_rows_and_retires_only_unreferenced_keys() {
     let pool = common::migrated_pool().await;
     let suffix = &Uuid::new_v4().simple().to_string()[..10];
@@ -252,7 +252,7 @@ async fn rotation_rewraps_mixed_rows_and_retires_only_unreferenced_keys() {
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn concurrent_writer_wins_over_rewrap() {
     let pool = common::migrated_pool().await;
     let suffix = &Uuid::new_v4().simple().to_string()[..10];
@@ -307,7 +307,7 @@ async fn concurrent_writer_wins_over_rewrap() {
 /// (`credential_rotation_inventory.rs`): every `*_encrypted` / ciphertext
 /// column that actually exists is a re-wrap target or a reasoned exception.
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn every_live_secret_column_is_a_rewrap_target() {
     let pool = common::migrated_pool().await;
     let live: Vec<(String, String)> = sqlx::query_as(

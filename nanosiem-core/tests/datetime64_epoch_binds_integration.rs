@@ -46,11 +46,11 @@ fn env(key: &str) -> String {
 
 async fn dual_pool() -> DualPool {
     let mut config = DualPoolConfig::with_auth(
-        env("DATABASE_URL"),
-        env("NANOSIEM_TEST_CLICKHOUSE_URL"),
+        nanosiem_test_db::require_pg_url(),
+        nanosiem_test_db::require_ch_url(),
         "nanosiem",
-        env("NANOSIEM_TEST_CLICKHOUSE_USER"),
-        env("NANOSIEM_TEST_CLICKHOUSE_PASSWORD"),
+        nanosiem_test_db::ch_user().expect("CLICKHOUSE_TEST_USER must be set for this live suite"),
+        nanosiem_test_db::ch_password().unwrap_or_default(),
     );
     // The raw-SQL feature identities are required at boot (NAN-2001).
     config.clickhouse_rawsql_password = Some(env("CLICKHOUSE_RAWSQL_PASSWORD"));

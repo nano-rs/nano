@@ -46,7 +46,7 @@ async fn wait_for(limit: Duration, what: &str, done: impl Fn() -> bool) {
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn takeover_bumps_the_epoch_after_in_flight_guarded_writes_and_refuses_stale_ones() {
     let pool = common::migrated_pool().await;
     let lock_id: i64 = 0x4e53_0000_0000 | i64::from(rand_suffix());
@@ -204,7 +204,7 @@ fn fake(pool: &sqlx::PgPool, lock_id: i64, supersede: bool, delay: Duration, usa
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn a_superseded_leader_resuming_mid_drop_loop_drops_nothing_more() {
     let pool = common::migrated_pool().await;
     let lock_id = seed_epoch(&pool).await;
@@ -217,7 +217,7 @@ async fn a_superseded_leader_resuming_mid_drop_loop_drops_nothing_more() {
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn the_drop_loop_rechecks_pressure_before_every_drop() {
     let pool = common::migrated_pool().await;
     let lock_id = seed_epoch(&pool).await;
@@ -233,7 +233,7 @@ async fn the_drop_loop_rechecks_pressure_before_every_drop() {
 /// The guard is held across the destructive call: a successor's epoch bump
 /// waits until the in-flight drop (or synthetic publication) finishes.
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn a_takeover_waits_for_an_in_flight_guarded_side_effect() {
     let pool = common::migrated_pool().await;
     let lock_id = seed_epoch(&pool).await;

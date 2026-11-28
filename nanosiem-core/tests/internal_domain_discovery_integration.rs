@@ -26,7 +26,7 @@ fn dest_host_only() -> ArtifactColumns {
 #[tokio::test]
 #[ignore = "requires NANOSIEM_TEST_CLICKHOUSE_URL pointing at a disposable migrated ClickHouse"]
 async fn internal_names_never_consume_the_candidate_budget() {
-    let url = std::env::var("NANOSIEM_TEST_CLICKHOUSE_URL").expect("NANOSIEM_TEST_CLICKHOUSE_URL");
+    let url = nanosiem_test_db::require_ch_url();
     let client = clickhouse::Client::default()
         .with_url(url)
         .with_database("nanosiem")

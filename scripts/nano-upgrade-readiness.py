@@ -1878,9 +1878,8 @@ def evaluate_ingest(ev: dict) -> list:
         add("fluent_24224", label, VERDICT_UNKNOWN, "Vector's counters and sockets could not be read.")
     elif n:
         add("fluent_24224", label, VERDICT_ACTION, f"{n} event(s) on a fluent source since Vector started.",
-            ["2.x publishes 24224 on 127.0.0.1 only. Senders on other hosts need "
-             "NANO_FLUENT_BIND_ADDRESS=0.0.0.0 in .env before the upgrade (unauthenticated; restrict it with "
-             "a firewall)."], events=n)
+            ["2.x does not publish 24224 and has no Fluent Forward listener. Move these senders to "
+             "HTTP /ingest, Splunk HEC or OTLP (all take an ingest token) before the upgrade."], events=n)
     elif listening(24224) or found:
         add("fluent_24224", label, VERDICT_UNUSED, "a listener exists, but no events since Vector started.",
             events=0)

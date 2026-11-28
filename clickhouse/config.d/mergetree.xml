@@ -62,4 +62,11 @@
         <!-- Max parts to merge at once -->
         <max_parts_to_merge_at_once>100</max_parts_to_merge_at_once>
     </merge_tree>
+
+    <!-- NAN-5914: a mutation (ALTER ... DELETE/UPDATE) that still has parts
+         left after 1 hour counts in the NumberOfPendingMutationsOverExecutionTime
+         metric, which the NanoClickHouseMutationStuck alert watches. The
+         ClickHouse default is 24 hours, far too late for nano's rare admin
+         mutations (GDPR erase, feed cleanup). It also shows in system.warnings. -->
+    <max_pending_mutations_execution_time_to_warn>3600</max_pending_mutations_execution_time_to_warn>
 </clickhouse>

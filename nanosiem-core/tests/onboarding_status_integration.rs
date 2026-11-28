@@ -81,7 +81,7 @@ fn wizard_feed(name: &str, vrl: &str, lifecycle: Option<&str>) -> NewLogSource {
 }
 
 #[tokio::test]
-#[ignore = "requires a disposable, freshly migrated Postgres (DATABASE_URL + NANOSIEM_ALLOW_DESTRUCTIVE_TESTS=1)"]
+#[ignore = "requires a disposable, freshly migrated Postgres (NANOSIEM_TEST_DATABASE_URL + NANOSIEM_ALLOW_DESTRUCTIVE_TESTS=1)"]
 async fn each_getting_started_step_clears_from_the_row_its_page_writes() {
     let pool = migrated_pool().await;
 

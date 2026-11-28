@@ -375,10 +375,10 @@ impl DistributedDetectionScheduler {
                 Ok(Some(counters)) if counters.crash_suspected() => suspects.push((rule, counters)),
                 Ok(Some(counters)) => healthy.push((rule, counters)),
                 Ok(None) => warn!(rule_id = %rule.id, "Claim lost before execution; skipping"),
-                Err(e) => warn!(
-                    rule_id = %rule.id,
-                    "Failed to read rule failure counters: {e}; leaving the claim to expire"
-                ),
+                Err(e) => {
+                    warn!(rule_id = %rule.id, "Failed to read rule failure counters: {e}; giving the claim back");
+                    abandon_unstarted_claim(&self.rule_repo, rule.id, &self.node_id).await;
+                }
             }
         }
 
@@ -476,6 +476,20 @@ pub(crate) fn partial_run_error<T>(
     crate::search::partial_run::partial_run_message(notes)
 }
 
+/// NAN-5957: give back a claim whose run never started because the
+/// bookkeeping before it failed (a pool timeout on a busy small install).
+/// A claim left to expire instead reads as a process crash on the next claim
+/// and sends the rule into crash isolation ("[crash?]") though nothing ran.
+/// Best effort: when PostgreSQL is really unreachable this fails too, and the
+/// claim still expires as before.
+async fn abandon_unstarted_claim(rule_repo: &DetectionRuleRepository, rule_id: Uuid, node_id: &str) {
+    match rule_repo.abandon_unstarted_claim(rule_id, node_id).await {
+        Ok(true) => counter!("nanosiem_detection_claims_abandoned_total").increment(1),
+        Ok(false) => {}
+        Err(e) => warn!(%rule_id, "Could not give the claim back ({e}); it expires and is reclaimed later"),
+    }
+}
+
 /// Back-off before a rule whose execution panicked is claimed again (NAN-3080).
 const PANIC_RETRY_BACKOFF_SECS: i64 = 300;
 
@@ -530,7 +544,8 @@ async fn execute_and_release(
                 return;
             }
             Err(e) => {
-                error!(rule_id = %rule.id, "Failed to mark the isolated run: {}; leaving the claim to expire", e);
+                error!(rule_id = %rule.id, "Failed to mark the isolated run: {}; giving the claim back", e);
+                abandon_unstarted_claim(rule_repo, rule.id, node_id).await;
                 return;
             }
         }

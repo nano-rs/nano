@@ -69,6 +69,17 @@ export interface InsertIntegrityMetrics {
   dictionary_memory_probe_ok?: boolean;
   /** NAN-4988: latest durable watchdog transition on each ClickHouse shard. */
   ingest_watchdog?: IngestWatchdogHealth[];
+  /** NAN-5976: ClickHouse errors from inside an upgrade's own restart window.
+   * Shown, not scored. Absent when there are none. */
+  upgrade_transient_errors?: UpgradeTransientError[];
+}
+
+/** NAN-5976: a ClickHouse error counter the upgrade's own restart caused. */
+export interface UpgradeTransientError {
+  name: string;
+  count: number;
+  last_at: string;
+  upgrade_run_id: string;
 }
 
 /** One ClickHouse dictionary's resident memory (NAN-4957). */

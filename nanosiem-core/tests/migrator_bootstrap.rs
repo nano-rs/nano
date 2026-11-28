@@ -17,11 +17,11 @@
 use nanosiem_core::db::ClickHouseMigrator;
 use std::path::PathBuf;
 
-/// Default `http://localhost:18123`. Override with `MIGRATOR_BOOTSTRAP_CH_URL` when
-/// another ClickHouse already owns that port: this test DROPs and recreates its own
-/// database, so never point it at a server you don't own (NAN-4906).
+/// `MIGRATOR_BOOTSTRAP_CH_TEST_URL`, e.g. `http://127.0.0.1:18123` for the docker run
+/// above. No default (NAN-5964): this test DROPs and recreates its own database,
+/// so never point it at a server you don't own (NAN-4906).
 fn ch_url() -> String {
-    std::env::var("MIGRATOR_BOOTSTRAP_CH_URL").unwrap_or_else(|_| "http://localhost:18123".to_string())
+    nanosiem_test_db::dedicated_url(nanosiem_test_db::Db::ClickHouse, "MIGRATOR_BOOTSTRAP_CH_TEST_URL").expect("checked by the test's skip gate")
 }
 /// Default `admin`/`admin` (the docker run above). Override with
 /// `MIGRATOR_BOOTSTRAP_CH_USER` / `MIGRATOR_BOOTSTRAP_CH_PASSWORD` for a server
@@ -74,6 +74,14 @@ fn build_client(database: &str) -> clickhouse::Client {
 
 #[tokio::test]
 async fn migrator_creates_target_database_when_missing() {
+    // NAN-5964: run only against an explicitly named server, with the opt-in.
+    if std::env::var("SKIP_DB_TESTS").is_ok()
+        || nanosiem_test_db::dedicated_url(nanosiem_test_db::Db::ClickHouse, "MIGRATOR_BOOTSTRAP_CH_TEST_URL").is_err()
+        || !matches!(std::env::var("NANOSIEM_ALLOW_DESTRUCTIVE_TESTS").as_deref(), Ok("1" | "true"))
+    {
+        eprintln!("Skipping: set MIGRATOR_BOOTSTRAP_CH_TEST_URL and NANOSIEM_ALLOW_DESTRUCTIVE_TESTS=1");
+        return;
+    }
     if !ch_reachable().await {
         eprintln!(
             "Skipping: ClickHouse not reachable at {} \

@@ -42,8 +42,7 @@ fn restricted(denied: &[String]) -> ArtifactScope {
 fn ch_client() -> Client {
     Client::default()
         .with_url(
-            std::env::var("CLICKHOUSE_TEST_URL")
-                .unwrap_or_else(|_| "http://localhost:8123".to_string()),
+            nanosiem_test_db::require_ch_url(),
         )
         .with_user("nanosiem")
         .with_password("nanosiem")

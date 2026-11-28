@@ -23,7 +23,7 @@ fn record(id: i64, value: &str) -> HashMap<String, serde_json::Value> {
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn reclaimed_generation_fences_the_stale_job_owner() {
     let pool = common::migrated_pool().await;
     let suffix = Uuid::now_v7().simple().to_string();
@@ -129,7 +129,7 @@ async fn reclaimed_generation_fences_the_stale_job_owner() {
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn append_replay_uses_the_same_rows_instead_of_duplicating() {
     let pool = common::migrated_pool().await;
     let suffix = Uuid::now_v7().simple().to_string();
@@ -188,7 +188,7 @@ async fn append_replay_uses_the_same_rows_instead_of_duplicating() {
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn concurrent_health_schedulers_create_one_notification() {
     let pool = common::migrated_pool().await;
     let suffix = Uuid::now_v7().simple().to_string();

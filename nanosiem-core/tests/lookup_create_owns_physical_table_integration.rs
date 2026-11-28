@@ -48,7 +48,7 @@ async fn physical_rows(pool: &PgPool, physical: &str) -> i64 {
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn colliding_sanitized_names_get_separate_tables() {
     let pool = common::migrated_pool().await;
     let svc = LookupService::new(LookupRepository::new(pool.clone()));
@@ -93,7 +93,7 @@ async fn colliding_sanitized_names_get_separate_tables() {
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn create_dynamic_table_refuses_an_existing_table() {
     let pool = common::migrated_pool().await;
     let repo = LookupRepository::new(pool.clone());

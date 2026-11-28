@@ -27,6 +27,35 @@ export function cspHashSource(scriptBody: string): string {
 }
 
 /**
+ * Environments where opt-in error-only Sentry Replay may be enabled at build time.
+ * Checked strictly against the raw `VITE_NANO_SENTRY_ENVIRONMENT` value (never a fallback).
+ */
+export const REPLAY_ALLOWED_ENVIRONMENTS: ReadonlySet<string> = new Set([
+  'local',
+  'e2e',
+  'internal',
+]);
+
+/**
+ * True only when a build explicitly sets a Sentry DSN, opts into Replay (`=1`),
+ * targets an allowed internal/e2e environment, and does not disable Replay via
+ * a `<= 0` `VITE_NANO_SENTRY_REPLAY_ON_ERROR_RATE`.
+ */
+export function isSentryReplayBuildEnabled(env: Record<string, string | undefined>): boolean {
+  const dsn = (env.VITE_NANO_SENTRY_DSN ?? '').trim();
+  const rawEnv = (env.VITE_NANO_SENTRY_ENVIRONMENT ?? '').trim().toLowerCase();
+  if (!dsn || env.VITE_NANO_SENTRY_REPLAY !== '1' || !REPLAY_ALLOWED_ENVIRONMENTS.has(rawEnv)) {
+    return false;
+  }
+  const rawRate = env.VITE_NANO_SENTRY_REPLAY_ON_ERROR_RATE;
+  if (rawRate !== undefined && rawRate.trim() !== '') {
+    const parsed = Number(rawRate);
+    if (Number.isFinite(parsed) && parsed <= 0) return false;
+  }
+  return true;
+}
+
+/**
  * NAN-5798: the origin of an opt-in Sentry DSN, allowed in connect-src so the
  * SDK can send. Empty for every build without `VITE_NANO_SENTRY_DSN`.
  */
@@ -40,7 +69,12 @@ export function sentryConnectOrigin(dsn: string | undefined): string[] {
   }
 }
 
-export function buildCsp(opts: { isDev: boolean; inlineScriptHashes: string[]; connectExtra?: string[] }): string {
+export function buildCsp(opts: {
+  isDev: boolean;
+  inlineScriptHashes: string[];
+  connectExtra?: string[];
+  allowBlobWorker?: boolean;
+}): string {
   // Dev needs 'unsafe-inline' for Vite HMR + React Refresh injected scripts.
   // Prod uses a hash allowlist for the inline scripts in index.html.
   const scriptSrc = opts.isDev
@@ -57,25 +91,35 @@ export function buildCsp(opts: { isDev: boolean; inlineScriptHashes: string[]; c
     ...(opts.connectExtra ?? []),
   ].join(' ');
 
-  return [
+  const directives = [
     "default-src 'self'",
     `script-src ${scriptSrc}`,
     "style-src 'self' 'unsafe-inline'",
     "img-src 'self' data: blob:",
     "font-src 'self' data:",
     `connect-src ${connectSrc}`,
-    "base-uri 'self'",
-    "form-action 'self'",
-  ].join('; ');
+  ];
+  // Sentry Replay's compression Web Worker loads from a blob: URL. Only allow
+  // blob workers in opt-in internal/e2e Replay builds; customer builds stay unchanged.
+  if (opts.allowBlobWorker) {
+    directives.push("worker-src 'self' blob:");
+  }
+  directives.push("base-uri 'self'", "form-action 'self'");
+  return directives.join('; ');
 }
 
 /** Replace the `__CSP__` placeholder with a policy hashed from this HTML's inline scripts. */
-export function applyCsp(html: string, isDev: boolean, connectExtra: string[] = []): string {
+export function applyCsp(
+  html: string,
+  isDev: boolean,
+  connectExtra: string[] = [],
+  allowBlobWorker = false,
+): string {
   if (!html.includes('__CSP__')) {
     throw new Error('csp: index.html is missing the __CSP__ meta placeholder');
   }
   const inlineScriptHashes = extractInlineScripts(html).map(cspHashSource);
-  return html.replace('__CSP__', buildCsp({ isDev, inlineScriptHashes, connectExtra }));
+  return html.replace('__CSP__', buildCsp({ isDev, inlineScriptHashes, connectExtra, allowBlobWorker }));
 }
 
 /** The script-src directive of the CSP meta tag in `html`, or null if absent. */

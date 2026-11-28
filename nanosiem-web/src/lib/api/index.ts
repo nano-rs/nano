@@ -177,6 +177,13 @@ export interface ClockRecoveryRequest {
   host_now_unix_seconds: number;
   license_sha256: string;
   recovery_epoch: number;
+  /** NAN-6017: present only when the license state is behind its clock witness. */
+  generation_lock?: {
+    state_generation: number;
+    witness_generation: number;
+    license_revision: number;
+    witness_recovery_epoch: number;
+  };
 }
 export type {
   MarketplaceCatalogEntry, EnrichmentMarketplaceRepo, CatalogStats,

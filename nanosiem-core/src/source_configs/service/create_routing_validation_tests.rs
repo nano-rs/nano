@@ -67,7 +67,7 @@ fn shared_validator_coerces_like_create_rule() {
 #[tokio::test]
 #[ignore = "requires live Postgres"]
 async fn create_with_initial_rules_against_postgres() {
-    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+    let url = nanosiem_test_db::require_pg_url();
     assert!(
         matches!(std::env::var("NANOSIEM_ALLOW_DESTRUCTIVE_TESTS").as_deref(), Ok("1" | "true")),
         "set NANOSIEM_ALLOW_DESTRUCTIVE_TESTS=1 for a disposable database"

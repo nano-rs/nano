@@ -31,7 +31,7 @@ source_type="conduit_proxy" OR source_type="windows_sysmon"
 "#;
 
 fn ch_url() -> String {
-    std::env::var("CLICKHOUSE_TEST_URL").unwrap_or_else(|_| "http://localhost:8123".into())
+    nanosiem_test_db::require_ch_url()
 }
 
 fn ch_user() -> String {
@@ -166,6 +166,14 @@ SELECT toDateTime64('2026-07-24 13:01:20', 6, 'UTC'), 'windows_sysmon', 'alice',
 
 #[tokio::test]
 async fn udm_drive_by_rule_matches_normalized_campaign() {
+    // NAN-5964: no localhost default, and this test writes data, so it
+    // also needs the destructive-test opt-in.
+    if nanosiem_test_db::ch_url().is_err()
+        || !matches!(std::env::var("NANOSIEM_ALLOW_DESTRUCTIVE_TESTS").as_deref(), Ok("1" | "true"))
+    {
+        eprintln!("Skipping: set CLICKHOUSE_TEST_URL to a throwaway ClickHouse and NANOSIEM_ALLOW_DESTRUCTIVE_TESTS=1");
+        return;
+    }
     if std::env::var("SKIP_DB_TESTS").is_ok() {
         eprintln!("Skipping drive-by rule contract (SKIP_DB_TESTS set)");
         return;

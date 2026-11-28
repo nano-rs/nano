@@ -28,10 +28,9 @@ impl Ch {
     fn from_env() -> Self {
         Self {
             http: reqwest::Client::new(),
-            url: std::env::var("NANOSIEM_TEST_CLICKHOUSE_URL")
-                .expect("NANOSIEM_TEST_CLICKHOUSE_URL must target a disposable ClickHouse"),
-            user: std::env::var("NANOSIEM_TEST_CLICKHOUSE_USER").ok(),
-            password: std::env::var("NANOSIEM_TEST_CLICKHOUSE_PASSWORD").ok(),
+            url: nanosiem_test_db::require_ch_url(),
+            user: nanosiem_test_db::ch_user(),
+            password: nanosiem_test_db::ch_password(),
         }
     }
 

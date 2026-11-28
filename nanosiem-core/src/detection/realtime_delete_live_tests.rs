@@ -49,7 +49,8 @@ async fn stack() -> Option<Stack> {
     if std::env::var("NANOSIEM_TEST_REALTIME").as_deref() != Ok("1") {
         return None;
     }
-    let config = DualPoolConfig::from_env().expect("PG/CH env");
+    let config =
+        DualPoolConfig::from_env_with_urls(nanosiem_test_db::require_pg_url(), nanosiem_test_db::require_ch_url());
     let dual_pool = DualPool::new(&config).await.expect("connect PG + CH");
     let pg = dual_pool.postgres().clone();
     crate::db::run_postgres_migrations(&pg).await.expect("PG migrations");

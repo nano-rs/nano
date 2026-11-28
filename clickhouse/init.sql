@@ -1191,7 +1191,8 @@ PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (source_type, timestamp, src_host, src_ip, cityHash64(id))
 SAMPLE BY cityHash64(id)
 TTL timestamp + toIntervalDay(365)
-SETTINGS index_granularity = 8192, non_replicated_deduplication_window = 1000
+SETTINGS index_granularity = 8192, non_replicated_deduplication_window = 1000,
+    materialize_ttl_recalculate_only = 1
 ;
 
 -- Table: signals
@@ -1221,7 +1222,7 @@ ENGINE = MergeTree
 PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (timestamp, rule_id, risk_entity)
 TTL timestamp + toIntervalDay(365)
-SETTINGS index_granularity = 8192
+SETTINGS index_granularity = 8192, materialize_ttl_recalculate_only = 1
 ;
 
 -- Table: ingestion_errors
@@ -1235,13 +1236,13 @@ CREATE TABLE IF NOT EXISTS nanosiem.ingestion_errors
     `source_info` String DEFAULT '',
     `_inserted_at` DateTime64(6, 'UTC') DEFAULT now64(6),
     INDEX idx_error_type error_type TYPE set(50) GRANULARITY 4,
-    INDEX idx_error_message error_message TYPE tokenbf_v1(32768, 3, 0) GRANULARITY 4
+    INDEX idx_error_message_words lower(error_message) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1
 )
 ENGINE = MergeTree
 PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (timestamp, error_type)
 TTL timestamp + toIntervalDay(90)
-SETTINGS index_granularity = 8192
+SETTINGS index_granularity = 8192, materialize_ttl_recalculate_only = 1
 ;
 
 -- Table: _migrations (tracks applied schema migrations)

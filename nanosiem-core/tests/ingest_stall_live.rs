@@ -18,7 +18,7 @@ fn env(name: &str) -> String {
 #[ignore = "needs a live ClickHouse; run by scripts/e2e/lanes/ingest-workload-deadlock.sh"]
 async fn live_stall_probe_matches_the_server_state() {
     let client = nanosiem_core::db::clickhouse_transport::client()
-        .with_url(env("NAN5296_CH_URL"))
+        .with_url(nanosiem_test_db::dedicated_url(nanosiem_test_db::Db::ClickHouse, "NAN5296_CH_TEST_URL").unwrap_or_else(|unset| panic!("{unset}")))
         .with_user(env("NAN5296_CH_USER"))
         .with_password(env("NAN5296_CH_PASSWORD"));
     let sample = probe(&client).await.expect("stall probe query");

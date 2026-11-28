@@ -231,6 +231,16 @@ impl ClickHouseMigrator {
     /// cannot be detected or a replica is down (NAN-5215: ON CLUSTER DDL waits
     /// for every replica, so the caller skips and the next run retries).
     pub(super) async fn explicit_on_cluster(&mut self) -> Result<String, String> {
+        Ok(self
+            .reachable_explicit_cluster()
+            .await?
+            .map(|cl| format!(" ON CLUSTER '{cl}'"))
+            .unwrap_or_default())
+    }
+
+    /// The explicit (self-managed) cluster name, `None` on a single node or
+    /// ClickHouse Cloud; `Err` as [`Self::explicit_on_cluster`].
+    pub(super) async fn reachable_explicit_cluster(&mut self) -> Result<Option<String>, String> {
         let cluster = self
             .detect_cluster()
             .await
@@ -239,10 +249,10 @@ impl ClickHouseMigrator {
             Some(c) if c != &self.database && !self.is_cloud.unwrap_or(false) => Some(c.clone()),
             _ => None,
         };
-        let Some(cl) = explicit else { return Ok(String::new()) };
+        let Some(cl) = explicit else { return Ok(None) };
         let client = self.client.clone().with_database("default");
         match Self::probe_reachability(&client, &cl).await {
-            Ok(r) if r.all_reachable() => Ok(format!(" ON CLUSTER '{cl}'")),
+            Ok(r) if r.all_reachable() => Ok(Some(cl)),
             Ok(r) => Err(format!("cluster '{cl}': {}", r.describe())),
             Err(e) => Err(format!("cluster '{cl}' reachability probe failed: {e}")),
         }

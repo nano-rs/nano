@@ -83,7 +83,7 @@ const FIXTURES: &[(&str, &str)] = &[
 ];
 
 fn ch_url() -> String {
-    std::env::var("CLICKHOUSE_TEST_URL").unwrap_or_else(|_| "http://localhost:8123".into())
+    nanosiem_test_db::require_ch_url()
 }
 fn ch_user() -> String {
     std::env::var("CLICKHOUSE_ADMIN_USER").unwrap_or_else(|_| "nanosiem_admin".into())
@@ -937,6 +937,14 @@ async fn count(client: &reqwest::Client, db: &str, npl: &str) -> u64 {
 #[ignore = "NAN-1262: harness insert-visibility flakiness; product path validated separately"]
 #[tokio::test]
 async fn ocsf_npl_queries_execute_against_fixtures() {
+    // NAN-5964: no localhost default, and this test writes data, so it
+    // also needs the destructive-test opt-in.
+    if nanosiem_test_db::ch_url().is_err()
+        || !matches!(std::env::var("NANOSIEM_ALLOW_DESTRUCTIVE_TESTS").as_deref(), Ok("1" | "true"))
+    {
+        eprintln!("Skipping: set CLICKHOUSE_TEST_URL to a throwaway ClickHouse and NANOSIEM_ALLOW_DESTRUCTIVE_TESTS=1");
+        return;
+    }
     if std::env::var("SKIP_DB_TESTS").is_ok() {
         eprintln!("Skipping (SKIP_DB_TESTS set)");
         return;
@@ -1351,6 +1359,14 @@ fn review_fixes_array_in_numeric_where_and_wide_stages() {
 /// migrated `nanosiem.ocsf_logs` (skips when none is reachable).
 #[tokio::test]
 async fn review_fix_queries_execute_against_migrated_store() {
+    // NAN-5964: no localhost default, and this test writes data, so it
+    // also needs the destructive-test opt-in.
+    if nanosiem_test_db::ch_url().is_err()
+        || !matches!(std::env::var("NANOSIEM_ALLOW_DESTRUCTIVE_TESTS").as_deref(), Ok("1" | "true"))
+    {
+        eprintln!("Skipping: set CLICKHOUSE_TEST_URL to a throwaway ClickHouse and NANOSIEM_ALLOW_DESTRUCTIVE_TESTS=1");
+        return;
+    }
     if std::env::var("SKIP_DB_TESTS").is_ok() {
         return;
     }
@@ -1396,6 +1412,14 @@ async fn log_source_predicate_matches_the_lower_source_type_index() {
     assert!(DDL.contains("INDEX idx_source_type_lower_set lower(source_type) TYPE set"), "index must be on lower(source_type)");
 
     let client = reqwest::Client::new();
+    // NAN-5964: no localhost default, and this test writes data, so it
+    // also needs the destructive-test opt-in.
+    if nanosiem_test_db::ch_url().is_err()
+        || !matches!(std::env::var("NANOSIEM_ALLOW_DESTRUCTIVE_TESTS").as_deref(), Ok("1" | "true"))
+    {
+        eprintln!("Skipping: set CLICKHOUSE_TEST_URL to a throwaway ClickHouse and NANOSIEM_ALLOW_DESTRUCTIVE_TESTS=1");
+        return;
+    }
     if std::env::var("SKIP_DB_TESTS").is_ok() || !reachable(&client).await {
         return;
     }
@@ -1466,6 +1490,14 @@ fn sort_alias_and_mvexpand_output_resolve_under_ocsf() {
 #[tokio::test]
 async fn sort_alias_and_mvexpand_execute_against_seeded_store() {
     let client = reqwest::Client::new();
+    // NAN-5964: no localhost default, and this test writes data, so it
+    // also needs the destructive-test opt-in.
+    if nanosiem_test_db::ch_url().is_err()
+        || !matches!(std::env::var("NANOSIEM_ALLOW_DESTRUCTIVE_TESTS").as_deref(), Ok("1" | "true"))
+    {
+        eprintln!("Skipping: set CLICKHOUSE_TEST_URL to a throwaway ClickHouse and NANOSIEM_ALLOW_DESTRUCTIVE_TESTS=1");
+        return;
+    }
     if std::env::var("SKIP_DB_TESTS").is_ok() || !reachable(&client).await {
         return;
     }

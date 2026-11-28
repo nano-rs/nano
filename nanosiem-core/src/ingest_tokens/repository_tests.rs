@@ -26,7 +26,7 @@ const KAFKA: Uuid = Uuid::from_u128(0x0c);
 /// A schema with `users`, `log_sources` and `before` applied, then migration
 /// 290. `None` when no test database is configured.
 async fn pool_with(before: &str) -> Option<(PgPool, String)> {
-    let url = std::env::var("NANOSIEM_TEST_DATABASE_URL").ok()?;
+    let url = nanosiem_test_db::pg_url().ok()?;
     let schema = format!("nan4907_{}", Uuid::new_v4().simple());
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)

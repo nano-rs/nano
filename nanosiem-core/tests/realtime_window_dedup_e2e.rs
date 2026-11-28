@@ -39,9 +39,16 @@ use sqlx::PgPool;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-const ADMIN_PG_URL: &str = "postgres://nanosiem:nanosiem@localhost:5432/nanosiem";
 const SCRATCH_DB: &str = "nanosiem_d13_e2e";
-const CH_URL: &str = "http://localhost:8123";
+
+/// NAN-5964: no localhost default; this test drops and recreates a database.
+fn admin_pg_url() -> String {
+    nanosiem_test_db::require_pg_url()
+}
+
+fn ch_url() -> String {
+    nanosiem_test_db::require_ch_url()
+}
 const GROUPED_SOURCE: &str = "d13_test_grouped";
 const PEREVENT_SOURCE: &str = "d13_test_perevent";
 
@@ -224,12 +231,13 @@ fn ensure(cond: bool, msg: String) -> Result<(), String> {
 }
 
 #[tokio::test]
-#[ignore] // Needs the local dev PG (:5432) + CH (:8123); run with -- --ignored.
+#[ignore] // Needs a throwaway PG + CH (NANOSIEM_TEST_DATABASE_URL, CLICKHOUSE_TEST_URL); run with -- --ignored.
 async fn realtime_grouped_dedups_per_entity_window_per_event_unchanged() {
     // ---- Scratch PG database (fresh migrated schema, isolated watermark) ----
-    let admin = PgPool::connect(ADMIN_PG_URL)
+    let admin_url = admin_pg_url();
+    let admin = PgPool::connect(&admin_url)
         .await
-        .expect("connect local Postgres (is the dev stack up?)");
+        .expect("connect test Postgres at NANOSIEM_TEST_DATABASE_URL");
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE IF EXISTS {SCRATCH_DB} WITH (FORCE)")))
         .execute(&admin)
         .await
@@ -239,7 +247,8 @@ async fn realtime_grouped_dedups_per_entity_window_per_event_unchanged() {
         .await
         .expect("create scratch db");
 
-    let scratch_url = format!("postgres://nanosiem:nanosiem@localhost:5432/{SCRATCH_DB}");
+    let (admin_base, _) = admin_url.rsplit_once('/').expect("NANOSIEM_TEST_DATABASE_URL has a database path");
+    let scratch_url = format!("{admin_base}/{SCRATCH_DB}");
     let pg = PgPool::connect(&scratch_url).await.expect("connect scratch db");
     run_postgres_migrations(&pg).await.expect("migrate scratch db");
 
@@ -253,7 +262,7 @@ async fn realtime_grouped_dedups_per_entity_window_per_event_unchanged() {
     // published port.
     let config = DualPoolConfig::with_auth(
         scratch_url.clone(),
-        CH_URL,
+        ch_url(),
         "nanosiem",
         std::env::var("CLICKHOUSE_ADMIN_USER").unwrap_or_else(|_| "nanosiem_admin".into()),
         std::env::var("CLICKHOUSE_ADMIN_PASSWORD").unwrap_or_default(),

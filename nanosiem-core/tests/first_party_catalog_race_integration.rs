@@ -59,8 +59,7 @@ struct Schema {
 
 impl Schema {
     async fn new(apply_migration: bool) -> Self {
-        let url = std::env::var("TEST_DATABASE_URL")
-            .expect("TEST_DATABASE_URL must reference a disposable PostgreSQL database");
+        let url = nanosiem_test_db::require_pg_url();
         let admin = PgPool::connect(&url).await.expect("connect test PostgreSQL");
         let name = format!("first_party_race_{}", Uuid::new_v4().simple());
         sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {name}"))).execute(&admin).await.expect("create schema");

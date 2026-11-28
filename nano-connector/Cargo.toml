@@ -73,6 +73,8 @@ tracing-subscriber = { workspace = true }
 seccompiler = "0.5"
 
 [dev-dependencies]
+# NAN-5967: the one place DB-backed tests get their database URLs and pools.
+nanosiem-test-db = { path = "../nanosiem-test-db" }
 proptest = "1"
 rcgen = "0.14"
 hyper = { version = "1", features = ["http1", "server", "client"] }

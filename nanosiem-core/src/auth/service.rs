@@ -65,14 +65,45 @@ impl CurrentSessionLogout {
     }
 }
 
+/// How a refresh was served (see [`AuthService::refresh_token`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshKind {
+    /// The presented token was the session's current one: it was rotated and
+    /// a new refresh token issued.
+    Rotated,
+    /// NAN-5973 reuse interval: the presented token was the session's
+    /// immediately previous one, within [`REFRESH_GRACE_SECS`] of its
+    /// rotation. The session's CURRENT refresh token is handed back (no new
+    /// branch), so a client whose rotation response was lost catches up.
+    GraceReissued,
+    /// Within the grace window, but the current token could not be re-derived
+    /// (it was minted by a pre-NAN-5973 build, or the refresh TTL changed in
+    /// between). An access token only; `refresh_token` is empty and the
+    /// refresh cookie must be left untouched (the NAN-2453 behaviour).
+    GraceAccessOnly,
+}
+
 /// Result of [`AuthService::refresh_token`].
 #[derive(Debug, Clone)]
 pub struct RefreshOutcome {
-    /// `refresh_token` is empty when `rotated` is false.
+    /// `refresh_token` is empty for [`RefreshKind::GraceAccessOnly`].
     pub tokens: TokenPair,
-    /// `false` for a grace refresh: an access token for the same session, no
-    /// new refresh token, and the refresh cookie must be left untouched.
-    pub rotated: bool,
+    pub kind: RefreshKind,
+    /// The session (token family) that was refreshed, for the audit row.
+    pub session_id: Uuid,
+}
+
+impl RefreshOutcome {
+    /// Whether the response carries a refresh token the client must store
+    /// (and the refresh cookie must be set to).
+    pub fn sets_refresh_token(&self) -> bool {
+        !matches!(self.kind, RefreshKind::GraceAccessOnly)
+    }
+
+    /// Served from the previous-token grace window.
+    pub fn is_grace(&self) -> bool {
+        !matches!(self.kind, RefreshKind::Rotated)
+    }
 }
 
 #[derive(Debug, Error)]
@@ -110,6 +141,14 @@ pub enum AuthError {
 
     #[error("Session not found or expired")]
     SessionNotFound,
+
+    /// NAN-5973: a refresh token that is no longer current was presented
+    /// outside the reuse interval (the previous token after
+    /// [`REFRESH_GRACE_SECS`], or any older token). Treated as theft: the
+    /// whole session (token family) was revoked. Clients see the same 401 as
+    /// [`AuthError::SessionNotFound`]; the session id is for the audit row.
+    #[error("Session not found or expired")]
+    RefreshTokenReused { session_id: Uuid },
 
     #[error("Password does not meet requirements: {0}")]
     PasswordRequirementsNotMet(String),
@@ -648,45 +687,173 @@ impl AuthService {
     /// - 2.3: Allow token refresh using a valid refresh token
     /// - 2.4: Issue new access token and rotate the refresh token
     ///
-    /// NAN-2453 (race-tolerant rotation): the refresh token is single-use, but
-    /// the immediately previous token is honoured for [`REFRESH_GRACE_SECS`]
-    /// after a rotation. Such a "grace" refresh mints an access token for the
-    /// same session and does NOT rotate (`rotated == false`, no new refresh
-    /// token), so two tabs racing on the same cookie both stay signed in and
-    /// the refresh chain is never forked. Older tokens, and the previous token
-    /// after the window, are refused as before.
+    /// Refresh tokens are single-use and rotate on every refresh. NAN-5973
+    /// (reuse interval, replacing the NAN-2453 access-only grace):
+    /// - the session's CURRENT token rotates ([`RefreshKind::Rotated`]);
+    /// - its IMMEDIATELY PREVIOUS token, within [`REFRESH_GRACE_SECS`] of the
+    ///   rotation, gets the session's current refresh token back plus a fresh
+    ///   access token ([`RefreshKind::GraceReissued`]). Nothing new is minted
+    ///   into the chain, so a client whose rotation response was lost (an
+    ///   aborted request) or a racing second tab converges on the same token;
+    /// - the previous token after the window, or any older token of a known
+    ///   session, is reuse: the whole session is revoked and the call fails
+    ///   with [`AuthError::RefreshTokenReused`].
+    ///
+    /// Every step is a single committed statement, so a caller that is
+    /// dropped mid-way never leaves a half-rotated session; the HTTP handler
+    /// additionally runs this on a spawned task so a client disconnect cannot
+    /// cancel it.
     pub async fn refresh_token(
         &self,
         refresh_token: &str,
         _ip_address: Option<&str>,
         _user_agent: Option<&str>,
     ) -> Result<RefreshOutcome, AuthError> {
-        // Validate the refresh token JWT
+        // Validate the refresh token JWT (signature, type, expiry).
         let claims = self.token_service.validate_refresh_token(refresh_token)?;
-
-        // Find the session by its current token hash, else by the immediately
-        // previous one within the grace window.
         let refresh_token_hash = hash_token(refresh_token);
-        let (session, grace) = match self
+
+        let session = match self
             .session_repo
             .get_session_by_token_hash(&refresh_token_hash)
             .await
         {
-            Ok(session) => (session, false),
-            Err(SessionRepositoryError::NotFoundByToken) => (
-                self.grace_session(&refresh_token_hash)
-                    .await?
-                    .ok_or(AuthError::SessionNotFound)?,
-                true,
-            ),
+            Ok(session) => session,
+            Err(SessionRepositoryError::NotFoundByToken) => {
+                return self.refresh_with_rotated_token(&claims, &refresh_token_hash).await;
+            }
             Err(e) => return Err(e.into()),
         };
-        if session.user_id != claims.sub {
-            return Err(AuthError::SessionNotFound);
-        }
+        check_refresh_binding(&claims, &session)?;
+        let roles = self.refresh_roles(&session).await?;
 
-        // Get the user
-        let user = self.user_repo.get_user_by_id(claims.sub).await?;
+        // Rotation (Requirement 2.4). The new token is derived from the token
+        // it replaces so a reuse-interval replay can hand it back later.
+        let new_expires_at = Utc::now() + Duration::seconds(self.token_service.refresh_token_ttl());
+        let exp = new_expires_at.timestamp();
+        let new_refresh_token = self.token_service.rotated_refresh_token(
+            session.user_id,
+            session.id,
+            &refresh_token_hash,
+            exp,
+        )?;
+        let new_expires_at = chrono::DateTime::from_timestamp(exp, 0)
+            .ok_or_else(|| AuthError::InternalError("refresh expiry out of range".into()))?;
+
+        // Compare-and-swap on the old hash so only one concurrent refresh of
+        // a single-use token rotates. A concurrent loser just lost to the
+        // rotation of THIS token, so it takes the reuse-interval path and
+        // gets the winner's token back.
+        match self
+            .session_repo
+            .rotate_refresh_token(
+                session.id,
+                &refresh_token_hash,
+                &hash_token(&new_refresh_token),
+                new_expires_at,
+            )
+            .await
+        {
+            Ok(_) => {
+                let access_token = self
+                    .token_service
+                    .create_access_token_for_session(session.user_id, roles, session.id)?;
+                Ok(RefreshOutcome {
+                    tokens: TokenPair::new(
+                        access_token,
+                        new_refresh_token,
+                        self.token_service.access_token_ttl(),
+                    ),
+                    kind: RefreshKind::Rotated,
+                    session_id: session.id,
+                })
+            }
+            Err(SessionRepositoryError::NotFoundByToken) => {
+                self.refresh_with_rotated_token(&claims, &refresh_token_hash).await
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// A signature-valid refresh token that is not any session's current
+    /// token: the reuse interval, reuse detection, or an unknown session.
+    async fn refresh_with_rotated_token(
+        &self,
+        claims: &super::token::RefreshTokenClaims,
+        refresh_token_hash: &str,
+    ) -> Result<RefreshOutcome, AuthError> {
+        match self
+            .session_repo
+            .find_session_by_previous_token_hash(refresh_token_hash, REFRESH_GRACE_SECS)
+            .await?
+        {
+            Some((session, true)) => {
+                check_refresh_binding(claims, &session)?;
+                let roles = self.refresh_roles(&session).await?;
+                let access_token = self
+                    .token_service
+                    .create_access_token_for_session(session.user_id, roles, session.id)?;
+                // Re-derive the session's current token and hand it out only
+                // if it IS the stored current token.
+                let current = self.token_service.rotated_refresh_token(
+                    session.user_id,
+                    session.id,
+                    refresh_token_hash,
+                    session.expires_at.timestamp(),
+                )?;
+                let (refresh, kind) = if hash_token(&current) == session.refresh_token_hash {
+                    (current, RefreshKind::GraceReissued)
+                } else {
+                    (String::new(), RefreshKind::GraceAccessOnly)
+                };
+                Ok(RefreshOutcome {
+                    tokens: TokenPair::new(access_token, refresh, self.token_service.access_token_ttl()),
+                    kind,
+                    session_id: session.id,
+                })
+            }
+            Some((session, false)) => {
+                // The previous token, after the reuse interval.
+                check_refresh_binding(claims, &session)?;
+                self.revoke_reused_family(session.id, session.user_id).await
+            }
+            None => match claims.sid {
+                // Older than the previous token, or an unknown token of a
+                // session that still exists: reuse of a family member.
+                Some(sid) => self.revoke_reused_family(sid, claims.sub).await,
+                // No family to name (pre-NAN-5973 or demo token): refused.
+                None => Err(AuthError::SessionNotFound),
+            },
+        }
+    }
+
+    /// Revoke the token family `session_id` (scoped to its owner). When it no
+    /// longer exists (logged out, expired, already revoked) this is an
+    /// ordinary unknown-session refusal.
+    async fn revoke_reused_family(
+        &self,
+        session_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<RefreshOutcome, AuthError> {
+        if self
+            .session_repo
+            .revoke_session_family(session_id, user_id)
+            .await?
+        {
+            tracing::warn!(
+                session_id = %session_id,
+                user_id = %user_id,
+                "refresh token reuse detected; session revoked"
+            );
+            Err(AuthError::RefreshTokenReused { session_id })
+        } else {
+            Err(AuthError::SessionNotFound)
+        }
+    }
+
+    /// Account checks and fresh roles for a refresh of `session`.
+    async fn refresh_roles(&self, session: &crate::auth::Session) -> Result<Vec<String>, AuthError> {
+        let user = self.user_repo.get_user_by_id(session.user_id).await?;
 
         // NAN-5014 defense in depth: a session created before the user's
         // forced-revocation watermark is dead even if its row survived (every
@@ -719,70 +886,7 @@ impl AuthService {
         {
             roles.push("demo_analyst".to_string());
         }
-
-        if grace {
-            let access_token =
-                self.token_service
-                    .create_access_token_for_session(user.id, roles, session.id)?;
-            return Ok(RefreshOutcome {
-                tokens: TokenPair::new(access_token, String::new(), self.token_service.access_token_ttl()),
-                rotated: false,
-            });
-        }
-
-        // Create new token pair (Requirement 2.4 - rotation)
-        // Permissions are NOT embedded in the JWT — resolved server-side.
-        let new_token_pair =
-            self.token_service
-                .create_token_pair_for_session(user.id, roles.clone(), session.id)?;
-
-        // Rotate the refresh token in the session
-        let new_refresh_token_hash = hash_token(&new_token_pair.refresh_token);
-        let new_expires_at = Utc::now() + Duration::seconds(self.token_service.refresh_token_ttl());
-
-        // Compare-and-swap on the old hash so only one concurrent refresh of a
-        // single-use token rotates. A concurrent loser falls back to the grace
-        // path (it just lost to the rotation of THIS token) instead of a 401.
-        match self
-            .session_repo
-            .rotate_refresh_token(
-                session.id,
-                &refresh_token_hash,
-                &new_refresh_token_hash,
-                new_expires_at,
-            )
-            .await
-        {
-            Ok(_) => Ok(RefreshOutcome {
-                tokens: new_token_pair,
-                rotated: true,
-            }),
-            Err(SessionRepositoryError::NotFoundByToken) => {
-                let lost = self
-                    .grace_session(&refresh_token_hash)
-                    .await?
-                    .filter(|s| s.id == session.id)
-                    .ok_or(AuthError::SessionNotFound)?;
-                let access_token = self
-                    .token_service
-                    .create_access_token_for_session(lost.user_id, roles, lost.id)?;
-                Ok(RefreshOutcome {
-                    tokens: TokenPair::new(access_token, String::new(), self.token_service.access_token_ttl()),
-                    rotated: false,
-                })
-            }
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    async fn grace_session(
-        &self,
-        refresh_token_hash: &str,
-    ) -> Result<Option<crate::auth::Session>, AuthError> {
-        Ok(self
-            .session_repo
-            .get_session_in_refresh_grace(refresh_token_hash, REFRESH_GRACE_SECS)
-            .await?)
+        Ok(roles)
     }
 
     /// Request a password reset
@@ -1122,11 +1226,18 @@ impl AuthService {
         ip_address: Option<&str>,
         user_agent: Option<&str>,
     ) -> Result<TokenPair, AuthError> {
-        let refresh_token = self.token_service.create_refresh_token(user_id)?;
+        // NAN-5973: the session id is chosen here so the first refresh token
+        // already names its family (`sid`), which lets reuse of it be
+        // detected and the family revoked after later rotations.
+        let session_id = Uuid::new_v4();
+        let refresh_token = self
+            .token_service
+            .create_refresh_token_for_session(user_id, session_id)?;
         let expires_at = Utc::now() + Duration::seconds(self.token_service.refresh_token_ttl());
         let session = self
             .session_repo
-            .create_session(
+            .create_session_with_id(
+                session_id,
                 user_id,
                 &hash_token(&refresh_token),
                 ip_address,
@@ -1203,7 +1314,37 @@ pub(crate) async fn verify_or_burn(password: &str, hash: Option<&str>) -> Result
         .await
         .map_err(|e| AuthError::InternalError(e.to_string()))?
         .unwrap_or(false);
+    #[cfg(feature = "test-support")]
+    if !is_real {
+        dummy_hash_probe::record(password);
+    }
     Ok(is_real && ok)
+}
+
+/// NAN-5984, test-support builds only (never compiled into a release): a
+/// record of which passwords were verified against [`DUMMY_BCRYPT_HASH`], so
+/// a test can assert that the unknown-email path really ran the dummy bcrypt
+/// (the NAN-5066 anti-enumeration property) without timing it.
+#[cfg(feature = "test-support")]
+pub mod dummy_hash_probe {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    fn burns() -> &'static Mutex<HashMap<String, u64>> {
+        static BURNS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+        BURNS.get_or_init(Default::default)
+    }
+
+    pub(crate) fn record(password: &str) {
+        *burns().lock().unwrap_or_else(|e| e.into_inner()).entry(password.to_string()).or_default() += 1;
+    }
+
+    /// How many completed verifications of exactly `password` used the dummy
+    /// hash. Tests pass a unique password per attempt, so parallel tests in
+    /// the same binary cannot disturb the count.
+    pub fn burns_for(password: &str) -> u64 {
+        burns().lock().unwrap_or_else(|e| e.into_inner()).get(password).copied().unwrap_or(0)
+    }
 }
 
 /// Whether a reserved per-email delay slot can be waited out or is too far
@@ -1217,6 +1358,18 @@ enum SlotWait {
 /// A throttle-state database error, as an auth error.
 fn throttle_db(e: sqlx::Error) -> AuthError {
     AuthError::DatabaseError(e.to_string())
+}
+
+/// NAN-5973: a refresh token must belong to the session it was matched to:
+/// same owner, and (when the token names one) the same session id.
+fn check_refresh_binding(
+    claims: &super::token::RefreshTokenClaims,
+    session: &crate::auth::Session,
+) -> Result<(), AuthError> {
+    if session.user_id != claims.sub || claims.sid.is_some_and(|sid| sid != session.id) {
+        return Err(AuthError::SessionNotFound);
+    }
+    Ok(())
 }
 
 /// Hash a token using SHA-256 for storage.

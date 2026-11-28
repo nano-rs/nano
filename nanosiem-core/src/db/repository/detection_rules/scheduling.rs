@@ -557,6 +557,40 @@ impl DetectionRuleRepository {
         Ok(row.and_then(|(cron,)| cron))
     }
 
+    /// Give back a claim this node took but never started to run (NAN-5957):
+    /// the bookkeeping read before the run failed, for example on a pool
+    /// timeout. Undoes the claim's `inflight_claims` increment and leaves the
+    /// schedule, the failure counters, any crash suspicion and a crashed
+    /// predecessor's isolated-run attribution as they were,
+    /// so the rule is simply claimed again on a later poll. Without this the
+    /// claim was left to expire, and the next claim read the expired one as
+    /// a process crash ("[crash?]"), though nothing had run. Returns whether
+    /// this node still held the claim.
+    pub async fn abandon_unstarted_claim(
+        &self,
+        rule_id: Uuid,
+        node_id: &str,
+    ) -> Result<bool, DetectionRuleRepositoryError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE detection_rules
+            SET claimed_by = NULL, claimed_at = NULL,
+                inflight_claims = GREATEST(inflight_claims - 1, 0),
+                -- NAN-5957 review: over a crashed predecessor (inflight > 1)
+                -- the flag is that crash's attribution (an isolated run
+                -- died): keep it. Otherwise it can only be this claim's own
+                -- mark, and this claim never ran. SET reads pre-update values.
+                isolated_claim = CASE WHEN inflight_claims <= 1 THEN false ELSE isolated_claim END
+            WHERE id = $1 AND claimed_by = $2
+            "#,
+        )
+        .bind(rule_id)
+        .bind(node_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     /// Release all claims held by a node (graceful shutdown).
     pub async fn release_all_claims(
         &self,

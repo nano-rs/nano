@@ -63,6 +63,8 @@ utoipa-swagger-ui.workspace = true
 [features]
 default = []
 [dev-dependencies]
+# NAN-5967: the one place DB-backed tests get their database URLs and pools.
+nanosiem-test-db = { path = "../nanosiem-test-db" }
 proptest.workspace = true
 # NAN-5868: paused virtual time for the license-outage supervisor tests.
 tokio = { workspace = true, features = ["test-util"] }

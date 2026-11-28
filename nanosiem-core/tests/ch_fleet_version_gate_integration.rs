@@ -8,15 +8,15 @@
 //! - a 26.8.36.3 node and a 26.10.3.7 node, both replicas of one cluster in
 //!   `remote_servers` (no Keeper needed for `clusterAllReplicas`);
 //! - an HTTP round-robin in front of both (nginx `upstream`), passed as
-//!   `CH_MIXED_FLEET_URL`. The client logs in as `CH_MIXED_FLEET_USER`
+//!   `CH_MIXED_FLEET_TEST_URL`. The client logs in as `CH_MIXED_FLEET_USER`
 //!   (default `nanosiem_admin`) with `CH_MIXED_FLEET_PASSWORD` (default
 //!   `CLICKHOUSE_ADMIN_PASSWORD`). Not `default`: with nano's users.d the
 //!   passwordless `default` user is container-local (security review
 //!   2026-11-08) and the round-robin reaches it over the network.
 //!
-//! Skips unless `CH_MIXED_FLEET_URL` is set. Optionally `CLICKHOUSE_TEST_URL`
+//! Skips unless `CH_MIXED_FLEET_TEST_URL` is set. Optionally `CLICKHOUSE_TEST_URL`
 //! (a single 26.10 node) checks the single-node fallback.
-//!   CH_MIXED_FLEET_URL=http://127.0.0.1:18495 \
+//!   CH_MIXED_FLEET_TEST_URL=http://127.0.0.1:18495 \
 //!     cargo test -p nanosiem-core --test ch_fleet_version_gate_integration -- --nocapture
 
 use std::collections::BTreeSet;
@@ -32,8 +32,8 @@ const SPILL_PROBE: &str =
 
 #[tokio::test]
 async fn gated_settings_stay_off_while_any_replica_is_old() {
-    let Ok(url) = std::env::var("CH_MIXED_FLEET_URL") else {
-        eprintln!("Skipping: CH_MIXED_FLEET_URL not set");
+    let Ok(url) = nanosiem_test_db::dedicated_url(nanosiem_test_db::Db::ClickHouse, "CH_MIXED_FLEET_TEST_URL") else {
+        eprintln!("Skipping: CH_MIXED_FLEET_TEST_URL not set");
         return;
     };
     let ch = client()
@@ -85,7 +85,7 @@ async fn gated_settings_stay_off_while_any_replica_is_old() {
 
 #[tokio::test]
 async fn single_node_falls_back_to_its_own_version() {
-    let Ok(url) = std::env::var("CLICKHOUSE_TEST_URL") else {
+    let Ok(url) = nanosiem_test_db::ch_url() else {
         eprintln!("Skipping: CLICKHOUSE_TEST_URL not set");
         return;
     };

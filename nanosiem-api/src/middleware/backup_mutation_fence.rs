@@ -378,9 +378,9 @@ mod tests {
     #[tokio::test]
     async fn concurrent_mutations_use_one_dedicated_lock_connection_per_process() {
         let check_pool = PgPoolOptions::new()
-            .connect_lazy("postgres://unused@127.0.0.1/unused")
+            .connect_lazy("postgres://unused@127.0.0.1:1/unused")
             .unwrap();
-        let fence = BackupMutationFence::new(check_pool, "postgres://unused@127.0.0.1/unused");
+        let fence = BackupMutationFence::new(check_pool, "postgres://unused@127.0.0.1:1/unused");
         assert_eq!(
             fence.inner.lock_pool.options().get_max_connections(),
             FENCE_LOCK_POOL_CONNECTIONS
@@ -395,9 +395,9 @@ mod tests {
     #[tokio::test]
     async fn response_body_owns_the_lease_until_stream_completion() {
         let check_pool = PgPoolOptions::new()
-            .connect_lazy("postgres://unused@127.0.0.1/unused")
+            .connect_lazy("postgres://unused@127.0.0.1:1/unused")
             .unwrap();
-        let fence = BackupMutationFence::new(check_pool, "postgres://unused@127.0.0.1/unused");
+        let fence = BackupMutationFence::new(check_pool, "postgres://unused@127.0.0.1:1/unused");
         // No database transaction is needed for this ownership test. The
         // missing transaction deliberately exercises only the counter path.
         fence.inner.state.lock().await.in_flight = 1;

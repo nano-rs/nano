@@ -333,7 +333,10 @@ export function RetentionPanel({
             {current == null && 'The current retention could not be read, so this may shorten it. '}
             Events older than{' '}
             <span className="text-foreground font-medium font-mono">{valid ? parsed : ''} days</span> are deleted in
-            the background, including the audit trail stored in the event table. This cannot be undone.
+            the background, including the audit trail stored in the event table. Whole days that are past the new
+            limit go first, usually within minutes. Events are stored in blocks, and a block that also holds newer events is
+            kept until all of its events are past the limit, so some older events can stay visible for up to a day.
+            This cannot be undone.
           </>
         }
         confirmLabel="Reduce retention"

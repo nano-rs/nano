@@ -406,10 +406,11 @@ fn vector_inserts_as_its_own_user_on_every_topology() {
         !enterprise.contains("CLICKHOUSE_USER:"),
         "role-split vector overrides CLICKHOUSE_USER; it must inherit nanosiem_vector"
     );
-    let helm = std::fs::read_to_string(repo_root().join("deploy/helm/nano/templates/vector/deployment.yaml")).unwrap();
+    let helm = std::fs::read_to_string(repo_root().join("deploy/helm/nano/templates/vector/statefulset.yaml"))
+        .expect("read the helm vector StatefulSet (NAN-5979 replaced the Deployment)");
     assert!(
         helm.contains("- name: CLICKHOUSE_USER\n              value: nanosiem_vector"),
-        "helm vector deployment must set CLICKHOUSE_USER=nanosiem_vector"
+        "helm vector StatefulSet must set CLICKHOUSE_USER=nanosiem_vector"
     );
 }
 

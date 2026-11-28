@@ -189,6 +189,7 @@ impl utoipa::OpenApi for SettingsApiDoc {
                     ai_providers::AvailableModelResponse,
                     ai_providers::CreateAvailableModelRequest,
                     ai_providers::UpdateAvailableModelRequest,
+                    ai_providers::ModelApiType,
                     ai_providers::ModelCatalogSyncResponse,
                     ai_providers::ModelCatalogStatusResponse,
                     operational::HealthMonitoringSettingsResponse,

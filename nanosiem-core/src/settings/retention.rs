@@ -62,6 +62,9 @@ pub(crate) fn retention_tables_for(active: &'static str) -> Vec<&'static str> {
 /// The DELETE TTL a retention change applies to `table`. A metadata ALTER;
 /// the server re-evaluates existing parts in a background mutation
 /// (`materialize_ttl_after_modify`), so the request never waits on a rewrite.
+/// NAN-5907: the event tables carry `materialize_ttl_recalculate_only = 1`
+/// (init DDL + migrator step ttl_recalc.rs), so that mutation only rewrites each part's TTL info; fully
+/// expired parts are then dropped whole by the TTL merge.
 ///
 /// NAN-5449: every table except the UDM `logs` keeps the NAN-1384 guard from
 /// migration 127 (`DELETE WHERE timestamp > 2000-01-01`). Without it a
@@ -76,6 +79,16 @@ pub(crate) fn retention_ttl_sql(table: &str, on_cluster: &str, days: u32) -> Str
              WHERE timestamp > toDateTime64('2000-01-01 00:00:00', 3, 'UTC')"
         )
     }
+}
+
+/// NAN-5907: `ALTER TABLE <t> MODIFY SETTING materialize_ttl_recalculate_only
+/// = 1`, run on every table right before a retention change or a run-now
+/// touches its TTL. Without it the MATERIALIZE TTL that follows rewrites every
+/// part of the table. Metadata-only and idempotent; the migrator step
+/// (`clickhouse_migrate::ttl_recalc`) normally set it already. A failure
+/// refuses the retention change ([`RetentionError::ClickHouse`]).
+pub(crate) fn recalc_only_guard_sql(table: &str, on_cluster: &str) -> String {
+    format!("ALTER TABLE {table}{on_cluster} MODIFY SETTING materialize_ttl_recalculate_only = 1")
 }
 
 /// Smallest and largest event retention nano accepts (API, UI, migrator).
@@ -882,7 +895,10 @@ impl ClickHouseStorageService {
         // so all shards keep the same retention window.
         // NAN-5346: also the UDM `logs` table under OCSF (retention_tables_for).
         let on_cluster = on_cluster_clause();
-        for table in retention_tables_for(crate::schema::active_logs_table()) {
+        let tables = retention_tables_for(crate::schema::active_logs_table());
+        // NAN-5907: every table first, so a failure changes no TTL at all.
+        self.ensure_recalc_only(&tables, &on_cluster).await?;
+        for table in tables {
             self.client
                 .query(&retention_ttl_sql(table, &on_cluster, days))
                 .execute()
@@ -890,6 +906,24 @@ impl ClickHouseStorageService {
                 .map_err(|e| RetentionError::ClickHouse(format!("{table}: {e}")))?;
         }
 
+        Ok(())
+    }
+
+    /// NAN-5907: make sure each table only recalculates TTL info on MATERIALIZE
+    /// TTL before anything re-TTLs it; refuse (no TTL change) when it cannot.
+    async fn ensure_recalc_only(&self, tables: &[&str], on_cluster: &str) -> Result<(), RetentionError> {
+        for table in tables {
+            self.client
+                .query(&recalc_only_guard_sql(table, on_cluster))
+                .execute()
+                .await
+                .map_err(|e| {
+                    RetentionError::ClickHouse(format!(
+                        "{table}: could not set materialize_ttl_recalculate_only, so the retention was not \
+                         changed (changing it would rewrite every stored event): {e}"
+                    ))
+                })?;
+        }
         Ok(())
     }
 
@@ -957,12 +991,18 @@ impl ClickHouseStorageService {
 
         // NAN-5450: MATERIALIZE TTL only. With `ttl_only_drop_parts = 1`
         // (server default, clickhouse/config.d/mergetree.xml) expired parts
-        // are dropped whole, which frees space without a merge. The old
+        // are dropped whole, which frees space without a merge. NAN-5907: with
+        // `materialize_ttl_recalculate_only = 1` (ttl_recalc.rs) the mutation
+        // itself only refreshes TTL info; the drop follows as a TTL merge, so
+        // the count below can miss rows that merge has not dropped yet. The old
         // `OPTIMIZE ... FINAL` that followed rewrote the whole table: heavy on
         // a healthy disk and refused (silently, as far as the caller could
         // tell) on a full one, where it needs room for a merged copy.
         // `mutations_sync = 1` waits for this replica's mutation so the
         // returned count reflects the drop (the handler bounds the wait).
+        // NAN-5907: never let MATERIALIZE TTL rewrite every part.
+        self.ensure_recalc_only(&retention_tables_for(local_logs_table), &on_cluster)
+            .await?;
         self.client
             .query(&format!(
                 "ALTER TABLE {local_logs_table}{on_cluster} MATERIALIZE TTL"

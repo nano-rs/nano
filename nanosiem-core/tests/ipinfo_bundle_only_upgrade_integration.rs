@@ -31,8 +31,7 @@ const MIGRATION_312: &str = include_str!("../../migrations/postgres/312_threatfo
 const BYO_URL: &str = "https://ipinfo.io/data/ipinfo_lite.csv.gz?token=byo-upgrade-test";
 
 async fn fresh_db() -> (sqlx::PgPool, sqlx::PgPool, String) {
-    let url = std::env::var("NANOSIEM_TEST_DATABASE_URL")
-        .expect("NANOSIEM_TEST_DATABASE_URL must target a disposable PostgreSQL");
+    let url = nanosiem_test_db::require_pg_url();
     let admin = sqlx::PgPool::connect(&url).await.unwrap();
     let name = format!("ipinfo_{}", &uuid::Uuid::now_v7().simple().to_string()[18..]);
     sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}"))).execute(&admin).await.unwrap();

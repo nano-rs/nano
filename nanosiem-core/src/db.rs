@@ -9,6 +9,7 @@ pub mod clickhouse_transport;
 pub mod config;
 pub mod dual_pool;
 pub mod future_timestamp_repair;
+pub mod listener;
 pub mod migration_refresh;
 pub mod migrations;
 pub mod pg_text;

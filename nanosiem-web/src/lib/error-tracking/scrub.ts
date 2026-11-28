@@ -122,6 +122,19 @@ export function scrubLog<T extends LogLike>(log: T): T {
   return scrubValue(log);
 }
 
+/** CSS selectors masked and blocked in error-only Sentry Replays. */
+export const REPLAY_MASK_SELECTORS: readonly string[] = [
+  '[data-secret]',
+  'input[type="password"]',
+  '[data-testid*="token"]',
+  '[data-testid*="secret"]',
+];
+
+/** Scrub secrets from Sentry Replay recording events (console, navigation, network breadcrumbs). */
+export function scrubReplayRecordingEvent<T>(event: T): T {
+  return scrubValue(event);
+}
+
 const str = (v: unknown): string | undefined => (typeof v === 'string' ? v : undefined);
 
 export function eventText(event: SentryPayload): string {
@@ -172,11 +185,14 @@ export function memoryCounterStore(): CounterStore {
   return { get: (k) => m.get(k) ?? 0, set: (k, v) => { m.set(k, v); } };
 }
 
+export const DEFAULT_MAX_REPLAYS = 3;
+
 export interface GateOptions {
   maxPerIssue: number;
   maxEvents: number;
   maxTransactions: number;
   maxLogs: number;
+  maxReplays?: number;
   tags: () => Record<string, string>;
   store: CounterStore;
 }
@@ -185,6 +201,7 @@ export interface GateOptions {
 export function createGate(opts: GateOptions) {
   // Issue counts stay in memory; the session totals persist across reloads.
   const perIssue = new Map<string, number>();
+  const maxReplays = opts.maxReplays ?? DEFAULT_MAX_REPLAYS;
   const bump = (key: string, max: number) => {
     const n = opts.store.get(key);
     if (n >= max) return false;
@@ -214,6 +231,10 @@ export function createGate(opts: GateOptions) {
       const clean = scrubLog(log);
       clean.attributes = { ...(clean.attributes ?? {}), ...opts.tags() };
       return clean;
+    },
+    replay(event?: SentryPayload): boolean {
+      if (event && BENIGN_ERRORS.some((rx) => rx.test(eventText(event)))) return false;
+      return bump('replays', maxReplays);
     },
   };
 }

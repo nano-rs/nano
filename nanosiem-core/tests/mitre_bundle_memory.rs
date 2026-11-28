@@ -10,7 +10,7 @@
 //! ```text
 //! MITRE_BUNDLE_PATH=/path/enterprise-attack.json \
 //!   cargo test -p nanosiem-core --test mitre_bundle_memory -- --ignored --nocapture real_bundle
-//! MITRE_BUNDLE_PATH=... MITRE_PG_URL=postgres://... \
+//! MITRE_BUNDLE_PATH=... NANOSIEM_TEST_DATABASE_URL=postgres://... \
 //!   cargo test -p nanosiem-core --test mitre_bundle_memory -- --ignored --nocapture pg_path
 //! ```
 
@@ -164,12 +164,12 @@ fn real_bundle_parse_peak_heap() {
 /// container (fixture key), write it to PostgreSQL, then apply the verified
 /// bytes in place. Measured against a scratch database of its own.
 #[test]
-#[ignore = "needs MITRE_BUNDLE_PATH and a scratch MITRE_PG_URL"]
+#[ignore = "needs MITRE_BUNDLE_PATH and a scratch NANOSIEM_TEST_DATABASE_URL"]
 fn real_bundle_install_path_peak_heap() {
     use nanosiem_core::content_bundle::{channels, contract, tree};
     let _guard = SERIAL.lock().unwrap();
     let path = std::env::var("MITRE_BUNDLE_PATH").expect("MITRE_BUNDLE_PATH");
-    let url = std::env::var("MITRE_PG_URL").expect("MITRE_PG_URL");
+    let url = nanosiem_test_db::require_pg_url();
     let key = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
     let ring = nanosiem_core::platform_enrichment::portable::KeyRing::from_hex(&[(
         "fixture-nan5668",
@@ -242,11 +242,11 @@ fn real_bundle_install_path_peak_heap() {
 }
 
 #[test]
-#[ignore = "needs MITRE_BUNDLE_PATH and a scratch MITRE_PG_URL"]
+#[ignore = "needs MITRE_BUNDLE_PATH and a scratch NANOSIEM_TEST_DATABASE_URL"]
 fn real_bundle_pg_path_peak_heap() {
     let _guard = SERIAL.lock().unwrap();
     let path = std::env::var("MITRE_BUNDLE_PATH").expect("MITRE_BUNDLE_PATH");
-    let url = std::env::var("MITRE_PG_URL").expect("MITRE_PG_URL");
+    let url = nanosiem_test_db::require_pg_url();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

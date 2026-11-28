@@ -193,8 +193,13 @@ mod live {
     }
 
     async fn local_clickhouse() -> Option<clickhouse::Client> {
+        // NAN-5964: no localhost default.
+        let Ok(url) = nanosiem_test_db::ch_url() else {
+            eprintln!("Skipping: CLICKHOUSE_TEST_URL is not set");
+            return None;
+        };
         let client = clickhouse::Client::default()
-            .with_url("http://localhost:8123")
+            .with_url(url)
             .with_database("nanosiem");
         match client.query("SELECT toUInt8(1)").fetch_one::<u8>().await {
             Ok(_) => Some(client),

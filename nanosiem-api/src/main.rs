@@ -142,7 +142,7 @@ async fn async_main() -> Result<()> {
     // worker starts. A partial online tuple and a never-checked fresh install
     // fail closed; no configuration falls through to C05/legacy authority.
     #[cfg(feature = "enterprise")]
-    initialize_license_admission(&state).await;
+    let license_boot = initialize_license_admission(&state).await;
 
     // Initialize demo service if DEPLOYMENT_MODE=demo
     if let Err(e) = state.init_demo_if_enabled().await {
@@ -424,7 +424,7 @@ async fn async_main() -> Result<()> {
         // Request handlers consume only its cached snapshot.
         let refresh_state = state.clone();
         let refresh_handle = tokio::spawn(async move {
-            run_sovereign_license_refresh(refresh_state).await;
+            run_sovereign_license_refresh(refresh_state, license_boot).await;
         });
         state.add_task_handle(refresh_handle).await;
         // NAN-5893: keep the frozen-clock runtime across restarts.
@@ -432,6 +432,13 @@ async fn async_main() -> Result<()> {
             nanosiem_api::license_admission::run_runtime_checkpoints(state.clone()),
         );
         state.add_task_handle(checkpoint_handle).await;
+        // NAN-5890: close admission at the monotonic hard stop or when no
+        // validation lands within the outage grace, even if a stalled store
+        // holds the refresh up.
+        let enforcer_handle = tokio::spawn(
+            nanosiem_api::license_admission::run_admission_enforcer(state.clone()),
+        );
+        state.add_task_handle(enforcer_handle).await;
         tracing::info!("C05/legacy license refresh started (30s interval, runtime checkpoint 2s)");
     } else {
         tracing::error!("Incomplete online license configuration remains locked until restart");
@@ -535,8 +542,11 @@ async fn async_main() -> Result<()> {
     Ok(())
 }
 
+/// Returns the delay before the C05 refresher's first pass: sooner when the
+/// boot refresh failed (NAN-5890).
 #[cfg(feature = "enterprise")]
-async fn initialize_license_admission(state: &AppState) {
+async fn initialize_license_admission(state: &AppState) -> std::time::Duration {
+    let normal = nanosiem_api::license_admission::next_refresh_delay(Ok(()), false);
     match state.config.online_license_config() {
         Ok(Some(online)) => {
             let checker = LicenseChecker::new(
@@ -553,7 +563,7 @@ async fn initialize_license_admission(state: &AppState) {
                 tracing::error!(%error, "Initial online license check failed; using only a previously successful bounded cache");
             }
         }
-        Ok(None) => refresh_sovereign_license_status(state).await,
+        Ok(None) => return refresh_sovereign_license_status(state, true).await,
         Err(error) => {
             tracing::error!(%error, "Incomplete online license configuration; failing closed");
             let snapshot = nanosiem_api::license_admission::OfflineLicenseSnapshot::Unavailable(
@@ -563,10 +573,15 @@ async fn initialize_license_admission(state: &AppState) {
             *state.offline_license_snapshot.write().await = snapshot;
         }
     }
+    normal
 }
 
+/// One durable C05 refresh. Returns how long to wait before the next one
+/// (NAN-5890): 5s while a storage outage rides the grace (or `booting`), 2s
+/// while a first import finishes, else 30s.
 #[cfg(feature = "enterprise")]
-async fn refresh_sovereign_license_status(state: &AppState) {
+async fn refresh_sovereign_license_status(state: &AppState, booting: bool) -> std::time::Duration {
+    use nanosiem_api::license_admission::{next_refresh_delay, record_refresh_failure};
     match nanosiem_api::license_admission::refresh_offline_snapshot(state, true).await {
         Ok(snapshot) => {
             if let Some(grace) = snapshot.legacy_grace() {
@@ -586,20 +601,23 @@ async fn refresh_sovereign_license_status(state: &AppState) {
                     );
                 }
             }
+            next_refresh_delay(Ok(()), false)
         }
         Err(error) => {
-            tracing::warn!(%error, "C05 authority refresh failed");
-            nanosiem_api::license_admission::record_refresh_failure(&state, &error).await;
+            // `record_refresh_failure` owns the (rate-limited) logging.
+            let kept = record_refresh_failure(state, &error).await;
+            next_refresh_delay(Err(&error), kept || booting)
         }
     }
 }
 
+/// The API's durable C05 refresh loop (see `refresh_sovereign_license_status`
+/// for the cadence).
 #[cfg(feature = "enterprise")]
-async fn run_sovereign_license_refresh(state: AppState) {
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-    interval.tick().await;
+async fn run_sovereign_license_refresh(state: AppState, first_delay: std::time::Duration) {
+    let mut delay = first_delay;
     loop {
-        interval.tick().await;
-        refresh_sovereign_license_status(&state).await;
+        tokio::time::sleep(delay).await;
+        delay = refresh_sovereign_license_status(&state, false).await;
     }
 }

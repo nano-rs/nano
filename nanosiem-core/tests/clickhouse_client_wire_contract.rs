@@ -31,18 +31,14 @@ use nanosiem_core::search::{search_error_from_error, SearchError};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-fn env(key: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| panic!("{key} must be set for this live suite"))
-}
-
 fn base() -> clickhouse::Client {
-    clickhouse::Client::default().with_url(env("NANOSIEM_TEST_CLICKHOUSE_URL"))
+    clickhouse::Client::default().with_url(nanosiem_test_db::require_ch_url())
 }
 
 fn admin() -> clickhouse::Client {
     base()
-        .with_user(env("NANOSIEM_TEST_CLICKHOUSE_USER"))
-        .with_password(env("NANOSIEM_TEST_CLICKHOUSE_PASSWORD"))
+        .with_user(nanosiem_test_db::ch_user().expect("CLICKHOUSE_TEST_USER must be set for this live suite"))
+        .with_password(nanosiem_test_db::ch_password().unwrap_or_default())
         // Readonly users may not set anything, so only the writer pins this.
         .with_setting("async_insert", "0")
 }

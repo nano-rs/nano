@@ -29,7 +29,7 @@ async fn scratch_db(prefix: &str) -> (PgPool, PgPool, String) {
         .execute(&admin)
         .await
         .expect("create scratch database");
-    let base = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+    let base = nanosiem_test_db::require_pg_url();
     let (head, query) = match base.split_once('?') {
         Some((h, q)) => (h.to_string(), format!("?{q}")),
         None => (base.clone(), String::new()),

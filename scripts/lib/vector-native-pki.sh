@@ -770,23 +770,75 @@ USAGE
 # EXIT trap reopens on any exit in between (scripts/lib/vector-quiesce.sh).
 # Role split: the ingest host's edge is closed by its install/upgrade flow, so
 # the restart stays as it was.
+# NAN-5966: the command to restart Vector by hand with this install's own
+# Compose files; empty when compose_restart_vector refused the overlay list.
+NANO_VQ_PKI_RESTART_HINT=""
+pki_restart_hint() {
+    local argument
+    NANO_VQ_PKI_RESTART_HINT='docker compose'
+    for argument in "$@"; do NANO_VQ_PKI_RESTART_HINT+=" $(printf '%q' "$argument")"; done
+    NANO_VQ_PKI_RESTART_HINT+=' restart vector'
+}
+# NAN-5966: a single host's Compose arguments: the install's overlays too (TLS,
+# Agent Lane gate), read and checked by scripts/lib/compose-overlays.sh exactly
+# as scripts/nano does (NAN-5968), so a Compose call here (and the hints it
+# prints) never recreates nginx without HTTPS. Sets PKI_COMPOSE_ARGS, or prints
+# why and returns 1 without changing anything.
+PKI_COMPOSE_ARGS=()
+pki_single_host_args() {
+    local install="$1"
+    PKI_COMPOSE_ARGS=()
+    if [[ ! -f "$install/.env" ]]; then
+        note "!! $install/.env is missing; run install.sh first."
+        return 1
+    fi
+    # NAN-5968: the same reader and checks as scripts/nano (one shared lib).
+    if ! declare -F nano_overlay_args >/dev/null; then
+        if [[ ! -r "$LIB_DIR/compose-overlays.sh" ]]; then
+            note "!! scripts/lib/compose-overlays.sh is missing; the install is incomplete. Re-extract the release bundle."
+            return 1
+        fi
+        # shellcheck source=scripts/lib/compose-overlays.sh
+        . "$LIB_DIR/compose-overlays.sh"
+    fi
+    if ! nano_overlay_args "$install"; then
+        note "!! $NANO_OVERLAY_ERROR. Fix .env, then run this again."
+        return 1
+    fi
+    PKI_COMPOSE_ARGS=(--project-directory "$install" --env-file "$install/.env" -f "$install/docker-compose.opensource.yml"
+        ${NANO_OVERLAY_ARGS[@]+"${NANO_OVERLAY_ARGS[@]}"})
+}
 compose_restart_vector() {
     local install="$1" args=() rc=0
+    NANO_VQ_PKI_RESTART_HINT=""
+    if [[ ! -f "$install/.env" ]]; then
+        note "!! $install/.env is missing; run install.sh first."
+        return 1
+    fi
     if [[ -f "$install/.nano-role.env" ]]; then
         args=(--project-directory "$install/deploy/compose" --env-file "$install/.env"
             --env-file "$install/.nano-role.env" -f "$install/deploy/compose/docker-compose.enterprise.yml")
+        pki_restart_hint "${args[@]}"
         docker compose "${args[@]}" restart vector </dev/null >/dev/null 2>&1
         return
     fi
-    args=(--project-directory "$install" --env-file "$install/.env" -f "$install/docker-compose.opensource.yml")
+    pki_single_host_args "$install" || return 1
+    args=("${PKI_COMPOSE_ARGS[@]}")
+    pki_restart_hint "${args[@]}"
     if [[ ! -r "$LIB_DIR/vector-quiesce.sh" ]]; then
         note "!! scripts/lib/vector-quiesce.sh is missing: restarting Vector without closing ingest first"
         docker compose "${args[@]}" restart vector </dev/null >/dev/null 2>&1
         return
     fi
+    NANO_VQ_PKI_COMPOSE_ARGS=("${args[@]}")
+    # NAN-5966: the lib's "run: ..." hints print this install's full command.
+    nano_vq_compose_text() {
+        local argument
+        printf 'docker compose'
+        for argument in "${NANO_VQ_PKI_COMPOSE_ARGS[@]}"; do printf ' %q' "$argument"; done
+    }
     # shellcheck source=scripts/lib/vector-quiesce.sh
     . "$LIB_DIR/vector-quiesce.sh"
-    NANO_VQ_PKI_COMPOSE_ARGS=("${args[@]}")
     nano_vq_compose() { ${NANO_VQ_LIMIT:+timeout "$NANO_VQ_LIMIT"} docker compose "${NANO_VQ_PKI_COMPOSE_ARGS[@]}" "$@"; }
     declare -F log >/dev/null || log() { note "$*"; }
     declare -F warn >/dev/null || warn() { note "warning: $*"; }
@@ -889,8 +941,12 @@ cmd_client_cert() {
                 if compose_restart_vector "$install"; then
                     note "Restarted Vector: '$name' is refused from now on."
                 else
-                    note "!! The revocation is NOT effective yet: Vector could not be restarted here. Run:"
-                    note "!!   docker compose -f $install/docker-compose.opensource.yml restart vector"
+                    note "!! The revocation is NOT effective yet: Vector could not be restarted here."
+                    if [[ -n "$NANO_VQ_PKI_RESTART_HINT" ]]; then
+                        note "!! Once the cause above is fixed, run: $NANO_VQ_PKI_RESTART_HINT"
+                    else
+                        note "!! Fix the .env problem above, then run this command again (a revocation can be repeated)."
+                    fi
                     exit 1
                 fi
             fi
@@ -918,6 +974,14 @@ cmd_client_cert() {
             [[ -z "$tls" ]] || rest+=(--tls-dir "$tls")
             [[ -z "$server_ca" ]] || rest+=(--server-ca "$server_ca")
             [[ -z "$server_name" ]] || rest+=(--server-name "$server_name")
+            # NAN-5966: on a single host the issue ends with a Vector restart; a
+            # .env that restart cannot use stops here, before anything is issued,
+            # so running the same command again after fixing it works.
+            if ((!external && !role_split)) && [[ -n "$tls" && -d "$tls" ]] \
+                && ! pki_single_host_args "$install"; then
+                note "!! Nothing was issued."
+                exit 1
+            fi
             cmd_issue "$name" --pki-dir "$pki" "${rest[@]}"
             if ((external)); then
                 note ""
@@ -930,8 +994,11 @@ cmd_client_cert() {
                 if compose_restart_vector "$install"; then
                     note "Restarted Vector: the listener now accepts '$name'."
                 else
-                    note "!! Restart Vector so the listener accepts '$name':"
-                    note "!!   docker compose -f $install/docker-compose.opensource.yml restart vector"
+                    if [[ -n "$NANO_VQ_PKI_RESTART_HINT" ]]; then
+                        note "!! The certificate is issued. Restart Vector with: $NANO_VQ_PKI_RESTART_HINT"
+                    else
+                        note "!! The certificate is issued, but Vector was not restarted (above). Restart Vector with this install's Compose files so the listener accepts '$name'. Do not issue '$name' again."
+                    fi
                 fi
             fi
             ;;

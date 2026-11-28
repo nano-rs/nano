@@ -703,7 +703,7 @@ async fn encrypted_url_roundtrips_through_repository() {
 
     // Lazy pool: never connects (encrypt/decrypt touch only the in-memory key),
     // but building it spawns the pool's maintenance task, which needs a runtime.
-    let pool = sqlx::PgPool::connect_lazy("postgres://user:pass@127.0.0.1/nano")
+    let pool = sqlx::PgPool::connect_lazy("postgres://user:pass@127.0.0.1:1/nano")
         .expect("lazy pool builds without connecting");
     let enc = EncryptionService::new(b"0123456789abcdef0123456789abcdef");
     let repo = WebhookRepository::with_encryption(pool, enc);

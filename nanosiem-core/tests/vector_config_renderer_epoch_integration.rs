@@ -51,8 +51,7 @@ CREATE TABLE cloud_credentials (
 "#;
 
 async fn isolated_pool() -> (PgPool, PgPool, String) {
-    let url = std::env::var("TEST_DATABASE_URL")
-        .expect("TEST_DATABASE_URL must reference a disposable PostgreSQL database");
+    let url = nanosiem_test_db::require_pg_url();
     let admin = PgPool::connect(&url).await.expect("connect test PostgreSQL");
     let schema = format!("vector_epoch_{}", uuid::Uuid::new_v4().simple());
     sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}"))).execute(&admin).await.unwrap();

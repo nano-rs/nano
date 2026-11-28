@@ -1237,7 +1237,7 @@ mod tests {
     async fn runtime_lock_rejects_pool_without_a_spare_connection() {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(1)
-            .connect_lazy("postgres://postgres:postgres@localhost/nanosiem_test")
+            .connect_lazy("postgres://unused@127.0.0.1:1/unused")
             .expect("lazy pool");
         let result = acquire_rule_runtime_lock(&pool, Uuid::now_v7()).await;
         assert!(matches!(result, Err(sqlx::Error::Configuration(_))));

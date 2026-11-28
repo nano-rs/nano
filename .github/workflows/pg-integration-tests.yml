@@ -172,10 +172,10 @@ jobs:
           # triggers on any `**/*.rs` change, so this is where a non-DB
           # regression guard has to live to actually gate a PR.
           #
-          # NAN-2223: grant_authority_integration reads TEST_DATABASE_URL rather
-          # than DATABASE_URL and connects to an ALREADY-migrated database (it
-          # has no migrated_pool of its own), so it is exported below as an alias
-          # of the same URL and must run AFTER a suite that applied migrations.
+          # NAN-2223: grant_authority_integration connects to an ALREADY-migrated
+          # database (it has no migrated_pool of its own), so it must run AFTER a
+          # suite that applied migrations. Like every suite migrated to
+          # nanosiem-test-db (NAN-5967), it reads NANOSIEM_TEST_DATABASE_URL.
           # It had never been wired into this job at all, which is why the
           # privilege-grant regressions it guards were never gated on a PR.
           #
@@ -273,6 +273,24 @@ jobs:
           # NAN-5776: hunts::recon::dismissal_live_tests (a deleted recon draft
           # frees its technique for POST /api/hunts/drafts; recon runs still do
           # not recreate it). Same gate and overlay as the cadence suite.
+          # NAN-5988: the marketplace sync DB tests (marketplace::sync_service
+          # db_tests and owner_db_tests) used to run unignored in the first
+          # line, on a database nothing had migrated yet, so they failed on a
+          # missing table the first time NAN-5967 let them run (and, past
+          # that, on the NAN-4955 content-channel source they predate). They
+          # are now ignored there, apply the open migrations themselves, read
+          # a local git repository, and run on
+          # their own line below, after the hunts suites, with the same
+          # features as those so the lib test binary is reused, not rebuilt.
+          # -e CI forwards the runner CI=true into the cargo container: those
+          # tests skip on an unset database URL locally but FAIL when CI=true,
+          # so a job that lost its database can never pass them empty.
+          # NAN-5967: tests migrated to nanosiem-test-db never read DATABASE_URL;
+          # they read NANOSIEM_TEST_DATABASE_URL (then the older names), so the
+          # same throwaway URL is exported under the canonical name too. The
+          # enterprise, nanosiem-api, nanosiem-api-lib and nano-connector suites
+          # read only that name now; DATABASE_URL stays exported for any suite
+          # not migrated yet.
           mapfile -t cargo_cache_args < <(bash scripts/ci/cargo-cache-docker-args.sh)
           if [ "${cargo_cache_args[0]:-}" = --env-file ]; then
             cargo_cache_args+=(-v nanosiem-pgit-sccache:/sccache)
@@ -287,8 +305,10 @@ jobs:
             -v nanosiem-pgit-cargo-registry:/usr/local/cargo/registry \
             -e CARGO_TARGET_DIR=/tmp/target \
             -e CARGO_BUILD_JOBS \
+            -e CI \
             -e DATABASE_URL="$DATABASE_URL" \
             -e TEST_DATABASE_URL="$DATABASE_URL" \
+            -e NANOSIEM_TEST_DATABASE_URL="$DATABASE_URL" \
             -e NANOSIEM_ALLOW_DESTRUCTIVE_TESTS=1 \
             -e NANOSIEM_REQUIRE_RELATION_INVENTORY=1 \
             "$RUST_IMAGE" \
@@ -303,6 +323,8 @@ jobs:
               NANOSIEM_TEST_DATABASE_URL="$DATABASE_URL" cargo test -p nanosiem-api --features enterprise --lib state::melod::config_poller_tests
               NANO_TEST_DATABASE_URL="$DATABASE_URL" cargo test -p nanosiem-core --features enterprise --lib hunts::hunt_schedule_slot_live_tests -- --ignored --test-threads=1
               NANO_TEST_DATABASE_URL="$DATABASE_URL" cargo test -p nanosiem-core --features enterprise --lib hunts::recon::dismissal_live_tests -- --ignored --test-threads=1
+              # NAN-5988: marketplace sync DB tests (NAN-4930 re-parse retry, NAN-4946 slug ownership).
+              cargo test -p nanosiem-core --features enterprise --lib marketplace::sync_service -- --ignored --test-threads=1
               cargo test -p nanosiem-core --test migration_seed_parity -- --ignored --test-threads=1
               cargo test -p nanosiem-core --test api_key_rate_limit_integration -- --ignored
               cargo test -p nanosiem-core --test first_admin_claim_integration -- --ignored

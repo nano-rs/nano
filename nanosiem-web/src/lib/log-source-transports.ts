@@ -36,3 +36,34 @@ export function logSourceTransportLabel(
   const key = source.dispatch_source_config_type ?? source.source_type;
   return SOURCE_TYPE_LABELS[key] ?? key;
 }
+
+/**
+ * NAN-6036: the `ingestion_method` a library parser must be imported with
+ * when it is fed by a source configuration of `configType`. This is the web
+ * copy of `SOURCE_TYPE_MAP` (moved here from ParserRepositories so the Add
+ * source wizard uses the same table) and mirrors the Rust
+ * `ingest_transport::dispatch_compatible`: a configuration feeds the method of
+ * the same name, except `http`, which feeds `routed`. The import endpoint
+ * refuses any other pairing (NAN-943), because a parser bound to the wrong
+ * route receives no events.
+ *
+ * Returns `null` for a configuration type this table does not know, so a
+ * caller can refuse it instead of guessing.
+ */
+const INGESTION_METHOD_FOR_CONFIG_TYPE: Record<string, string> = {
+  http: 'routed',
+  vector: 'vector',
+  otlp: 'otlp',
+  splunk_hec: 'splunk_hec',
+  kafka: 'kafka',
+  aws_s3: 'aws_s3',
+  aws_sqs: 'aws_sqs',
+  crowdstrike_fdr: 'crowdstrike_fdr',
+  gcp_pubsub: 'gcp_pubsub',
+  azure_event_hubs: 'azure_event_hubs',
+};
+
+export function ingestionMethodForConfigType(configType: string | null | undefined): string | null {
+  if (!configType) return null;
+  return INGESTION_METHOD_FOR_CONFIG_TYPE[configType] ?? null;
+}

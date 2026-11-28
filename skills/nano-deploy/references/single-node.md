@@ -238,8 +238,9 @@ only the ingest ports in use from the log sources. HTTP ingest goes through
 nginx on 80/443 at `/ingest`; Vector's 8080 and the HEC port 8088 are
 token-gated. Vector native 6000 is mutual TLS only and, from 2.0.30, listens
 on every interface (`NANO_VECTOR_NATIVE_BIND_ADDRESS` in `.env` narrows it);
-allow it only from the senders that use it. Keep 4317, 4318 and 24224 on
-loopback (the default).
+allow it only from the senders that use it. Keep 4317 and 4318 on loopback
+(the default). Port 24224 is not published: nano has no Fluent Forward
+listener, so Fluentd and Fluent Bit send over HTTP, HEC or OTLP.
 Docker-published ports bypass UFW's `INPUT` rules: enforce source limits in
 the `DOCKER-USER` chain, as described in [multi-node-ha.md](multi-node-ha.md#firewall).
 

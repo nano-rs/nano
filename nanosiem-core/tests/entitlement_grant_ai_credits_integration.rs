@@ -36,7 +36,7 @@ fn licensed(operator: EntitlementOperator) -> Entitlement {
 }
 
 #[tokio::test]
-#[ignore = "requires a disposable DATABASE_URL (pg-integration-tests)"]
+#[ignore = "requires a disposable NANOSIEM_TEST_DATABASE_URL (pg-integration-tests)"]
 async fn granted_allowance_is_enforced_and_clearing_restores_env_default() {
     assert!(
         std::env::var("NANO_AI_CREDITS_PER_MONTH").is_err(),
@@ -80,7 +80,7 @@ async fn granted_allowance_is_enforced_and_clearing_restores_env_default() {
 }
 
 #[tokio::test]
-#[ignore = "requires a disposable DATABASE_URL (pg-integration-tests)"]
+#[ignore = "requires a disposable NANOSIEM_TEST_DATABASE_URL (pg-integration-tests)"]
 async fn out_of_range_grants_are_refused_and_cannot_be_stored() {
     let (pool, tier) = settings().await;
     assert!(tier.set_granted_ai_credits(Some(0)).await.is_err());

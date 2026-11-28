@@ -2,8 +2,9 @@
 
 //! Shared setup for the DB-backed integration suites (NAN-1272).
 //!
-//! Connects to the Postgres at `DATABASE_URL` (default: the docker-compose
-//! `postgres` service) and applies the project migrations once per test
+//! Connects to the test Postgres from the shared `nanosiem-test-db` helper
+//! (`NANOSIEM_TEST_DATABASE_URL`, or the older `TEST_DATABASE_URL`; never
+//! `DATABASE_URL`, NAN-5967) and applies the project migrations once per test
 //! binary via the canonical [`run_postgres_migrations`] runner — the same path
 //! the API uses at boot, so the test schema matches production exactly.
 //!
@@ -16,37 +17,13 @@
 use sqlx::PgPool;
 use tokio::sync::OnceCell;
 
-const DEFAULT_URL: &str = "postgres://nanosiem:nanosiem@localhost:5432/nanosiem";
-
-/// Explicit opt-in required before any DB-backed suite touches a database
-/// (NAN-2215). See [`assert_destructive_opt_in`].
-const DESTRUCTIVE_OPT_IN: &str = "NANOSIEM_ALLOW_DESTRUCTIVE_TESTS";
-
 static MIGRATED: OnceCell<()> = OnceCell::const_new();
 
-/// Strip credentials from a Postgres URL so panics can name the target database
-/// without printing its password. Returns `host:port/dbname` when the URL is
-/// well-formed, and a safe placeholder when it is not — never the raw string,
-/// which is what carries the secret.
+/// Strip credentials from a Postgres URL so panics can name the target
+/// database without printing its password (NAN-5967: the shared helper).
 #[allow(dead_code)]
 pub fn redact_db_url(url: &str) -> String {
-    // postgres://user:pass@host:port/db?params -> host:port/db
-    //
-    // `splitn(2, …)`, not `split`: a password containing "://" would otherwise
-    // truncate the remainder and the function would return the CREDENTIAL
-    // segment — the one thing it exists to withhold.
-    let after_scheme = url.splitn(2, "://").nth(1).unwrap_or("");
-    let authority_and_path = after_scheme.rsplit('@').next().unwrap_or("");
-    let without_query = authority_and_path
-        .split(['?', '#'])
-        .next()
-        .unwrap_or("")
-        .trim_end_matches('/');
-    if without_query.is_empty() {
-        "<unparseable DATABASE_URL>".to_string()
-    } else {
-        without_query.to_string()
-    }
+    nanosiem_test_db::redact(url)
 }
 
 /// Refuse to run against a database the operator has not explicitly sacrificed
@@ -70,25 +47,7 @@ pub fn redact_db_url(url: &str) -> String {
 /// random port. Explicit consent is the only signal that distinguishes them.
 #[allow(dead_code)]
 pub fn assert_destructive_opt_in(url: &str) {
-    let opted_in = std::env::var(DESTRUCTIVE_OPT_IN)
-        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE"))
-        .unwrap_or(false);
-    if opted_in {
-        return;
-    }
-    panic!(
-        "\n\
-         refusing to run a DB-backed integration suite against {target}.\n\n\
-         These suites DELETE FROM shared tables (webhooks, restricted_source_types,\n\
-         alerts, …). DATABASE_URL defaults to the local dev stack's database, so\n\
-         running them here would destroy real configuration.\n\n\
-         If that database IS disposable, opt in explicitly:\n\
-         \x20 {opt_in}=1 cargo test -p <crate> --test <suite> -- --ignored\n\n\
-         For a throwaway instead: docker compose up -d postgres, and point\n\
-         DATABASE_URL at it.\n",
-        target = redact_db_url(url),
-        opt_in = DESTRUCTIVE_OPT_IN,
-    );
+    nanosiem_test_db::assert_destructive_opt_in(&redact_db_url(url));
 }
 
 /// A connected pool against a fully-migrated test database.
@@ -98,17 +57,11 @@ pub fn assert_destructive_opt_in(url: &str) {
 /// destructive-test opt-in is absent (NAN-2215).
 #[allow(dead_code)] // not every test binary that `mod common`s uses every helper
 pub async fn migrated_pool() -> PgPool {
-    let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
+    let url = nanosiem_test_db::require_pg_url();
     // BEFORE connecting: the guard must fire ahead of any statement a suite
     // could issue, not merely ahead of the first DELETE.
     assert_destructive_opt_in(&url);
-    let pool = PgPool::connect(&url).await.unwrap_or_else(|e| {
-        // Redacted: the raw URL carries the password.
-        panic!(
-            "connect to test Postgres at {}: {e}\n(is `docker compose up -d postgres` running?)",
-            redact_db_url(&url)
-        )
-    });
+    let pool = nanosiem_test_db::connect_pg(nanosiem_test_db::pg_pool_options(10), &url).await;
     MIGRATED
         .get_or_init(|| async {
             nanosiem_core::db::run_postgres_migrations(&pool)
@@ -125,7 +78,7 @@ pub async fn migrated_pool() -> PgPool {
 /// is enforced for undeclared sessions.
 #[allow(dead_code)]
 pub async fn declared_pool(key: &str) -> PgPool {
-    let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
+    let url = nanosiem_test_db::require_pg_url();
     assert_destructive_opt_in(&url);
     nanosiem_core::crypto::rotation::declare_write_key(
         sqlx::postgres::PgPoolOptions::new().max_connections(4),

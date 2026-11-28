@@ -1,0 +1,8 @@
+{
+  "_doc": [
+    "Intentional exceptions to the WCAG 2.0/2.1 A/AA axe-core accessibility checks (nanosiem-web/tests/e2e/ui/driver.mjs a11y_scan and nano-suite a11y lane).",
+    "Each entry requires: id (unique [A-Za-z0-9._-]+), rule (exact axe-core rule ID such as 'color-contrast' or 'label'; wildcards and catch-alls are forbidden), at least one of selector (CSS matching the offending element) or within (CSS matching the element or an ancestor), optional surfaces (keys of e2e/coverage/ui-surfaces.json; default every page), and a non-empty reason.",
+    "An entry for a known bug being fixed sets temporary: true and issue: NAN-<id>, and must be removed once that fix merges."
+  ],
+  "entries": []
+}

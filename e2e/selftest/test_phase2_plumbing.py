@@ -360,6 +360,33 @@ def test_runner_security_group_d_includes_the_enterprise_sso_scenario(runner: Pa
     assert stripped.stdout.splitlines() == [str(tmp_path / "tests" / "test_security_group_d.py")]
 
 
+def test_runner_personas_selects_enterprise_journeys_only_on_enterprise(runner: Path, tmp_path: Path) -> None:
+    # NAN-5970: an open-edition `run ui personas` selected tests/enterprise/personas
+    # (every scenario skips on open), so the ZERO-scenarios gate failed the lane
+    # with no test failures (v2.0.36 RC2, v2.0.37 RC1 open-img). The open
+    # journeys stay selected (and gated) on both editions.
+    root = Path(runner).parents[1]
+    open_dir = str(root / "e2e" / "tests" / "personas")
+    ent_dir = str(root / "e2e" / "tests" / "enterprise" / "personas")
+    ent = _bash(runner, "EDITION=enterprise; POSITIONAL=(personas); suite_paths")
+    opn = _bash(runner, "EDITION=open; POSITIONAL=(personas); suite_paths")
+    assert ent.returncode == 0 and opn.returncode == 0, ent.stderr + opn.stderr
+    assert opn.stdout.splitlines() == [open_dir], opn.stdout
+    if (root / "e2e" / "tests" / "enterprise" / "personas").is_dir():  # stripped in open core
+        # Coverage-gated (no `+`): an enterprise run whose hunter journeys all skip must fail.
+        assert ent.stdout.splitlines() == [open_dir, ent_dir], ent.stdout
+    else:
+        assert ent.stdout.splitlines() == [open_dir], ent.stdout
+    # A kept open stack run from a full checkout (default edition enterprise)
+    # selects by the stack's recorded edition.
+    (tmp_path / "run.env").write_text("E2E_EDITION=open\n")
+    kept = _bash(
+        runner, f'RUN_DIR="{tmp_path}"; EDITION=enterprise; POSITIONAL=(personas); stack_suite_paths'
+    )
+    assert kept.returncode == 0, kept.stderr
+    assert kept.stdout.splitlines() == [open_dir], kept.stdout
+
+
 def test_runner_reused_stack_selects_by_the_stack_edition(runner: Path, tmp_path: Path) -> None:
     # NAN-5869: `run security_group_d` on a kept open stack from a full
     # checkout (default edition enterprise) gated on the enterprise-only SSO

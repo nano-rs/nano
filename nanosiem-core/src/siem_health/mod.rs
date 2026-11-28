@@ -34,7 +34,12 @@ pub mod finding_signature;
 pub mod pipeline_drops;
 // NAN-5760: deleted log sources set aside from the per-source lists.
 pub mod removed_sources;
+// NAN-5952: AI agents set to a retired model (reads enterprise meloD tables).
+#[cfg(feature = "enterprise")]
+pub mod retired_model_findings;
 pub mod repository;
+// NAN-5976: ClickHouse errors from inside a recorded upgrade rollout window.
+pub mod upgrade_transients;
 pub mod scheduler;
 pub mod shard_skew;
 // NAN-5839: a log source whose clock looks a whole timezone off.

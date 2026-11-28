@@ -1156,6 +1156,11 @@ _IMAGE_ROLES: dict[str, frozenset[str]] = {
     "grafana": frozenset({"monitoring"}),
     "redis_exporter": frozenset({"monitoring"}),
     "alertmanager": frozenset({"monitoring"}),
+    # NAN-5935: Kubernetes-only images (the Helm chart's ClickHouse operator
+    # and backup prune). They ride in the bundle for air-gapped registry
+    # mirrors; no Compose role runs them, so a role-selected host skips them.
+    "clickhouse-operator": frozenset(),
+    "rclone": frozenset(),
 }
 
 

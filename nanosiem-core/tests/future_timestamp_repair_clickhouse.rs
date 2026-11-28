@@ -8,10 +8,6 @@ use nanosiem_core::db::future_timestamp_repair::FutureTimestampRepair;
 use nanosiem_core::schema::SchemaId;
 use uuid::Uuid;
 
-fn env(key: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| panic!("{key} must be set for this live suite"))
-}
-
 async fn exec(ch: &clickhouse::Client, sql: &str) {
     ch.query(sql)
         .execute()
@@ -23,9 +19,9 @@ async fn exec(ch: &clickhouse::Client, sql: &str) {
 #[ignore = "requires a lane-owned ClickHouse 26.8 or 26.10 container"]
 async fn repairs_all_epoch_millisecond_table_classes_and_reruns_as_noop() {
     let ch = clickhouse::Client::default()
-        .with_url(env("NANOSIEM_TEST_CLICKHOUSE_URL"))
-        .with_user(env("NANOSIEM_TEST_CLICKHOUSE_USER"))
-        .with_password(env("NANOSIEM_TEST_CLICKHOUSE_PASSWORD"))
+        .with_url(nanosiem_test_db::require_ch_url())
+        .with_user(nanosiem_test_db::ch_user().expect("CLICKHOUSE_TEST_USER must be set for this live suite"))
+        .with_password(nanosiem_test_db::ch_password().unwrap_or_default())
         .with_validation(false)
         .with_compression(clickhouse::Compression::None)
         .with_setting("async_insert", "0")

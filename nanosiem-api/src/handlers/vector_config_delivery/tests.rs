@@ -434,7 +434,7 @@ mod install_token_switch_db {
         include_str!("../../../../migrations/postgres/290_ingest_tokens.sql");
 
     async fn service() -> Option<(IngestTokenService, sqlx::PgPool, String)> {
-        let url = std::env::var("NANOSIEM_TEST_DATABASE_URL").ok()?;
+        let url = nanosiem_test_db::pg_url().ok()?;
         let schema = format!("nan5042_{}", uuid::Uuid::new_v4().simple());
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(1)

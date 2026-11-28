@@ -4,7 +4,7 @@
 //! repositories (the name predates NAN-4955 and is kept for its callers).
 //!
 //! NAN-4955: no install talks to GitHub for content. First-party repositories
-//! (`nano-rs/*`, `nanos-sh/*`) are served from the installed nano content
+//! (`nano-rs/*` only, NAN-5954) are served from the installed nano content
 //! channel snapshot (`content_bundle::source`), which the app delivers as a
 //! signed bundle. Every other owner is refused here, fail closed, with no
 //! network request: third-party repositories can no longer be admitted

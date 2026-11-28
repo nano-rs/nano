@@ -157,3 +157,48 @@ def test_stack_repr_hides_its_secrets() -> None:
     hidden = {"api_key", "admin_password", "ch_admin_password"}
     shown = {f.name for f in Stack.__dataclass_fields__.values() if f.repr}
     assert not hidden & shown
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Cookie: nanosiem_session=ck-1234567; theme=dark",
+        "set-cookie: nanosiem_session=ck-1234567; HttpOnly",
+        '{"Cookie": "nanosiem_session=ck-1234567"}',
+        '{"cookie":"nanosiem_session=ck-1234567"}',
+        "{'Set-Cookie': 'nanosiem_session=ck-1234567; HttpOnly'}",
+        "{'cookie': 'nanosiem_session=ck-1234567'}",
+        '{"set-cookie":["nanosiem_session=ck-1234567; Path=/", "other=ck-1234567"]}',
+        "{'Set-Cookie': ['nanosiem_session=ck-1234567']}",
+        '{\\"Cookie\\": \\"nanosiem_session=ck-1234567\\"}',
+        "COOKIE:nanosiem_session=ck-1234567",
+    ],
+)
+def test_every_cookie_header_form_is_redacted(text: str) -> None:
+    out = redact.redact_text(text)
+    assert "ck-1234567" not in out and "<redacted>" in out, out
+
+
+# Every token prefix nano issues, plus the API-key and Sentry shapes the e2e
+# runs carry. None is registered anywhere: the shape alone must redact it.
+@pytest.mark.parametrize(
+    "token",
+    [
+        "nit_" + "a1b2c3d4e5f6" * 3,  # ingest token: nanosiem-core/src/ingest_tokens/mod.rs TOKEN_MARKER
+        "nal_" + "0123456789abcdefghjk" + "_" + "s3cr3t" * 4,  # Agent Lane: nanosiem-enterprise/src/agentlane/token.rs
+        "nscim_" + "AbC-dEf_0123456789xyzXYZ",  # SCIM: nanosiem-enterprise/src/scim/token.rs
+        "nsk_" + "planted0123456789abc",  # API-key shape in e2e fixtures and docs
+        "sntrys_" + "eyJpYXQiOjE3MDAwMDAwMDB9",  # Sentry org auth token
+        # A realistic org token: base64 JSON, then a 43-char secret with + / =.
+        "sntrys_eyJpYXQiOjE3MzAwMDAwMDAsInVybCI6Imh0dHBzOi8vc2VudHJ5LmlvIn0=_ab+cd/EF=gh+ij/KL0123456789abcdefghijkl+/=",
+        "sntryu_" + "0123456789abcdef0123",  # Sentry user auth token
+    ],
+)
+def test_unregistered_issued_tokens_are_redacted_by_shape(token: str) -> None:
+    out = redact.redact_text(f"GET /invite/{token}?t={token} body={token}", [])
+    assert token not in out and out.count("<redacted>") == 3, out
+
+
+def test_short_or_ordinary_underscored_words_stay() -> None:
+    text = "nit_short nal_x nsk_ok token_count=3 nscim_ unit_test_name_is_long"
+    assert redact.redact_text(text, []) == text

@@ -9,7 +9,9 @@
 //! 3. a further re-import is `Current` (no apply);
 //! 4. a re-sealed descriptor over an unchanged tree after a failed apply is
 //!    handed to the applier with `tree_changed = true` (an applier that skips
-//!    unchanged trees would otherwise never retry it).
+//!    unchanged trees would otherwise never retry it);
+//! 5. (NAN-5956) the applier's summary of a successful apply is stored and
+//!    shown in channel status; a failed apply clears it.
 //!
 //! ```text
 //! NANOSIEM_TEST_DATABASE_URL=postgres://postgres:pw@127.0.0.1:<port>/postgres \
@@ -86,8 +88,7 @@ impl ContentApplier for FlakyApplier {
 }
 
 async fn fresh_pg() -> sqlx::PgPool {
-    let url = std::env::var("NANOSIEM_TEST_DATABASE_URL")
-        .expect("NANOSIEM_TEST_DATABASE_URL must target a disposable PostgreSQL");
+    let url = nanosiem_test_db::require_pg_url();
     let admin = sqlx::PgPool::connect(&url).await.unwrap();
     let name = format!("cc_{}", &uuid::Uuid::now_v7().simple().to_string()[18..]);
     sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}"))).execute(&admin).await.unwrap();
@@ -126,9 +127,11 @@ async fn failed_apply_is_retried_on_reimport_and_never_reported_current() {
     let row = c.store().get("playbooks.main").await.unwrap().unwrap();
     assert_eq!(row.sequence, Some(100));
     assert!(row.apply_error.as_deref().is_some_and(|e| e.contains("simulated")));
+    assert_eq!(row.apply_summary, None, "a failed apply has no summary");
     let status = c.status().await.unwrap();
     let st = status.channels.iter().find(|s| s.channel == "playbooks.main").unwrap();
     assert!(st.installed && st.apply_pending);
+    assert_eq!(st.apply_summary, None);
 
     // 2. same bundle again, apply now works: re-applied (forced), not "current".
     applier.fail.store(false, Ordering::SeqCst);
@@ -138,6 +141,11 @@ async fn failed_apply_is_retried_on_reimport_and_never_reported_current() {
     assert_eq!(applier.forced.lock().unwrap()[1], true);
     let row = c.store().get("playbooks.main").await.unwrap().unwrap();
     assert!(row.apply_error.is_none() && row.applied_at.is_some());
+    // NAN-5956: the applier's summary is kept and shown in channel status.
+    assert_eq!(row.apply_summary.as_deref(), Some("applied"));
+    let status = c.status().await.unwrap();
+    let st = status.channels.iter().find(|s| s.channel == "playbooks.main").unwrap();
+    assert_eq!(st.apply_summary.as_deref(), Some("applied"));
 
     // 3. nothing pending any more: current, no apply.
     assert_eq!(c.import_bytes(b1.clone()).await.unwrap(), ChannelOutcome::Current { sequence: 100 });
@@ -148,6 +156,8 @@ async fn failed_apply_is_retried_on_reimport_and_never_reported_current() {
     applier.fail.store(true, Ordering::SeqCst);
     let b2 = bundle("playbooks.main", 200, &files("v2"));
     assert!(matches!(c.import_bytes(b2).await, Err(ChannelError::ApplyFailed(_))));
+    let row = c.store().get("playbooks.main").await.unwrap().unwrap();
+    assert_eq!(row.apply_summary, None, "a failed apply clears the previous summary");
     applier.fail.store(false, Ordering::SeqCst);
     let resealed = bundle("playbooks.main", 300, &files("v2"));
     let out = c.import_bytes(resealed).await.unwrap();

@@ -124,6 +124,8 @@ default = []
 test-support = []
 
 [dev-dependencies]
+# NAN-5967: the only way DB-backed tests get a database URL or pool.
+nanosiem-test-db = { path = "../nanosiem-test-db" }
 # NAN-5789: integration tests link the crate with its test-only constructors.
 nanosiem-core = { path = ".", features = ["test-support"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["tls12", "aws_lc_rs"] }

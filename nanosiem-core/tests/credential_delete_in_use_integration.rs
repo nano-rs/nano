@@ -36,7 +36,7 @@ fn unique(prefix: &str) -> String {
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn unreferenced_credential_is_deleted() {
     let pool = common::migrated_pool().await;
     let repo = CredentialRepository::new(pool.clone());
@@ -47,7 +47,7 @@ async fn unreferenced_credential_is_deleted() {
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn credential_used_by_a_source_configuration_is_in_use_not_an_encryption_error() {
     let pool = common::migrated_pool().await;
     let repo = CredentialRepository::new(pool.clone());
@@ -73,7 +73,7 @@ async fn credential_used_by_a_source_configuration_is_in_use_not_an_encryption_e
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn credential_used_by_a_custom_enrichment_is_in_use_not_a_database_error() {
     let pool = common::migrated_pool().await;
     // `custom_enrichments` is enterprise-overlay schema; on an open-core
@@ -120,7 +120,7 @@ async fn credential_used_by_a_custom_enrichment_is_in_use_not_a_database_error()
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn credential_used_by_a_pull_feed_is_in_use() {
     // NAN-4914 `connector_feeds.credential_id` is `ON DELETE RESTRICT` on the
     // open schema: the delete predicate and the 409 message both name it.
@@ -149,7 +149,7 @@ async fn credential_used_by_a_pull_feed_is_in_use() {
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn restrict_reference_outside_the_predicate_is_in_use_on_every_postgres_major() {
     // NAN-4980: a reference the delete predicate does not name is refused by
     // its foreign key, and the repository maps that to InUse (409). On a real

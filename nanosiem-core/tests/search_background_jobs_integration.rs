@@ -7,7 +7,7 @@
 //! (queued and running), and execution under the stamped source scope.
 //!
 //! Needs a migrated PostgreSQL at `DATABASE_URL` and a ClickHouse at
-//! `CLICKHOUSE_URL` whose schema the `clickhouse_migrator` has brought current
+//! `CLICKHOUSE_TEST_URL` (no localhost default) whose schema the `clickhouse_migrator` has brought current
 //! (credentials from the usual `CLICKHOUSE_*` env, admin user for seeding).
 //! `#[ignore]`d; run with `-- --ignored --test-threads=1`.
 
@@ -27,7 +27,7 @@ use nanosiem_core::{DualPool, DualPoolConfig, SearchRequest, SearchService, Time
 use uuid::Uuid;
 
 fn ch_url() -> String {
-    std::env::var("CLICKHOUSE_URL").unwrap_or_else(|_| "http://127.0.0.1:8123".to_string())
+    nanosiem_test_db::require_ch_url()
 }
 
 fn ch_admin() -> (String, String) {
@@ -87,7 +87,8 @@ struct Harness {
 
 async fn harness() -> Harness {
     let pool = common::migrated_pool().await;
-    let config = DualPoolConfig::from_env().expect("DualPool env");
+    // NAN-5964: the same ClickHouse the seeding uses; never CLICKHOUSE_URL.
+    let config = DualPoolConfig::from_env_with_urls(nanosiem_test_db::require_pg_url(), ch_url());
     let mut dual = DualPool::new(&config).await.expect("connect DualPool");
     dual.refresh_cluster_state(&config.clickhouse_database).await;
     let search = Arc::new(SearchService::with_dual_pool(&dual));

@@ -122,9 +122,12 @@ pub fn all() -> impl Iterator<Item = &'static Channel> {
     CHANNELS.iter().chain(EXTENSION_CHANNELS.get().copied().unwrap_or(&[]).iter())
 }
 
-/// GitHub organizations whose repositories are first-party content. `nanos-sh`
-/// is the pre-rename organization (migration 178).
-pub const FIRST_PARTY_OWNERS: &[&str] = &["nano-rs", "nanos-sh"];
+/// GitHub organizations whose repositories are first-party content.
+///
+/// NAN-5954: the pre-rename organization `nanos-sh` is NOT first-party (it is
+/// unregistered on GitHub, so anyone could claim it). Stored legacy URLs were
+/// rewritten to `nano-rs` by PG migrations 178 and 403; never re-add it here.
+pub const FIRST_PARTY_OWNERS: &[&str] = &["nano-rs"];
 
 pub fn by_id(id: &str) -> Option<&'static Channel> {
     all().find(|c| c.id == id)
@@ -135,8 +138,8 @@ pub fn is_first_party_owner(owner: &str) -> bool {
     FIRST_PARTY_OWNERS.iter().any(|o| o.eq_ignore_ascii_case(owner.trim()))
 }
 
-/// The channel serving `owner/repo@branch`, if any. `nanos-sh` maps to
-/// `nano-rs`; repo names compare case-insensitively without `.git`.
+/// The channel serving `owner/repo@branch`, if any. Repo names compare
+/// case-insensitively without `.git`.
 pub fn for_repo(owner: &str, repo: &str, branch: &str) -> Option<&'static Channel> {
     if !is_first_party_owner(owner) {
         return None;

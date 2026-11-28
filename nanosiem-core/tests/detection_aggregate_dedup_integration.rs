@@ -18,8 +18,10 @@
 //! - **Controls**: genuinely new activity (a later `_last_seen`) and a new
 //!   entity DO still emit — dedup must not over-suppress.
 //!
-//! Requires local PG (:5432) + CH (:8123) with the nanosiem schema. Skips
-//! cleanly when unreachable or when `SKIP_DB_TESTS` is set.
+//! Requires a throwaway PG + CH with the nanosiem schema, named by
+//! `DATABASE_URL` and `CLICKHOUSE_TEST_URL` (no localhost default, NAN-5964).
+//! Skips cleanly when either is unset or unreachable, or when `SKIP_DB_TESTS`
+//! is set.
 //!   Run: cargo test -p nanosiem-core --test detection_aggregate_dedup_integration -- --nocapture
 
 use chrono::{Duration, Utc};
@@ -32,17 +34,16 @@ use nanosiem_core::{DualPool, DualPoolConfig};
 use serde_json::json;
 
 fn pg_url() -> String {
-    std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://nanosiem:nanosiem@localhost:5432/nanosiem".into())
+    nanosiem_test_db::require_pg_url()
 }
 fn ch_url() -> String {
-    std::env::var("CLICKHOUSE_TEST_URL").unwrap_or_else(|_| "http://localhost:8123".into())
+    nanosiem_test_db::require_ch_url()
 }
 fn ch_user() -> String {
-    std::env::var("CLICKHOUSE_TEST_USER").unwrap_or_else(|_| "nanosiem".into())
+    nanosiem_test_db::ch_user().unwrap_or_else(|| "nanosiem".into())
 }
 fn ch_pass() -> String {
-    std::env::var("CLICKHOUSE_TEST_PASSWORD").unwrap_or_else(|_| "nanosiem".into())
+    nanosiem_test_db::ch_password().unwrap_or_else(|| "nanosiem".into())
 }
 fn ch_db() -> String {
     std::env::var("CLICKHOUSE_TEST_DB").unwrap_or_else(|_| "nanosiem".into())
@@ -162,16 +163,25 @@ impl Harness {
             println!("Skipping (SKIP_DB_TESTS set)");
             return None;
         }
-        let config = DualPoolConfig::from_env().unwrap_or_else(|_| {
-            let mut config =
-                DualPoolConfig::with_auth(pg_url(), ch_url(), ch_db(), ch_user(), ch_pass());
-            config.clickhouse_admin_user = std::env::var("CLICKHOUSE_ADMIN_USER").ok();
-            config.clickhouse_admin_password = std::env::var("CLICKHOUSE_ADMIN_PASSWORD").ok();
-            config.clickhouse_rawsql_password = std::env::var("CLICKHOUSE_RAWSQL_PASSWORD").ok();
-            config.clickhouse_rawsql_noaudit_password =
-                std::env::var("CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD").ok();
-            config
-        });
+        // NAN-5964: these tests write probe rules and rows. Without explicit URLs
+        // they skip; they never fall back to a developer's own localhost stack.
+        if let Err(unset) = nanosiem_test_db::pg_and_ch_urls() {
+            println!("Skipping: {unset}");
+            return None;
+        }
+        if !nanosiem_test_db::destructive_opt_in() {
+            println!("Skipping: set NANOSIEM_ALLOW_DESTRUCTIVE_TESTS=1 to run these write tests");
+            return None;
+        }
+        // Built from the same URLs the probe inserts use. `from_env()` would
+        // read CLICKHOUSE_URL instead and could split the run across stacks.
+        let mut config =
+            DualPoolConfig::with_auth(pg_url(), ch_url(), ch_db(), ch_user(), ch_pass());
+        config.clickhouse_admin_user = std::env::var("CLICKHOUSE_ADMIN_USER").ok();
+        config.clickhouse_admin_password = std::env::var("CLICKHOUSE_ADMIN_PASSWORD").ok();
+        config.clickhouse_rawsql_password = std::env::var("CLICKHOUSE_RAWSQL_PASSWORD").ok();
+        config.clickhouse_rawsql_noaudit_password =
+            std::env::var("CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD").ok();
         let dual_pool = match DualPool::new(&config).await {
             Ok(p) => p,
             Err(e) => {

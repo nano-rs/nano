@@ -100,7 +100,7 @@ async fn assert_all_refused(
 }
 
 #[tokio::test]
-#[ignore = "requires a disposable Postgres (DATABASE_URL)"]
+#[ignore = "requires a disposable Postgres (NANOSIEM_TEST_DATABASE_URL)"]
 async fn missing_saved_search_is_not_found() {
     let pool = common::migrated_pool().await;
     let repo = SavedSearchRepository::new(pool.clone());
@@ -119,7 +119,7 @@ async fn missing_saved_search_is_not_found() {
 }
 
 #[tokio::test]
-#[ignore = "requires a disposable Postgres (DATABASE_URL)"]
+#[ignore = "requires a disposable Postgres (NANOSIEM_TEST_DATABASE_URL)"]
 async fn someone_elses_private_search_is_not_found() {
     let pool = common::migrated_pool().await;
     let repo = SavedSearchRepository::new(pool.clone());
@@ -130,7 +130,7 @@ async fn someone_elses_private_search_is_not_found() {
 }
 
 #[tokio::test]
-#[ignore = "requires a disposable Postgres (DATABASE_URL)"]
+#[ignore = "requires a disposable Postgres (NANOSIEM_TEST_DATABASE_URL)"]
 async fn search_shared_with_a_group_the_caller_is_not_in_is_not_found() {
     let pool = common::migrated_pool().await;
     let repo = SavedSearchRepository::new(pool.clone());
@@ -142,7 +142,7 @@ async fn search_shared_with_a_group_the_caller_is_not_in_is_not_found() {
 }
 
 #[tokio::test]
-#[ignore = "requires a disposable Postgres (DATABASE_URL)"]
+#[ignore = "requires a disposable Postgres (NANOSIEM_TEST_DATABASE_URL)"]
 async fn someone_elses_public_search_is_forbidden() {
     let pool = common::migrated_pool().await;
     let repo = SavedSearchRepository::new(pool.clone());
@@ -153,7 +153,7 @@ async fn someone_elses_public_search_is_forbidden() {
 }
 
 #[tokio::test]
-#[ignore = "requires a disposable Postgres (DATABASE_URL)"]
+#[ignore = "requires a disposable Postgres (NANOSIEM_TEST_DATABASE_URL)"]
 async fn search_shared_with_the_callers_group_is_forbidden() {
     let pool = common::migrated_pool().await;
     let repo = SavedSearchRepository::new(pool.clone());
@@ -165,7 +165,7 @@ async fn search_shared_with_the_callers_group_is_forbidden() {
 }
 
 #[tokio::test]
-#[ignore = "requires a disposable Postgres (DATABASE_URL)"]
+#[ignore = "requires a disposable Postgres (NANOSIEM_TEST_DATABASE_URL)"]
 async fn the_owner_can_still_update_share_and_delete() {
     let pool = common::migrated_pool().await;
     let repo = SavedSearchRepository::new(pool.clone());
@@ -185,7 +185,7 @@ async fn the_owner_can_still_update_share_and_delete() {
 /// its lock), the owner's update starts and blocks on that lock, then the
 /// delete commits.
 #[tokio::test]
-#[ignore = "requires a disposable Postgres (DATABASE_URL)"]
+#[ignore = "requires a disposable Postgres (NANOSIEM_TEST_DATABASE_URL)"]
 async fn an_update_racing_a_delete_is_not_found_not_a_database_error() {
     let pool = common::migrated_pool().await;
     let repo = SavedSearchRepository::new(pool.clone());
@@ -215,7 +215,7 @@ async fn an_update_racing_a_delete_is_not_found_not_a_database_error() {
 /// The same race for delete: two owners' deletes (a double click) — the
 /// second reports `NotFound`.
 #[tokio::test]
-#[ignore = "requires a disposable Postgres (DATABASE_URL)"]
+#[ignore = "requires a disposable Postgres (NANOSIEM_TEST_DATABASE_URL)"]
 async fn a_delete_racing_a_delete_is_not_found() {
     let pool = common::migrated_pool().await;
     let repo = SavedSearchRepository::new(pool.clone());
@@ -242,7 +242,7 @@ async fn a_delete_racing_a_delete_is_not_found() {
 /// Bad input is a 400 before any ownership lookup, so it discloses nothing
 /// about a search the caller cannot see.
 #[tokio::test]
-#[ignore = "requires a disposable Postgres (DATABASE_URL)"]
+#[ignore = "requires a disposable Postgres (NANOSIEM_TEST_DATABASE_URL)"]
 async fn an_over_long_description_is_invalid_input_for_anyone() {
     let pool = common::migrated_pool().await;
     let repo = SavedSearchRepository::new(pool.clone());

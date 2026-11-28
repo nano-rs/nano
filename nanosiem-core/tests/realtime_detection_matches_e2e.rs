@@ -16,9 +16,9 @@
 //!
 //! ```bash
 //! NANOSIEM_ALLOW_DESTRUCTIVE_TESTS=1 \
-//! NANOSIEM_E2E_PG_URL=postgres://nanosiem:nanosiem@127.0.0.1:<port>/nanosiem \
-//! NANOSIEM_E2E_CH_URL=http://127.0.0.1:<port> \
-//! NANOSIEM_E2E_CH_USER=nanosiem_admin NANOSIEM_E2E_CH_PASSWORD=... \
+//! NANOSIEM_TEST_DATABASE_URL=postgres://nanosiem:nanosiem@127.0.0.1:<port>/nanosiem \
+//! CLICKHOUSE_TEST_URL=http://127.0.0.1:<port> \
+//! CLICKHOUSE_TEST_USER=nanosiem_admin CLICKHOUSE_TEST_PASSWORD=... \
 //! CLICKHOUSE_RAWSQL_PASSWORD=... CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD=... \
 //! NANO_SCHEMA_PROFILE=udm \
 //! cargo test -p nanosiem-core --test realtime_detection_matches_e2e -- --ignored --nocapture
@@ -53,12 +53,11 @@ fn env() -> Env {
         Ok("1"),
         "set NANOSIEM_ALLOW_DESTRUCTIVE_TESTS=1 against DISPOSABLE PG + CH"
     );
-    let var = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("{k} is required"));
     Env {
-        pg_admin_url: var("NANOSIEM_E2E_PG_URL"),
-        ch_url: var("NANOSIEM_E2E_CH_URL"),
-        ch_user: var("NANOSIEM_E2E_CH_USER"),
-        ch_password: var("NANOSIEM_E2E_CH_PASSWORD"),
+        pg_admin_url: nanosiem_test_db::require_pg_url(),
+        ch_url: nanosiem_test_db::require_ch_url(),
+        ch_user: nanosiem_test_db::ch_user().unwrap_or_else(|| panic!("CLICKHOUSE_TEST_USER is required")),
+        ch_password: nanosiem_test_db::ch_password().unwrap_or_default(),
     }
 }
 

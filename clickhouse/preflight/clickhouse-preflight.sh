@@ -11,6 +11,16 @@
 #    without it. ClickHouse publishes no amd64compat Docker image, so there is
 #    no image to fall back to: stop here with a clear message instead of
 #    letting the server crash-loop.
+# 1a. simdjson kernel (NAN-6000). ClickHouse parses every JSON value (the
+#    JSON type, so init.sql's `ext JSON DEFAULT '{}'` and every insert) with
+#    simdjson. The official amd64 build compiles in only simdjson's Haswell
+#    kernel (no Westmere, no scalar fallback), and simdjson picks it from
+#    CPUID only when AVX2, BMI1, BMI2 and PCLMULQDQ are all reported. A VM CPU
+#    model that hides one of them (Proxmox's built-in x86-64-v3 and x86-64-v4
+#    types omit pclmulqdq) still RUNS ClickHouse, but every JSON parse fails:
+#    "Cannot parse JSON object here: {}" (Code 117) at CREATE TABLE
+#    nanosiem.logs. Refuse with a clear fix, unless the operator opted into
+#    rapidjson with the shipped zz-local-no-simdjson.xml drop-in.
 # 2. Obsolete s3-disk elements. Tiering storage.xml files written before
 #    NAN-4906 carry <cache_enabled>, <data_cache_enabled> and <cache_path>
 #    inside the s3 disk. Nothing has read them since 22.8, but 26.10 rejects
@@ -18,8 +28,8 @@
 #    every storage_configuration file in config.d, keep a one-time backup,
 #    and fail if any survive.
 #
-# Test seams: PREFLIGHT_CPUINFO (default /proc/cpuinfo) and PREFLIGHT_ARCH
-# (default `uname -m`). See clickhouse/preflight/test-clickhouse-preflight.sh.
+# Test seams: PREFLIGHT_CPUINFO (default /proc/cpuinfo), PREFLIGHT_ARCH
+# (default `uname -m`) and PREFLIGHT_USERS_DIR (default /users.d). See clickhouse/preflight/test-clickhouse-preflight.sh.
 set -eu
 
 CONFIG_DIR="${1:-/etc/clickhouse-server/config.d}"
@@ -27,6 +37,7 @@ CPUINFO="${PREFLIGHT_CPUINFO:-/proc/cpuinfo}"
 ARCH="${PREFLIGHT_ARCH:-$(uname -m)}"
 OBSOLETE='cache_enabled|data_cache_enabled|cache_path'
 REQUIRED_BY="${NANO_PREFLIGHT_ROLE:-ClickHouse role}"
+USERS_DIR="${PREFLIGHT_USERS_DIR:-/users.d}"
 
 die() {
     echo "clickhouse-preflight: FATAL: $*" >&2
@@ -38,9 +49,24 @@ case "$ARCH" in
     x86_64|amd64)
         [ -r "$CPUINFO" ] || die "$REQUIRED_BY cannot establish AVX2 capability because $CPUINFO is unreadable"
         if ! grep -qw avx2 "$CPUINFO"; then
-            die "$REQUIRED_BY requires AVX2, but this x86-64 CPU has no AVX2. ClickHouse 26.6+ binaries would crash with an illegal instruction. Move this tenant to an AVX2-capable host (or expose AVX2 to the VM: Proxmox CPU type 'host' or x86-64-v3) before upgrading. See docs/dev/CLICKHOUSE-UPGRADE-NOTES.md."
+            die "$REQUIRED_BY requires AVX2, but this x86-64 CPU has no AVX2. ClickHouse 26.6+ binaries would crash with an illegal instruction. Move this tenant to an AVX2-capable host (or expose AVX2 to the VM: Proxmox CPU type 'host') before upgrading. See docs/dev/CLICKHOUSE-UPGRADE-NOTES.md."
         fi
         echo "clickhouse-preflight: AVX2 present"
+        missing=""
+        # Keeper-only hosts never parse JSON (NANO_PREFLIGHT_ROLE lists roles).
+        case "$REQUIRED_BY" in *clickhouse*|*ClickHouse*) simd_flags="bmi1 bmi2 pclmulqdq" ;; *) simd_flags="" ;; esac
+        for flag in $simd_flags; do
+            grep -qw "$flag" "$CPUINFO" || missing="$missing $flag"
+        done
+        if [ -n "$missing" ]; then
+            if grep -qs '<allow_simdjson>0</allow_simdjson>' "$USERS_DIR"/*.xml; then
+                echo "clickhouse-preflight: WARNING: this CPU does not report$missing, so ClickHouse's fast JSON parser cannot run here. Continuing because allow_simdjson is 0 in $USERS_DIR (slower JSON parsing). To get it back, set the VM's CPU type to 'host'." >&2
+            else
+                die "This server's CPU does not report$missing to programs. Without it ClickHouse cannot read any JSON value, so setup fails with 'Cannot parse JSON object here: {}'. This usually means the virtual machine uses a limited CPU type. To fix it, give the VM its host's CPU: Proxmox CPU types x86-64-v3 and x86-64-v4 lack pclmulqdq. In Proxmox, set the VM's Processor type to 'host' (qm set <vmid> --cpu host), or use a custom CPU model that adds +pclmulqdq, then shut the VM down and start it again. (x86-64-v2-AES has pclmulqdq but no AVX2, which ClickHouse also needs.) If you cannot change the CPU type, copy clickhouse/preflight/zz-local-no-simdjson.xml into clickhouse/users.d/ and run install.sh again; ClickHouse then uses a slower JSON parser."
+            fi
+        elif [ -n "$simd_flags" ]; then
+            echo "clickhouse-preflight: simdjson CPU features present"
+        fi
         ;;
     *)
         echo "clickhouse-preflight: arch $ARCH, AVX2 check not applicable"
@@ -55,7 +81,7 @@ esac
 # placeholder, would start ClickHouse with every nano user open to all private
 # ranges. Refuse instead.
 if [ "${NANO_PREFLIGHT_REQUIRE_ASSEMBLED:-0}" = 1 ]; then
-    for dir in "$CONFIG_DIR" "${PREFLIGHT_USERS_DIR:-/users.d}"; do
+    for dir in "$CONFIG_DIR" "$USERS_DIR"; do
         [ -f "$dir/.nano-assembled" ] || die "$dir was not assembled by this release's installer, so ClickHouse would start without nano's network allow-list and sizing. Run scripts/nano upgrade (or re-run install.sh), or assemble it: python3 -I scripts/lib/clickhouse_config_dirs.py --root . --record-env, then start again. See docs/getting-started/docker-deployment.md."
     done
     echo "clickhouse-preflight: assembled config.d and users.d present"

@@ -1073,6 +1073,14 @@ function IngestionDetail({
             value: ii.cache_dictionary_update_fails.toLocaleString(),
             bad: ii.cache_dictionary_update_fails > 0,
           },
+          // NAN-5976: errors from an upgrade's own restart, left out of the
+          // two counts above and out of the score.
+          ...(ii.upgrade_transient_errors ?? []).map((e) => ({
+            key: `upgrade-transient-${e.name}`,
+            label: `${e.name} during the upgrade (not scored)`,
+            value: `${e.count.toLocaleString()} while the upgrade restarted services, last at ${new Date(e.last_at).toISOString().slice(11, 19)} UTC; none since`,
+            bad: false,
+          })),
           {
             key: 'stale-dict-refresh',
             label: 'Stale dictionary refreshes (staging MVs)',

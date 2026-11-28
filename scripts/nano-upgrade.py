@@ -214,6 +214,14 @@ INGEST_EDGE_CLOSURE_FILE = ".nano-ingest-edge-closure.json"
 SINGLE_INGEST_CLOSURE_FILE = ".nano-single-ingest-closure.json"
 # NAN-5566: Vector's docker stop timeout, longer than its own 60 s graceful limit.
 VECTOR_STOP_TIMEOUT_SECONDS = 120
+# NAN-6046: nano-jobs drains running detection rules for up to 30 s on
+# SIGTERM, then releases their claims (the compose files' stop_grace_period).
+# A Compose recreate stops the OLD container with the OLD definition's
+# timeout (Docker's 10 s before 2.0.37; measured on Compose 2.24.4 and
+# 2.29.7), which killed the drain and left each running rule claimed: the
+# next start marked it "[crash?]". So every planned nano-jobs stop the
+# upgrade makes uses at least this timeout.
+JOBS_STOP_TIMEOUT_SECONDS = 45
 # NAN-5566: what confirms that direct senders to an ungated Vector are paused.
 SENDERS_PAUSED_CONFIRMATIONS = (
     "NANO_CONFIRM_SENDERS_PAUSED", "NANO_CONFIRM_UPGRADE", "NANO_CONFIRM_LEGACY_UPGRADE",
@@ -436,6 +444,11 @@ BUNDLE_IMAGE_ROLES: dict[str, frozenset[str]] = {
     "grafana": frozenset({"monitoring"}),
     "redis_exporter": frozenset({"monitoring"}),
     "alertmanager": frozenset({"monitoring"}),
+    # NAN-5935: Kubernetes-only images (the Helm chart's ClickHouse operator
+    # and backup prune). They ride in the bundle for air-gapped registry
+    # mirrors; no Compose role runs them, so a role-selected host skips them.
+    "clickhouse-operator": frozenset(),
+    "rclone": frozenset(),
 }
 INSTALL_OPERATION_RESERVE_BYTES = 256 * 1024**2
 METRICS_EXPOSE_OVERLAY = "docker-compose.metrics-expose.yml"
@@ -1366,6 +1379,30 @@ FAILED_DICTIONARIES_KEY = "failed_dictionaries"
 # How long an error class must stay silent after its last occurrence inside
 # the rollout window before the gate treats it as a finished transient.
 TRANSIENT_ERROR_QUIET_SECONDS = 300
+# NAN-5958: the product's finding for rules that failed in the last 24 h and
+# whose latest run succeeded (analyzer.rs `failing_rule_recommendations`),
+# as a signature. A scheduled rule that runs while the upgrade restarts
+# ClickHouse fails "[transient] Backend unavailable" once and recovers on
+# its next run, but the finding stays for 24 h.
+RECOVERED_RULE_FAILURES_SIGNATURE = (
+    "detection rules failed to run or to store their matches in the last hours "
+    "and have since recovered"
+)
+# How many failing rules the report's metrics list (`list_failing_rules`).
+RULE_FAILURES_SNAPSHOT_LIMIT = 20
+# NAN-6046 review r2 P2-2: PostgreSQL's NOW(), read right BEFORE the run's
+# first step is journaled. A rule's last_error_at is PostgreSQL's clock too,
+# so "failed before the upgrade started" never compares two hosts' clocks:
+# every error the upgrade could cause is stamped at or after this reading.
+POSTGRES_CLOCK_EVENT = "postgres_clock_before_first_step"
+# NAN-5958 review P1: how long after a resume's nano-jobs restart finished a
+# rule failure still counts as caused by that restart (the restarted jobs
+# process reconnecting and re-claiming). Never open-ended.
+RESUME_RESTART_SETTLE_SECONDS = 60
+# The same bound for ClickHouse error counters (NAN-5528): nano-jobs reloads
+# the enrichment dictionaries when it starts, and a reload against the memory
+# limit can take a few minutes after the restart itself.
+RESUME_DICTIONARY_RELOAD_SETTLE_SECONDS = 300
 SIEM_HEALTH_STEP = "post-verify:siem-health"
 SIEM_HEALTH_RESUME_ADVICE = (
     "The release is fully rolled out; only this final check failed. Fix the cause "
@@ -1519,6 +1556,7 @@ def siem_health_report_for_gate(
     clock: Callable[[], float] = time.monotonic,
     now: Callable[[], str] = utc_now,
     on_requested: Callable[[], None] = lambda: None,
+    on_restarted: Callable[[], None] = lambda: None,
 ) -> tuple[dict[str, Any], bool]:
     """The report the gate evaluates. Returns (report, fresh).
 
@@ -1544,6 +1582,9 @@ def siem_health_report_for_gate(
         except Exception as error:  # noqa: BLE001 - other hosts may still succeed
             eprint(f"WARNING: could not request a fresh SIEM Health report: {str(error)[:300]}")
     if restarted:
+        # NAN-5958 review P1: bounds the restart's own window (only when a
+        # restart really happened; before the report wait starts).
+        on_restarted()
         eprint(
             f"==> {now()} requested a fresh SIEM Health report (restarted nano-jobs; "
             "its scheduler reports about 5 minutes after start)"
@@ -1605,24 +1646,14 @@ def upgrade_transient_findings(
     if not candidates:
         return {}
 
-    def first_start(predicate: Callable[[str], bool]) -> dt.datetime | None:
-        for event in events:
-            if event.get("event") == "step_started" and predicate(str(event.get("step", ""))):
-                return _parse_report_time(event.get("at"))
-        return None
-
-    window_start = first_start(lambda step: True)
-    window_end = first_start(lambda step: step == SIEM_HEALTH_STEP)
     # A resume's own nano-jobs restart (to get a fresh report) can reload
-    # dictionaries again: that span counts as upgrade-caused too.
-    extra_windows = [
-        (requested, now())
-        for requested in (
-            _parse_report_time(event.get("at"))
-            for event in events if event.get("event") == "siem_health_refresh_requested"
-        )
-        if requested is not None
-    ]
+    # dictionaries again: that span counts as upgrade-caused too, bounded to
+    # the restart plus the dictionary-reload settle period, never "until now"
+    # (NAN-5958 review: an open window let a later --resume excuse errors
+    # that happened long after the upgrade).
+    window_start, window_end, extra_windows = upgrade_rollout_windows(
+        events, settle_seconds=RESUME_DICTIONARY_RELOAD_SETTLE_SECONDS,
+    )
     transient: dict[str, str] = {}
     kept: dict[str, str] = {}
     for attempt in range(3):
@@ -1643,6 +1674,562 @@ def upgrade_transient_findings(
     for signature, reason in sorted(kept.items()):
         eprint(f"note: SIEM Health finding '{signature}' still counts: {reason}")
     return transient
+
+
+def _strict_int(value: Any) -> bool:
+    """An int that is not a bool (bool is an int subclass in Python)."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def trim_rule_failures(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """NAN-5958: keep only what the gate needs from each failing rule (no
+    rule names or error text in the journal beyond the failure class)."""
+    rules = snapshot.pop("rule_failures", None)
+    total = snapshot.pop("rule_failures_total", None)
+    if not isinstance(rules, list) or not _strict_int(total):
+        return snapshot
+    kept: list[dict[str, Any]] = []
+    for rule in rules[:RULE_FAILURES_SNAPSHOT_LIMIT]:
+        if not isinstance(rule, dict):
+            return snapshot
+        error = rule.get("last_error")
+        match = re.match(r"\[([a-z_:]{1,40})\]", error) if isinstance(error, str) else None
+        kept.append({
+            "last_error_at": rule.get("last_error_at") if isinstance(rule.get("last_error_at"), str) else None,
+            "failing_since": rule.get("failing_since") if isinstance(rule.get("failing_since"), str) else None,
+            # NAN-5958 review P2: an unknown value stays unknown (None), and
+            # the gate treats it as still failing; never coerced to False.
+            "failing_now": rule.get("failing_now") if isinstance(rule.get("failing_now"), bool) else None,
+            "consecutive_failures": rule.get("consecutive_failures")
+            if _strict_int(rule.get("consecutive_failures")) else None,
+            "failure_class": match.group(1) if match else None,
+        })
+    snapshot["rule_failures"] = kept
+    snapshot["rule_failures_total"] = total
+    return snapshot
+
+
+# NAN-6012: SIEM Health dimensions, with the weights the product's heuristic
+# scorer uses for the overall score (nanosiem-core siem_health/analyzer.rs
+# `fallback_report`), and the critical line (`HealthStatus::from_score`).
+SIEM_HEALTH_DIMENSION_WEIGHTS: dict[str, float] = {
+    "ingestion": 0.25, "parsing": 0.20, "enrichment": 0.15,
+    "detection": 0.25, "alerting": 0.15,
+}
+SIEM_HEALTH_CRITICAL_BELOW = 50
+# The dimensions the product can mark as having no data, and the neutral
+# score its scorer gives them (`score_parsing` / `score_enrichment`).
+SIEM_HEALTH_NO_DATA_CAPABLE = frozenset({"parsing", "enrichment"})
+SIEM_HEALTH_NO_DATA_NEUTRAL = 50
+# How far a dimension that was measured in the baseline may fall, alone and
+# summed over all measured dimensions at the scorer's weights (overall score
+# points), before the gate counts it as a regression (metric noise between
+# two reports). Below the scorer's smallest silent penalty tier (10).
+SIEM_HEALTH_DIMENSION_TOLERANCE = 5
+SIEM_HEALTH_MEASURED_DROP_TOLERANCE = 2.5
+
+
+def normalize_dimension_evidence(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """NAN-6012: reduce the report's dimension data to what the gate needs.
+
+    `dimensions` keeps the five dimension scores (None when a report has no
+    score for one). `no_data_dimensions` is the set of dimensions the report
+    had no data to score (they get a neutral score, not a measured one):
+
+    * from the report's own `metrics.no_data_dimensions` marker when present;
+    * for reports written before the marker existed (the baseline of an
+      upgrade from an older release), from the same metrics the product's
+      scorer checks: parsing has no field coverage and no lowercase invariant
+      violations; enrichment saw no events in the last 24 hours.
+
+    Anything missing or malformed leaves `no_data_dimensions` as None, and the
+    gate then counts every dimension as measured (never more permissive).
+    """
+    raw_scores = snapshot.pop("dimensions", None)
+    marker = snapshot.pop("no_data_marker", None)
+    legacy = snapshot.pop("no_data_legacy", None)
+    snapshot.pop("no_data_dimensions", None)
+    if isinstance(raw_scores, dict):
+        snapshot["dimensions"] = {
+            name: raw_scores.get(name) if _strict_int(raw_scores.get(name)) else None
+            for name in SIEM_HEALTH_DIMENSION_WEIGHTS
+        }
+    no_data: list[str] | None = None
+    if marker is not None:
+        if isinstance(marker, list) and all(
+            isinstance(name, str) and name in SIEM_HEALTH_NO_DATA_CAPABLE for name in marker
+        ):
+            no_data = sorted(set(marker))
+    elif isinstance(legacy, dict):
+        coverage = legacy.get("parsing_field_coverage")
+        # The query reports 0 for a report written before NAN-1643 (no
+        # violations list; the product reads that as empty) and NULL for a
+        # malformed one.
+        violations = legacy.get("parsing_invariant_violations")
+        events = legacy.get("enrichment_events_24h")
+        if _strict_int(coverage) and _strict_int(violations) and _strict_int(events):
+            no_data = []
+            if coverage == 0 and violations == 0:
+                no_data.append("parsing")
+            if events == 0:
+                no_data.append("enrichment")
+    if no_data is not None:
+        snapshot["no_data_dimensions"] = sorted(no_data)
+    return snapshot
+
+
+def _weighted_score(scores: dict[str, int]) -> int:
+    """The overall score the product's heuristic scorer gives these
+    dimension scores (it truncates toward zero, like Rust's `as i32`)."""
+    return int(sum(weight * scores[name] for name, weight in SIEM_HEALTH_DIMENSION_WEIGHTS.items()))
+
+
+def _scored_report(snapshot: dict[str, Any]) -> dict[str, int] | None:
+    """The report's five dimension scores, when its overall score is exactly
+    the weighted sum of them (so no AI judgment and no finding cap moved it),
+    else None."""
+    scores = snapshot.get("dimensions")
+    overall = snapshot.get("score")
+    if not isinstance(scores, dict) or not _strict_int(overall) or not 0 <= overall <= 100:
+        return None
+    clean: dict[str, int] = {}
+    for name in SIEM_HEALTH_DIMENSION_WEIGHTS:
+        value = scores.get(name)
+        if not _strict_int(value) or not 0 <= value <= 100:
+            return None
+        clean[name] = value
+    if _weighted_score(clean) != overall:
+        return None
+    return clean
+
+
+def no_data_status_drop(
+    before: dict[str, Any], after: dict[str, Any],
+) -> dict[str, list[str]] | None:
+    """NAN-6012: is a warning-to-critical drop explained only by dimensions
+    that had no data in the baseline?
+
+    Returns None when the reports do not carry the evidence, or when either
+    overall score is not the plain weighted sum of its dimensions (an AI
+    judgment or a finding cap): the gate then behaves as it did before.
+    Otherwise returns `measured`: reasons the drop is not explained (a
+    measured dimension fell beyond the tolerance, or the no-data dimensions
+    do not account for crossing the critical line); and `no_data`: baseline
+    no-data dimensions that fell. The drop is explained only when `measured`
+    is empty and `no_data` is not.
+    """
+    if before.get("status") != "warning":
+        return None
+    no_data = before.get("no_data_dimensions")
+    if not isinstance(no_data, list) or not set(no_data) <= SIEM_HEALTH_NO_DATA_CAPABLE:
+        return None
+    before_scores, after_scores = _scored_report(before), _scored_report(after)
+    if before_scores is None or after_scores is None:
+        return None
+    measured: list[str] = []
+    no_data_drops: list[str] = []
+    no_data_points = 0.0
+    measured_points = 0.0
+    for name, weight in SIEM_HEALTH_DIMENSION_WEIGHTS.items():
+        old, new = before_scores[name], after_scores[name]
+        if new >= old:
+            continue
+        if name in no_data:
+            no_data_drops.append(f"{name} {old} to {new}")
+            # Credit at most the neutral placeholder's worth (an AI-scored
+            # baseline may have given a no-data dimension 100).
+            no_data_points += weight * max(0, min(old, SIEM_HEALTH_NO_DATA_NEUTRAL) - new)
+        else:
+            measured_points += weight * (old - new)
+            if old - new > SIEM_HEALTH_DIMENSION_TOLERANCE:
+                measured.append(f"{name} {old} to {new}")
+    if measured_points > SIEM_HEALTH_MEASURED_DROP_TOLERANCE and not measured:
+        measured.append(
+            f"measured dimensions together cost {measured_points:.1f} overall points"
+        )
+    if not measured and no_data_drops:
+        # The no-data drops alone must take the baseline across the critical
+        # line, and undoing them must lift the new report out of it.
+        if before["score"] - no_data_points >= SIEM_HEALTH_CRITICAL_BELOW:
+            measured.append(
+                "the dimensions that had no data before the upgrade do not explain "
+                "the drop to critical on their own"
+            )
+        elif after["score"] + no_data_points < SIEM_HEALTH_CRITICAL_BELOW:
+            measured.append(
+                f"overall score would still be critical ({int(after['score'] + no_data_points)}) "
+                "without the dimensions that had no data before the upgrade"
+            )
+    return {"measured": measured, "no_data": no_data_drops}
+
+
+def upgrade_rollout_windows(
+    events: Sequence[dict[str, Any]],
+    *,
+    settle_seconds: int = RESUME_RESTART_SETTLE_SECONDS,
+) -> tuple[dt.datetime | None, dt.datetime | None, list[tuple[dt.datetime, dt.datetime]]]:
+    """The upgrade's own maintenance windows, all bounded: the run's first
+    step to the first start of the SIEM Health check, plus each resume's
+    nano-jobs restart, from the request to `settle_seconds` after the
+    restart finished (`siem_health_refresh_restarted`). A request whose
+    restart never completed opens no window (NAN-5958 review P1: an
+    open-ended "until now" window let a later --resume excuse steady-state
+    failures that happened long after the upgrade)."""
+    def first_start(predicate: Callable[[str], bool]) -> dt.datetime | None:
+        for event in events:
+            if event.get("event") == "step_started" and predicate(str(event.get("step", ""))):
+                return _parse_report_time(event.get("at"))
+        return None
+
+    settle = dt.timedelta(seconds=settle_seconds)
+    extra: list[tuple[dt.datetime, dt.datetime]] = []
+    requested: dt.datetime | None = None
+    for event in events:
+        kind = event.get("event")
+        if kind == "siem_health_refresh_requested":
+            requested = _parse_report_time(event.get("at"))
+        elif kind == "siem_health_refresh_restarted" and requested is not None:
+            restarted = _parse_report_time(event.get("at"))
+            if restarted is not None and restarted >= requested:
+                extra.append((requested, restarted + settle))
+            requested = None
+    return first_start(lambda step: True), first_start(lambda step: step == SIEM_HEALTH_STEP), extra
+
+
+# NAN-5976: SIEM Health reads `system.errors` over 24 hours, so a ClickHouse
+# error the gate already called an upgrade transient kept the product's own
+# report CRITICAL for a day. The upgrade records the SAME windows the gate
+# uses for error counters (upgrade_rollout_windows with the dictionary-reload
+# settle) plus its pre-upgrade baseline in PostgreSQL
+# (`upgrade_rollout_windows`, migration 405); SIEM Health applies the gate's
+# rule to them (nanosiem-core siem_health/upgrade_transients.rs).
+ROLLOUT_WINDOW_RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+ROLLOUT_WINDOWS_MAX = 64
+
+
+ROLLOUT_CLOCK_READ_MAX_SECONDS = 10
+
+
+def rollout_window_record(
+    events: Sequence[dict[str, Any]], baseline: dict[str, Any] | None,
+    *, clickhouse_now: dt.datetime, read_started: dt.datetime, read_finished: dt.datetime,
+) -> dict[str, Any] | None:
+    """The record SIEM Health reads, or None while the main window is not
+    known yet (before the SIEM Health check has started) or ClickHouse's
+    clock could not be tied to this host's.
+
+    The bounds are moved onto ClickHouse's clock (review r2: SIEM Health then
+    compares them with `last_error_time` directly, no other clock involved).
+    `clickhouse_now` was read between `read_started` and `read_finished` on
+    this host; each start uses the earliest and each end the latest possible
+    pairing, so the uncertainty only ever shrinks a window."""
+    start, end, extra = upgrade_rollout_windows(
+        events, settle_seconds=RESUME_DICTIONARY_RELOAD_SETTLE_SECONDS,
+    )
+    if start is None or end is None or end < start:
+        return None
+    spread = (read_finished - read_started).total_seconds()
+    if spread < 0 or spread > ROLLOUT_CLOCK_READ_MAX_SECONDS:
+        return None
+    windows = [(start, end), *[(a, b) for a, b in extra if b >= a]][:ROLLOUT_WINDOWS_MAX]
+    converted = []
+    for a, b in windows:
+        a_ch = clickhouse_now + (a - read_started)
+        b_ch = clickhouse_now + (b - read_finished)
+        if b_ch < a_ch:
+            continue
+        converted.append([
+            a_ch.astimezone(dt.timezone.utc).isoformat(), b_ch.astimezone(dt.timezone.utc).isoformat(),
+        ])
+    if not converted:
+        return None
+    return {
+        "clock": "clickhouse",
+        "windows": converted,
+        "clickhouse_errors_before": _rollout_baseline(baseline),
+    }
+
+
+def _rollout_baseline(baseline: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The gate's baseline in the shape SIEM Health parses, or None (a window
+    without a baseline never excuses an error, as in the gate)."""
+    if not isinstance(baseline, dict):
+        return None
+    captured = _parse_report_time(baseline.get("captured_at"))
+    errors = baseline.get("errors")
+    if captured is None or not isinstance(errors, dict):
+        return None
+    kept: dict[str, Any] = {}
+    for name, entry in errors.items():
+        if name not in TRANSIENT_ERROR_NAMES or not isinstance(entry, dict):
+            return None
+        last = _parse_report_time(entry.get("last_at"))
+        value = entry.get("value")
+        kept[name] = {
+            "value": value if isinstance(value, int) and value >= 0 else 0,
+            "last_at": last.astimezone(dt.timezone.utc).isoformat() if last else None,
+        }
+    return {"captured_at": captured.astimezone(dt.timezone.utc).isoformat(), "errors": kept}
+
+
+def rollout_windows_sql(run_id: str, record: dict[str, Any]) -> str:
+    """Add this run's windows; never replace or extend what is stored.
+
+    Every value is validated and re-rendered here; the baseline JSON travels
+    hex-encoded, so no quoting can break out of the statement. Inserts only
+    (ON CONFLICT DO NOTHING): a stored window is never changed. Nothing is
+    added once SIEM Health froze the run (`error_scored_at`), or, when the
+    run already has windows, once any SIEM Health report since the run
+    started (estimated on PostgreSQL's clock and widened by a minute) scored
+    a ClickHouse error counter (review r2 P2-3: a later window must never
+    excuse an error a report already counted)."""
+    if not ROLLOUT_WINDOW_RUN_ID.fullmatch(run_id):
+        raise UpgradeError("upgrade run id is invalid")
+    if record.get("clock") != "clickhouse":
+        raise UpgradeError("upgrade rollout window record is not on ClickHouse's clock")
+    windows = record.get("windows")
+    if not isinstance(windows, list) or not windows or len(windows) > ROLLOUT_WINDOWS_MAX:
+        raise UpgradeError("upgrade rollout windows are invalid")
+    baseline = _rollout_baseline(record.get("clickhouse_errors_before"))
+    baseline_sql = (
+        "convert_from(decode('"
+        + json.dumps(baseline, sort_keys=True, separators=(",", ":")).encode("utf-8").hex()
+        + "', 'hex'), 'UTF8')::jsonb"
+        if baseline is not None else "NULL::jsonb"
+    )
+    values: list[str] = []
+    seen: set[str] = set()
+    for window in windows:
+        if not isinstance(window, list) or len(window) != 2:
+            raise UpgradeError("upgrade rollout window is invalid")
+        start, end = (_parse_report_time(window[0]), _parse_report_time(window[1]))
+        if start is None or end is None or end < start:
+            raise UpgradeError("upgrade rollout window is invalid")
+        start_text = start.astimezone(dt.timezone.utc).isoformat()
+        end_text = end.astimezone(dt.timezone.utc).isoformat()
+        if start_text in seen:
+            continue
+        seen.add(start_text)
+        values.append(
+            f"('{run_id}', '{start_text}'::timestamptz, '{end_text}'::timestamptz, {baseline_sql})"
+        )
+    scored = (
+        "COALESCE(((h.metrics::jsonb)->'ingestion'->'insert_integrity'->>'memory_limit_errors')::bigint, 0) > 0 "
+        "OR COALESCE(((h.metrics::jsonb)->'ingestion'->'insert_integrity'->>'cache_dictionary_update_fails')::bigint, 0) > 0"
+    )
+    run_started = (
+        "(SELECT r.recorded_at - (r.ends_at - r.starts_at) - interval '60 seconds' "
+        f"FROM upgrade_rollout_windows r WHERE r.run_id = '{run_id}' ORDER BY r.starts_at LIMIT 1)"
+    )
+    return (
+        "BEGIN; "
+        "INSERT INTO upgrade_rollout_windows (run_id, starts_at, ends_at, clickhouse_errors_before) "
+        f"SELECT v.run_id, v.starts_at, v.ends_at, v.baseline FROM (VALUES {', '.join(values)}) "
+        "AS v(run_id, starts_at, ends_at, baseline) "
+        f"WHERE NOT EXISTS (SELECT 1 FROM upgrade_rollout_windows f WHERE f.run_id = '{run_id}' "
+        "AND f.error_scored_at IS NOT NULL) "
+        # A window overlapping one already stored (the same window converted
+        # again with a second of clock-read jitter, or a longer version of
+        # it) is never added: stored windows are never extended.
+        "AND NOT EXISTS (SELECT 1 FROM upgrade_rollout_windows o WHERE o.run_id = v.run_id "
+        "AND o.starts_at <= v.ends_at AND v.starts_at <= o.ends_at) "
+        f"AND (NOT EXISTS (SELECT 1 FROM upgrade_rollout_windows e WHERE e.run_id = '{run_id}') "
+        f"OR NOT EXISTS (SELECT 1 FROM siem_health_reports h WHERE h.created_at >= {run_started} "
+        f"AND ({scored}))) "
+        "ON CONFLICT (run_id, starts_at) DO NOTHING; "
+        "DELETE FROM upgrade_rollout_windows WHERE ends_at < now() - interval '30 days'; "
+        "COMMIT;"
+    )
+
+
+def rollout_error_findings(before: dict[str, Any], after: dict[str, Any]) -> list[str]:
+    """NAN-5976 review P2-3: new ClickHouse error-counter findings in the
+    report the gate read, at ANY status (one MEMORY_LIMIT_EXCEEDED costs a
+    healthy install 5 points and can flip it to warning). Such a report was
+    written before the rollout window was recorded, so a fresh one is asked
+    for; that only regenerates the report and never excuses anything."""
+    return sorted(
+        signature
+        for signature in siem_health_finding_signatures(after) - siem_health_finding_signatures(before)
+        if transient_error_name(signature) is not None
+    )
+
+
+def refresh_report_after_rollout_errors(
+    executors: Sequence[Any], *, on_requested: Callable[[], None],
+) -> bool:
+    """NAN-5976: the report the gate just read counts a ClickHouse error from
+    the rollout (it was written before the window was recorded), and SIEM
+    Health writes the next one only every 12 hours. Ask for a fresh one the
+    same credential-free way a --resume does (restart nano-jobs; its scheduler
+    reports about 5 minutes later) and do not wait for it.
+
+    This restart opens NO window (review r2 P2-3): it is journaled as its own
+    event, not the resume's requested/restarted pair, so anything it causes is
+    counted. Best effort: the upgrade has already passed."""
+    on_requested()
+    restarted = False
+    for executor in executors:
+        try:
+            restarted = bool(executor.request_siem_health_report().get("restarted")) or restarted
+        except Exception as error:  # noqa: BLE001 - never fails a finished upgrade
+            eprint(f"note: could not request a fresh SIEM Health report: {str(error)[:300]}")
+    if restarted:
+        eprint(
+            "note: the latest SIEM Health report still counts a ClickHouse error from the "
+            "upgrade's own restart; a fresh report that leaves it out of the score runs in "
+            "about 5 minutes"
+        )
+    return restarted
+
+
+def _leading_count(title: Any) -> int | None:
+    match = re.match(r"\s*(\d+)\b", title) if isinstance(title, str) else None
+    return int(match.group(1)) if match else None
+
+
+def postgres_window_start(events: Sequence[dict[str, Any]]) -> dt.datetime | None:
+    """NAN-6046 review r2 P2-2: the upgrade's start on PostgreSQL's clock,
+    or None (nothing then counts as pre-existing). Only a reading journaled
+    BEFORE the run's first step counts: it is then at or before PostgreSQL's
+    time of every error the upgrade could cause, whatever the hosts' skew."""
+    for event in events:
+        kind = event.get("event")
+        if kind == "step_started":
+            return None
+        if kind == POSTGRES_CLOCK_EVENT:
+            return _parse_report_time(event.get("postgres_now"))
+    return None
+
+
+def recovered_rule_failures_verdict(
+    before: dict[str, Any],
+    after: dict[str, Any],
+    events: Sequence[dict[str, Any]],
+) -> tuple[str, str] | None:
+    """The verdict on the "rules failed ... and have since recovered"
+    finding, judged RULE BY RULE: ("excused", summary note), ("counts",
+    reason), or None when the report it applies to is not critical or has no
+    such finding.
+
+    NAN-6046: the finding's title loses its count in the signature ("1" and
+    "2 detection rule(s) ..." are the same finding), and the "before" report
+    can be 12 hours old. So subtracting titles both blamed the upgrade for a
+    rule that failed in those hours (CT122 RC3: a 14:52 failure, the upgrade
+    at 15:28) and, when "before" already had the title, hid every new
+    failure behind it (a "[crash]" or "[deterministic]" after the upgrade).
+    Whenever `after` has the finding, each rule it lists is judged on its own:
+
+    * pre-existing, not counted: it is not failing now, has no failure
+      streak (`failing_since` is empty: it recovered), and its last error is
+      before the upgrade started, judged on PostgreSQL's clock (the reading
+      journaled just before the first step, the backup; none, none is);
+    * otherwise it must meet the NAN-5958 rule unchanged (recovered, a
+      transient error, inside the upgrade's own window), or the finding
+      counts, even when `before` had the same title.
+
+    Fail-closed: either report's rule list truncated, totals that do not add
+    up, an unknown window, and any unknown or invalid value keep it."""
+    if str(after.get("status", "")) != "critical":
+        return None
+    if RECOVERED_RULE_FAILURES_SIGNATURE not in siem_health_finding_signatures(after):
+        return None
+
+    def keep(reason: str) -> tuple[str, str]:
+        return "counts", reason
+
+    rules, total = after.get("rule_failures"), after.get("rule_failures_total")
+    if not isinstance(rules, list) or not _strict_int(total) or not rules:
+        return keep("the report does not list the failing rules")
+    if total != len(rules):
+        return keep(f"the report lists {len(rules)} of {total} failing rules")
+    for finding in after.get("findings", []) or []:
+        if not isinstance(finding, dict):
+            continue
+        if siem_health_finding_signatures({"findings": [finding]}) == {RECOVERED_RULE_FAILURES_SIGNATURE}:
+            count = _leading_count(finding.get("title"))
+            if count is not None and count != total:
+                return keep(f"the finding counts {count} rules but the report lists {total}")
+    if "rule_failures" in before or "rule_failures_total" in before:
+        before_rules, before_total = before.get("rule_failures"), before.get("rule_failures_total")
+        if not isinstance(before_rules, list) or not _strict_int(before_total) \
+                or before_total != len(before_rules):
+            return keep("the report from before the upgrade does not list all of its failing rules")
+    window_start, window_end, extra = upgrade_rollout_windows(events)
+    if window_start is None or window_end is None:
+        return keep("the upgrade rollout window is unknown")
+    # Pre-existing is judged on PostgreSQL's clock only (review r2 P2-2).
+    pg_start = postgres_window_start(events)
+    last_seen: dt.datetime | None = None
+    counted = 0
+    for rule in rules:
+        if not isinstance(rule, dict):
+            return keep("a failing rule entry is invalid")
+        streak = rule.get("consecutive_failures")
+        if rule.get("failing_now") is not False or not _strict_int(streak) or streak != 0:
+            return keep("a rule has not recovered")
+        at = _parse_report_time(rule.get("last_error_at"))
+        if at is None:
+            return keep("a rule's last error time is unknown")
+        # Review r2 P2-1: a rule with a failure start has not recovered (an
+        # unsettled "[crash?]" suspect awaiting its isolated rerun), however
+        # old its error: never pre-existing. Every recovery clears it.
+        if rule.get("failing_since") is not None:
+            return keep("a rule has not recovered")
+        if pg_start is not None and at < pg_start:
+            continue  # pre-existing: it failed before the upgrade started
+        # NAN-5958, unchanged.
+        if rule.get("failure_class") != "transient":
+            return keep(f"a rule failed with a {rule.get('failure_class') or 'unclassified'} error")
+        inside = window_start <= at <= window_end or any(start <= at <= end for start, end in extra)
+        if not inside:
+            return keep(f"a rule failed at {_hhmmss(at)}, outside the upgrade's own window")
+        counted += 1
+        last_seen = at if last_seen is None or at > last_seen else last_seen
+    earlier = len(rules) - counted
+    parts: list[str] = []
+    if counted:
+        assert last_seen is not None
+        parts.append(
+            f"{counted} detection rule(s) failed with a transient error while the upgrade "
+            f"restarted services (last at {_hhmmss(last_seen)}) and have since recovered"
+        )
+    if earlier:
+        assert pg_start is not None
+        parts.append(
+            f"{earlier} detection rule(s) failed before the upgrade started "
+            f"({_hhmmss(pg_start)}) and have since recovered"
+        )
+    return "excused", "; ".join(parts)
+
+
+def recovered_rule_failure_transients(
+    before: dict[str, Any],
+    after: dict[str, Any],
+    events: Sequence[dict[str, Any]],
+    *,
+    now: Callable[[], dt.datetime] = lambda: dt.datetime.now(dt.timezone.utc),
+) -> dict[str, str]:
+    """NAN-5958 / NAN-6046: the recovered-rule-failures finding as an upgrade
+    transient (signature -> summary note) when `recovered_rule_failures_verdict`
+    excuses it; otherwise nothing, with a note saying why it still counts."""
+    verdict = recovered_rule_failures_verdict(before, after, events)
+    if verdict is None:
+        return {}
+    kind, text = verdict
+    if kind != "excused":
+        eprint(f"note: SIEM Health finding '{RECOVERED_RULE_FAILURES_SIGNATURE}' still counts: {text}")
+        return {}
+    return {RECOVERED_RULE_FAILURES_SIGNATURE: text}
+
+
+def recovered_rule_failures_counted(
+    before: dict[str, Any], after: dict[str, Any], events: Sequence[dict[str, Any]],
+) -> list[str]:
+    """NAN-6046: the finding when its per-rule verdict counts it, so the gate
+    counts it even when `before` already had the same title."""
+    verdict = recovered_rule_failures_verdict(before, after, events)
+    return [RECOVERED_RULE_FAILURES_SIGNATURE] if verdict is not None and verdict[0] == "counts" else []
 
 
 def transient_error_name(signature: str) -> str | None:
@@ -1803,17 +2390,21 @@ def read_clickhouse_error_counters(
 
 def gate_siem_health_regressions(
     before: dict[str, Any], after: dict[str, Any], override_reason: str | None = None,
-    transient: dict[str, str] | None = None,
+    transient: dict[str, str] | None = None, counted: Iterable[str] = (),
 ) -> dict[str, Any]:
     before_status = str(before.get("status", "not-present"))
     after_status = str(after.get("status", "not-present"))
     transient = dict(transient or {})
     regressions: list[str] = []
     excused: list[str] = []
+    no_data_notes: list[str] = []
     if after_status == "critical":
+        after_signatures = siem_health_finding_signatures(after)
         new_findings = sorted(
-            siem_health_finding_signatures(after)
-            - siem_health_finding_signatures(before)
+            (after_signatures - siem_health_finding_signatures(before))
+            # NAN-6046: a finding judged per rule counts even when `before`
+            # had the same (count-stripped) title.
+            | {signature for signature in counted if signature in after_signatures}
         )
         excused = [finding for finding in new_findings if finding in transient]
         remaining = [finding for finding in new_findings if finding not in transient]
@@ -1826,11 +2417,22 @@ def gate_siem_health_regressions(
                 signature for signature, rank in _finding_priorities(after).items()
                 if signature in before_ranks and rank > before_ranks[signature]
             ]
-            if remaining or worsened or not excused:
+            # NAN-6012: with no new or worsened finding, a drop caused only by
+            # dimensions the baseline had no data for (a quiet install scores
+            # them a neutral 50; the first real data scores them for real) is
+            # not a regression. A measured dimension that fell still is.
+            drop = None if (remaining or worsened or excused) else no_data_status_drop(before, after)
+            if drop is not None and drop["no_data"] and not drop["measured"]:
+                no_data_notes = drop["no_data"]
+            elif remaining or worsened or not excused:
                 regressions.append(f"status worsened from {before_status} to critical")
                 if worsened:
                     regressions.append(
                         f"pre-existing findings worsened: {', '.join(sorted(worsened))}"
+                    )
+                if drop is not None and drop["measured"]:
+                    regressions.append(
+                        f"measured SIEM Health dimensions dropped: {', '.join(drop['measured'])}"
                     )
         if remaining:
             regressions.append(f"new critical-report findings: {', '.join(remaining)}")
@@ -1844,6 +2446,7 @@ def gate_siem_health_regressions(
         "after": after,
         "regressions": regressions,
         "transient": [transient[finding] for finding in excused],
+        "no_data_dimensions": no_data_notes,
         "override": bool(regressions and override_reason),
     }
 
@@ -2671,6 +3274,24 @@ class Journal:
                 return RunState(path.stem, path, events)
         return None
 
+    def find_all_incomplete(self) -> list[RunState]:
+        """NAN-5969: every unfinished run, newest first. Reads every journal,
+        so an unreadable one raises instead of hiding behind a newer one."""
+        if not self.directory.exists():
+            return []
+        self.ensure_directory()
+        candidates = sorted(
+            self.directory.glob("upgrade-*.jsonl"),
+            key=lambda item: item.stat().st_mtime,
+            reverse=True,
+        )
+        unfinished: list[RunState] = []
+        for path in candidates:
+            events = self._events(path)
+            if events and not self._terminal(events):
+                unfinished.append(RunState(path.stem, path, events))
+        return unfinished
+
     def load_latest_incomplete(self) -> RunState:
         state = self.find_latest_incomplete()
         if state is not None:
@@ -2706,6 +3327,158 @@ class Journal:
         except (OSError, json.JSONDecodeError) as error:
             raise UpgradeError(f"invalid upgrade journal: {path}") from error
         return events
+
+
+# NAN-5969: the step families a single-host upgrade journals. A journal
+# that started any other step is unknown here and is never closed for the
+# operator.
+FINISHED_ROLLOUT_STEP_PREFIXES = (
+    "backup-skipped", "backup:", "prepare:", "render-config:", "network-pin:",
+    "rollout:", "post-verify:",
+)
+
+
+def stuck_at_siem_health(
+    state: RunState, *, installed_version: str, edition: str,
+    new_target: str | None = None,
+    running_versions: Sequence[str] | None = None,
+    role_split: bool = False,
+) -> str | None:
+    """NAN-5969: None when `state` is an unfinished upgrade the new upgrade may
+    close on the operator's behalf, else the plain-English reason it may not.
+
+    Closable means exactly this (the 2.0.35 -> 2.0.36 NAN-5957/5958 state): a
+    single-host run whose every change step finished, which stopped only at
+    the read-only `post-verify:siem-health` gate, whose target release is the
+    one installed (and running) now, for a different, newer release than the
+    one about to be installed. There is nothing left to roll forward or back.
+    Anything else (stopped mid-change, another target, an unknown step, a
+    rollback, a multi-host run) keeps the explicit resume/abandon contract."""
+    events = state.events
+    if not events or events[0].get("event") != "run_started":
+        return "its journal does not start with a recorded run"
+    started = events[0]
+    if role_split or started.get("inventory"):
+        return "it is a multi-host upgrade"
+    if started.get("legacy_layout"):
+        return "it is a legacy layout transition"
+    try:
+        source = canonical_version(str(started.get("installed_version", "")))
+        journal_target = canonical_version(str(started.get("target_version", "")))
+        installed = canonical_version(str(installed_version))
+    except UpgradeError:
+        return "its recorded versions cannot be read"
+    if source == journal_target:
+        return "it did not change the release"
+    if started.get("edition") != edition:
+        return "it was for a different edition"
+    if installed != journal_target:
+        return f"the installed release is {installed}, not its target {journal_target}"
+    if running_versions is not None:
+        try:
+            running = [canonical_version(str(value)) for value in running_versions]
+        except UpgradeError:
+            running = []
+        if not running or any(value != journal_target for value in running):
+            return f"not every nano service is running its target {journal_target}"
+    if new_target is not None:
+        try:
+            if semver(new_target) <= semver(journal_target):
+                return f"it is for the same release {journal_target}; resume it instead"
+        except UpgradeError:
+            return "the new release version cannot be read"
+    if any(str(event.get("event", "")).startswith("rollback") for event in events):
+        return "a rollback was started for it"
+    activated = max(
+        (index for index, event in enumerate(events)
+         if event.get("event") == "api_mutation_fence_activated"),
+        default=-1,
+    )
+    cleared = max(
+        (index for index, event in enumerate(events)
+         if event.get("event") == "api_mutation_fence_cleared"),
+        default=-1,
+    )
+    if activated > cleared:
+        return "it left the API write fence on"
+    started_steps = state.started_steps
+    unknown = sorted(
+        step for step in started_steps
+        if not step.startswith(FINISHED_ROLLOUT_STEP_PREFIXES)
+    )
+    if unknown:
+        return f"it started a step this upgrader does not know ({unknown[0]})"
+    done = state.done_steps
+    unfinished = started_steps - done
+    if unfinished != {SIEM_HEALTH_STEP}:
+        pending = sorted(unfinished - {SIEM_HEALTH_STEP})
+        if pending:
+            return f"it stopped in the middle of a change step ({pending[0]})"
+        return "it did not stop at the final SIEM Health check"
+    if "post-verify:smoke-search" not in done or not any(
+        step.startswith("rollout:") for step in done
+    ):
+        return "its rollout steps are not all recorded as finished"
+    return None
+
+
+def unfinished_upgrade_next_step(state: RunState) -> str:
+    """The exact command that finishes `state` with the bundle it started."""
+    started = state.latest("run_started") or {}
+    bundle = str(started.get("bundle") or "<the bundle it started with>")
+    return f"scripts/nano upgrade --bundle {shlex.quote(bundle)} --resume"
+
+
+def unfinished_upgrade_check(
+    journal: Journal, *, installed_version: str, edition: str, new_target: str,
+    running_versions: Callable[[], Sequence[str]], role_split: bool,
+) -> Check:
+    """NAN-5969: the dry run's view of an unfinished upgrade journal. It
+    PASSes when there is none or when the real upgrade will close it on its
+    own; otherwise it FAILs with the exact next step, because the real
+    upgrade will refuse to start."""
+    name = "unfinished-upgrade"
+    try:
+        unfinished = journal.find_all_incomplete()
+    except UpgradeError as error:
+        return Check(
+            name, False,
+            f"the upgrade journal cannot be read ({error}). The upgrade will not start "
+            f"until it can. Next step: check the files in {journal.directory} and contact "
+            "support before you change them.",
+        )
+    if not unfinished:
+        return Check(name, True, "no unfinished upgrade")
+    if len(unfinished) > 1:
+        names = ", ".join(item.run_id for item in unfinished)
+        return Check(
+            name, False,
+            f"{len(unfinished)} unfinished upgrades ({names}). The upgrade will refuse to "
+            "start. Next step: finish or close each one; for the newest: "
+            f"{unfinished_upgrade_next_step(unfinished[0])}",
+        )
+    state = unfinished[0]
+    started = state.latest("run_started") or {}
+    span = f"{started.get('installed_version', '?')} to {started.get('target_version', '?')}"
+    running = list(running_versions())
+    why_not = stuck_at_siem_health(
+        state, installed_version=installed_version, edition=edition,
+        new_target=new_target, running_versions=running, role_split=role_split,
+    )
+    if why_not is None:
+        return Check(
+            name, True,
+            f"unfinished upgrade {state.run_id} ({span}) stopped only at the final SIEM "
+            "Health check after every change step finished, and its release is installed "
+            "and running. "
+            "The upgrade will close it (recorded in the journal and the audit log) "
+            "before it starts.",
+        )
+    return Check(
+        name, False,
+        f"unfinished upgrade {state.run_id} ({span}) must be finished first: {why_not}. "
+        f"The upgrade will refuse to start. Next step: {unfinished_upgrade_next_step(state)}",
+    )
 
 
 class Runner:
@@ -2792,6 +3565,22 @@ def parse_role_env(path: pathlib.Path) -> dict[str, str]:
             raise UpgradeError(f"invalid role environment entry on line {number}")
         values[key] = value
     return values
+
+
+# NAN-6000: simdjson's only kernel in the official amd64 ClickHouse build
+# (Haswell) also needs these beside AVX2; without them every JSON parse fails.
+SIMDJSON_CPU_FLAGS = ("bmi1", "bmi2", "pclmulqdq")
+
+
+def simdjson_cpu_message(missing: list[str]) -> str:
+    return (
+        f"this CPU does not report {' '.join(missing)}, so ClickHouse cannot read any JSON value "
+        "(setup fails with 'Cannot parse JSON object here: {}'). Proxmox CPU types x86-64-v3 and "
+        "x86-64-v4 lack pclmulqdq: set the VM's CPU type to 'host' (or a custom model with "
+        "+pclmulqdq), stop and start the VM, then run the upgrade again. If you cannot, copy "
+        "clickhouse/preflight/zz-local-no-simdjson.xml into clickhouse/users.d/ first "
+        "(slower JSON parsing)."
+    )
 
 
 class LocalOps:
@@ -3122,7 +3911,7 @@ class LocalOps:
         return (
             f"nano's Compose network is pinned to {recorded} (NANO_COMPOSE_SUBNET in .env) "
             f"but the pin could not be planned: {plan.get('reason') or 'unknown reason'}. "
-            "Fix the cause (docker compose config, docker network ls) and rerun the upgrade "
+            f"Fix the cause ({self.compose_text('config')}; docker network ls) and rerun the upgrade "
             "with --resume; the ClickHouse allow-list was not changed."
         )
 
@@ -3790,6 +4579,16 @@ class LocalOps:
         self._single_ingest_closed = False
         return applied
 
+    def compose_text(self, *arguments: str) -> str:
+        """NAN-5966: a `docker compose ...` command an operator can paste: this
+        install's own project and files (a bare `docker compose` finds no
+        stack in an install folder)."""
+        try:
+            base = list(self.compose_args)
+        except Exception:  # noqa: BLE001 - a hint must never raise
+            base = ["docker", "compose"]
+        return shlex.join([*base, *arguments])
+
     def compose(
         self, arguments: Sequence[str], *, timeout: int = 120,
         input_text: str | None = None, check: bool = True,
@@ -4111,12 +4910,11 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
         if probe.returncode == 0:
             return f"registry accepted this host's credential for {head.split('/', 1)[0]}"
         detail = " ".join((probe.stderr or "").split())
-        if (
-            "unknown command" in detail
-            or "is not a docker command" in detail
-            or ("buildx" in detail and "not found" in detail)
-        ):
-            return ""  # no buildx: the digest pulls below are the auth test
+        if buildx_plugin_missing(f"{probe.stderr or ''} {probe.stdout or ''}"):
+            # NAN-5975: no buildx is not a refused credential. The digest
+            # pulls right after this ask the registry with the same login,
+            # so they are the credential test.
+            return BUILDX_MISSING_NOTE
         raise UpgradeError(
             f"the registry refused this host's credential for {target.split('@', 1)[0]} "
             f"({detail[-160:] or f'exit {probe.returncode}'}): log in again with a fresh "
@@ -4643,7 +5441,23 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
         missing = sorted(needed - flags)
         if missing:
             raise UpgradeError(f"missing CPU feature(s): {', '.join(missing)}")
-        return "required features present"
+        return self._check_simdjson_cpu(flags) or "required features present"
+
+    def _check_simdjson_cpu(self, flags: set[str]) -> str | None:
+        """NAN-6000: refuse before backup/rollout when ClickHouse's JSON parser
+        cannot run here (clickhouse-preflight would stop mid-rollout)."""
+        if "clickhouse" not in self.roles or "avx2" not in flags:
+            return None
+        missing = [flag for flag in SIMDJSON_CPU_FLAGS if flag not in flags]
+        if not missing:
+            return None
+        users = getattr(self, "install_dir", pathlib.Path(".")) / "clickhouse" / "users.d"
+        if any(
+            "<allow_simdjson>0</allow_simdjson>" in path.read_text(encoding="utf-8", errors="replace")
+            for path in sorted(users.glob("*.xml"))
+        ):
+            return f"CPU lacks {' '.join(missing)}; allow_simdjson=0 drop-in present (slower JSON parsing)"
+        raise UpgradeError(simdjson_cpu_message(missing))
 
     def _check_ntp(self) -> str:
         if shutil.which("timedatectl"):
@@ -6941,7 +7755,12 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
     def _stop_exact(self, services: Iterable[str], timeout: int) -> list[str]:
         selected = list(dict.fromkeys(services))
         if selected:
-            self.compose(["stop", "--timeout", str(min(timeout, 60)), *selected], timeout=timeout)
+            stop_timeout = min(timeout, 60)
+            if "nano-jobs" in selected:
+                # NAN-6046: never shorter than the jobs drain.
+                stop_timeout = max(stop_timeout, JOBS_STOP_TIMEOUT_SECONDS)
+            self.compose(["stop", "--timeout", str(stop_timeout), *selected],
+                         timeout=max(timeout, stop_timeout + 60))
         return selected
 
     def _start_exact(self, services: Iterable[str], timeout: int) -> list[str]:
@@ -7241,7 +8060,7 @@ printf '%s\n' "$metrics" | awk '$0 !~ /^#/ &&
         if not self._running_services(("ingest-edge",)):
             raise UpgradeError(
                 f"ingest-edge on {getattr(self, 'host_name', 'single')} is NOT running: senders "
-                "are refused. Start it: docker compose up -d --no-deps ingest-edge"
+                f"are refused. Start it: {self.compose_text('up', '-d', '--no-deps', 'ingest-edge')}"
             )
 
     def _reopen_ingest_edge(self) -> dict[str, Any] | None:
@@ -7275,7 +8094,7 @@ printf '%s\n' "$metrics" | awk '$0 !~ /^#/ &&
         """
         single = self._single_closure_path()
         if single is not None and (single.is_file() or single.is_symlink()):
-            eprint(f"{getattr(self, 'host_name', 'single')}: an interrupted run left ingest closed; reopening it")
+            eprint(f"{getattr(self, 'host_name', 'single')}: ingest is still closed from an earlier step or run; reopening it")
             self._reopen_single_node_ingest(force=True)
         path = self._closure_path()
         if path is None or not (path.is_file() or path.is_symlink()):
@@ -7559,8 +8378,8 @@ printf '%s\n' "$metrics" | awk '$0 !~ /^#/ &&
                 ["exec", "-T", "nginx", "rm", "-f", INGEST_EDGE_CLOSED_MARKER], timeout=60, check=False,
             )
             if result.returncode != 0:
-                eprint("WARNING: could not reopen ingest at nginx; run: docker compose exec nginx rm -f "
-                       f"{INGEST_EDGE_CLOSED_MARKER}")
+                eprint("WARNING: could not reopen ingest at nginx; run: "
+                       f"{self.compose_text('exec', 'nginx', 'rm', '-f', INGEST_EDGE_CLOSED_MARKER)}")
                 return
         if getattr(self, "_single_ingest_closed", False) or pending:
             eprint(f"{getattr(self, 'host_name', 'single')}: reopened ingest")
@@ -7581,8 +8400,9 @@ printf '%s\n' "$metrics" | awk '$0 !~ /^#/ &&
             eprint(
                 "WARNING: ingest is still closed on this host (nginx answers 503, Vector's ports refuse). "
                 "`scripts/nano upgrade --resume` (or --abandon-incomplete) reopens it; by hand: "
-                "docker compose exec nginx rm -f /run/nano-ingest/closed; docker compose start nginx; "
-                "docker compose exec vector sh /etc/vector/.nano/ingest-gate.sh open"
+                f"{self.compose_text('exec', 'nginx', 'rm', '-f', '/run/nano-ingest/closed')}; "
+                f"{self.compose_text('start', 'nginx')}; "
+                f"{self.compose_text('exec', 'vector', 'sh', '/etc/vector/.nano/ingest-gate.sh', 'open')}"
             )
 
     def _reopen_after_failure(self) -> None:
@@ -7926,6 +8746,8 @@ printf '%s\n' "$metrics" | awk '$0 !~ /^#/ &&
         ]
         core = [service for service in selected if service not in APP_EDGE_SERVICES]
         edges = [service for service in APP_EDGE_SERVICES if service in selected]
+        if "nano-jobs" in core:
+            self._stop_jobs_before_recreate()
         if core:
             self.compose(
                 ["up", "-d", "--no-deps", "--pull", "never", *self._recreate_args(core), *core],
@@ -8157,7 +8979,7 @@ printf 'consumer generation %s ready\n' "$generation"
             f"vector did not report healthy on its API (127.0.0.1:8686/health) within "
             f"{int(time.monotonic() - started)}s (expected about {estimate}s for its config tree, "
             f"limit {ceiling}s; last state: {last}). It compiles every parser before its sources "
-            "listen. Check 'docker compose logs vector'"
+            f"listen. Check: {self.compose_text('logs', 'vector')}"
         )
 
     def _wait_ingest_readiness(
@@ -8257,6 +9079,21 @@ printf 'consumer generation %s ready\n' "$generation"
         # NAN-5566: Vector is ready again (the readiness wait above).
         self._reopen_single_node_ingest()
         return selected
+
+    def _stop_jobs_before_recreate(self) -> None:
+        """NAN-6046: stop a running nano-jobs with JOBS_STOP_TIMEOUT_SECONDS
+        before `up` recreates it, so its shutdown drain and claim release
+        finish. A recreate would stop it with the old container's own timeout
+        (10 s for one created before 2.0.37) and SIGKILL the drain."""
+        try:
+            running = "nano-jobs" in self._running_services(("nano-jobs",))
+        except Exception as error:  # noqa: BLE001 - a probe; `up` still recreates
+            eprint(f"note: could not check nano-jobs before recreating it ({error})")
+            return
+        if not running:
+            return
+        self.compose(["stop", "--timeout", str(JOBS_STOP_TIMEOUT_SECONDS), "nano-jobs"],
+                     timeout=JOBS_STOP_TIMEOUT_SECONDS + 60)
 
     def _stop_vector_before_recreate(self, timeout: int) -> None:
         """NAN-5566: never let a recreate stop Vector with a short timeout (an
@@ -8926,6 +9763,80 @@ printf 'consumer generation %s ready\n' "$generation"
         overlays = (getattr(self, "env", None) or {}).get("NANO_COMPOSE_OVERLAYS", "")
         return TLS_OVERLAY in overlays.split()
 
+    def running_first_party_versions(self) -> list[str]:
+        """NAN-5969: one release tag per first-party nano service, read from
+        the live containers by SERVICE name (not .env, and not by image
+        repository: nano-api, vector-tap and agentlane-gate share one).
+
+        Every long-running first-party service this host is configured to
+        run adds the tag of its running container, or "" when it has no
+        running container or runs an image outside this install's prefix or
+        without a tag. Any other running first-party container (for example
+        one left from a disabled profile) adds its tag too, so a stale one
+        still refuses. One-shot services (`restart: "no"`, the migrator) and
+        services scaled to zero are not expected to run."""
+        prefix = self.env.get("NANO_IMAGE_PREFIX") or "ghcr.io/nano-rs/nano"
+
+        def first_party_tag(image: str) -> str:
+            if not image.startswith(f"{prefix}-"):
+                return ""
+            reference = image.split("@", 1)[0]
+            _, separator, tag = reference.rpartition(":")
+            return tag if separator and "/" not in tag else ""
+
+        config = json.loads(self.compose(["config", "--format", "json"], timeout=60).stdout)
+        services = config.get("services") if isinstance(config, dict) else None
+        project = str(config.get("name") or "") if isinstance(config, dict) else ""
+        if not isinstance(services, dict) or not project:
+            raise UpgradeError("could not read the configured Compose project and services")
+        expected: list[str] = []
+        for name, spec in services.items():
+            if not isinstance(spec, dict) or not str(spec.get("image", "")).startswith(f"{prefix}-"):
+                continue
+            if str(spec.get("restart", "")).strip() == "no":
+                continue
+            deploy = spec.get("deploy")
+            replicas = deploy.get("replicas") if isinstance(deploy, dict) else None
+            if replicas is None:
+                replicas = spec.get("scale")
+            try:
+                if replicas is not None and int(replicas) == 0:
+                    continue
+            except (TypeError, ValueError):
+                pass
+            if name == "vector-tap" and not self.env.get("NANO_VECTOR_TAP_TOKEN"):
+                continue
+            expected.append(str(name))
+        running: dict[str, list[str]] = {}
+        for line in self.compose(
+            [
+                "--profile", "*", "ps", "--status", "running",
+                "--format", "{{.Project}}\t{{.Service}}\t{{.Image}}",
+            ],
+            timeout=30,
+        ).stdout.splitlines():
+            # `compose ps` selects by this install's com.docker.compose.project
+            # label; the row's project is checked again so a container of any
+            # other project never counts as one of this install's services.
+            fields = line.strip().split("\t")
+            if len(fields) != 3 or not fields[1]:
+                continue
+            row_project, service, image = (field.strip() for field in fields)
+            if row_project != project:
+                continue
+            running.setdefault(service, []).append(image)
+        versions: list[str] = []
+        for service in expected:
+            images = running.get(service) or [""]
+            versions.extend(first_party_tag(image) for image in images)
+        for service, images in running.items():
+            if service in expected:
+                continue
+            versions.extend(
+                first_party_tag(image) for image in images if image.startswith(f"{prefix}-")
+            )
+        return versions
+
     def _probe_app_route(self) -> dict[str, Any]:
         internal_scheme = "https" if self.role_env.get("NANO_PRIVATE_TLS") == "true" else "http"
         legacy_bridge = getattr(self, "_legacy_bridge_rollout", False)
@@ -9125,7 +10036,23 @@ fi
         encoded = self._pg_query(
             "SELECT COALESCE((SELECT json_build_object("
             "'id',id::text,'status',overall_status,'score',overall_score,"
-            "'created_at',created_at,'findings',recommendations)::text "
+            "'created_at',created_at,'findings',recommendations,"
+            # NAN-5958: the failing rules behind the recovered-rules finding.
+            "'rule_failures',(metrics::jsonb)->'detection'->'failing_rules',"
+            "'rule_failures_total',(metrics::jsonb)->'detection'->'failing_rules_total',"
+            # NAN-6012: dimension scores and which dimensions had no data.
+            "'dimensions',json_build_object('ingestion',ingestion_score,'parsing',parsing_score,"
+            "'enrichment',enrichment_score,'detection',detection_score,'alerting',alerting_score),"
+            "'no_data_marker',(metrics::jsonb)->'no_data_dimensions',"
+            "'no_data_legacy',json_build_object("
+            "'parsing_field_coverage',CASE WHEN jsonb_typeof((metrics::jsonb)->'parsing'->'field_coverage')='array' "
+            "THEN jsonb_array_length((metrics::jsonb)->'parsing'->'field_coverage') END,"
+            "'parsing_invariant_violations',CASE WHEN jsonb_typeof((metrics::jsonb)->'parsing'->'lowercase_invariant_violations')='array' "
+            "THEN jsonb_array_length((metrics::jsonb)->'parsing'->'lowercase_invariant_violations') "
+            # Written before NAN-1643: no list, which the product reads as empty.
+            "WHEN jsonb_typeof((metrics::jsonb)->'parsing')='object' "
+            "AND NOT ((metrics::jsonb)->'parsing' ? 'lowercase_invariant_violations') THEN 0 END,"
+            "'enrichment_events_24h',(metrics::jsonb)->'enrichment'->'total_events_24h'))::text "
             "FROM siem_health_reports ORDER BY created_at DESC LIMIT 1),"
             "'{\"status\":\"no-report-yet\",\"findings\":[]}')"
         )
@@ -9135,7 +10062,7 @@ fi
             raise UpgradeError("latest SIEM Health report is invalid JSON") from error
         # Validate before the snapshot is admitted to the append-only journal.
         siem_health_finding_signatures(snapshot)
-        return snapshot
+        return normalize_dimension_evidence(trim_rule_failures(snapshot))
 
     def clickhouse_error_counters(self) -> dict[str, Any]:
         """NAN-5528: this ClickHouse's `system.errors` totals for the error
@@ -9174,6 +10101,45 @@ fi
         counters[FAILED_DICTIONARIES_KEY] = int(failed)
         return counters
 
+    def postgres_now(self) -> dt.datetime:
+        """NAN-6046: PostgreSQL's own clock (rule errors are stamped on it)."""
+        if "postgres" not in self.roles:
+            raise UpgradeError("PostgreSQL's clock must be read on the PostgreSQL host")
+        moment = _parse_report_time(self._pg_query("SELECT to_json(now())#>>'{}'", timeout=30))
+        if moment is None:
+            raise UpgradeError("PostgreSQL returned an invalid time")
+        return moment
+
+    def clickhouse_now(self) -> dt.datetime:
+        """NAN-5976: ClickHouse's own clock, to record rollout windows on it."""
+        if "clickhouse" not in self.roles:
+            raise UpgradeError("ClickHouse's clock must be read on a ClickHouse host")
+        value = self._ch_query("SELECT toUnixTimestamp(now())", timeout=30).strip()
+        if not value.isdigit() or int(value) <= 0:
+            raise UpgradeError("ClickHouse returned an invalid time")
+        return dt.datetime.fromtimestamp(int(value), tz=dt.timezone.utc)
+
+    def record_upgrade_rollout_windows(self, run_id: str, record: dict[str, Any]) -> dict[str, Any]:
+        """NAN-5976: store this run's rollout windows for SIEM Health."""
+        if "postgres" not in self.roles:
+            raise UpgradeError("upgrade rollout windows must be recorded on the PostgreSQL host")
+        statement = rollout_windows_sql(run_id, record)
+        present = self._pg_query(
+            "SELECT CASE WHEN to_regclass('upgrade_rollout_windows') IS NULL "
+            "THEN 'false' ELSE 'true' END"
+        )
+        if present != "true":
+            return {"recorded": 0, "reason": "this release has no upgrade_rollout_windows table"}
+        self._pg_query(statement)
+        # What is stored for the run (a frozen or already-scored run gets no
+        # new rows; the statement itself never fails for that).
+        stored = self._pg_query(
+            f"SELECT count(*) FROM upgrade_rollout_windows WHERE run_id = '{run_id}'"
+        )
+        if not stored.isdigit():
+            raise UpgradeError("PostgreSQL returned an invalid window count")
+        return {"recorded": int(stored)}
+
     def request_siem_health_report(self) -> dict[str, Any]:
         """NAN-5497: ask for a fresh SIEM Health report. The report needs an
         admin session over the API, which the upgrade does not hold; the
@@ -9181,7 +10147,10 @@ fi
         restart of this host's jobs service is the credential-free trigger."""
         if "app" not in self.roles or not self._service_exists("nano-jobs"):
             return {"host": self.host_name, "restarted": False}
-        result = self.compose(["restart", "nano-jobs"], timeout=180, check=False)
+        # NAN-6046: the explicit timeout lets the jobs drain release its claims.
+        result = self.compose(
+            ["restart", "--timeout", str(JOBS_STOP_TIMEOUT_SECONDS), "nano-jobs"], timeout=180, check=False,
+        )
         if result.returncode != 0:
             detail = [line.strip() for line in (result.stderr or "").splitlines() if line.strip()]
             raise UpgradeError(
@@ -9864,6 +10833,35 @@ class NodeExecutor:
             self._remote("clickhouse-errors", [], 120), "remote ClickHouse error counters",
         )
 
+    def clickhouse_now(self) -> dt.datetime:
+        if self.local:
+            return self.local_ops.clickhouse_now()
+        value = json_object(self._remote("clickhouse-now", [], 60), "remote ClickHouse time")
+        moment = _parse_report_time(value.get("now"))
+        if moment is None:
+            raise UpgradeError(f"host {self.node.name} returned an invalid ClickHouse time")
+        return moment
+
+    def postgres_now(self) -> dt.datetime:
+        if self.local:
+            return self.local_ops.postgres_now()
+        value = json_object(self._remote("postgres-now", [], 60), "remote PostgreSQL time")
+        moment = _parse_report_time(value.get("now"))
+        if moment is None:
+            raise UpgradeError(f"host {self.node.name} returned an invalid PostgreSQL time")
+        return moment
+
+    def record_upgrade_rollout_windows(self, run_id: str, record: dict[str, Any]) -> dict[str, Any]:
+        if self.local:
+            return self.local_ops.record_upgrade_rollout_windows(run_id, record)
+        return json_object(
+            self._remote(
+                "record-rollout-windows", ["--run-id", run_id], 120,
+                input_text=json.dumps(record, sort_keys=True, separators=(",", ":")),
+            ),
+            "remote upgrade rollout windows",
+        )
+
     def request_siem_health_report(self) -> dict[str, Any]:
         if self.local:
             return self.local_ops.request_siem_health_report()
@@ -10081,6 +11079,33 @@ def image_needs_registry_login(ref: str) -> bool:
         return False  # a Docker Hub name such as postgres:17 or a two-part Hub path
     repository = last.split("@", 1)[0].split(":", 1)[0]
     return repository.startswith("nanosiem-")
+
+
+# NAN-5975: what the docker CLI prints when the buildx plugin is missing (or
+# too old for `imagetools inspect --raw`). Docker 29.x does not say "unknown
+# command" for `docker buildx imagetools inspect --raw ...`: it reads the whole
+# line as top-level flags and answers "unknown flag: --raw". Registry answers
+# (401/403, "unauthorized", "denied", "<ref>: not found") never match.
+_BUILDX_MISSING_PATTERNS = (
+    re.compile(r"unknown flag:\s*--raw\b"),
+    re.compile(r"unknown command:?\s*(?:\"?docker\s+)?buildx\b"),
+    re.compile(r"'?buildx'?\s+is not a docker command"),
+    re.compile(r"cli-plugins/docker-buildx\b.*(?:no such file|not found|permission denied)"),
+    re.compile(r"\bdocker-buildx:?\s+(?:command\s+)?not found"),
+)
+
+BUILDX_MISSING_NOTE = (
+    "the Docker buildx plugin is not installed, so the image pulls below check "
+    "this host's registry credential instead (to add it on Debian or Ubuntu: "
+    "apt-get install docker-buildx-plugin)"
+)
+
+
+def buildx_plugin_missing(output: str) -> bool:
+    """True when docker's output says the buildx plugin is missing or cannot
+    run `imagetools inspect --raw`, not that the registry refused us."""
+    text = " ".join((output or "").split())
+    return any(pattern.search(text) for pattern in _BUILDX_MISSING_PATTERNS)
 
 
 def private_registry_images(manifest: dict[str, Any]) -> list[dict[str, Any]]:
@@ -11338,9 +12363,17 @@ def acquire_process_lock(install_dir: pathlib.Path) -> Iterable[None]:
     except BlockingIOError as error:
         os.close(descriptor)
         raise UpgradeError("another live nano upgrade/rollback process holds the install lock") from error
+    # NAN-5963: the backup and restore this operation runs through
+    # `scripts/nano` run under this lock instead of waiting for it.
+    previous = os.environ.get("NANO_INSTALL_LOCK_OWNER")
+    os.environ["NANO_INSTALL_LOCK_OWNER"] = f"{os.getpid()}:{install_dir}"
     try:
         yield
     finally:
+        if previous is None:
+            os.environ.pop("NANO_INSTALL_LOCK_OWNER", None)
+        else:
+            os.environ["NANO_INSTALL_LOCK_OWNER"] = previous
         fcntl.flock(descriptor, fcntl.LOCK_UN)
         os.close(descriptor)
 
@@ -11515,29 +12548,116 @@ def abandon_command(args: argparse.Namespace) -> int:
         postgres_nodes = node_sort(nodes, "postgres")
         if not postgres_nodes:
             raise UpgradeError("abandon requires a PostgreSQL host")
-        # NAN-5488: an abandoned run must not leave an ingest edge closed.
-        for node in node_sort(nodes, "ingest"):
-            try:
-                reopened = executors[node.name].reconcile_ingest_edge_closure()
-            except (UpgradeError, OSError, ValueError) as error:
-                eprint(
-                    f"WARNING: could not reopen the ingest edge on {node.name}: {error}. Check it "
-                    "with `scripts/nano cluster-health` there"
-                )
-                continue
-            if reopened.get("reconciled"):
-                journal.append(state, "ingest_edge_reopened_on_abandon", node=node.name)
         with executors[postgres_nodes[0].name].upgrade_lock():
-            journal.append(
-                state, "run_abandoned", reason=reason, reconciled_by_uid=os.getuid(),
-                reconciled_on=socket.gethostname(),
-            )
-            ops.audit(
-                state.run_id, "nano_upgrade_abandon", True,
-                {"reason": reason, "reconciled_by_uid": os.getuid()},
-            )
+            close_incomplete_run(journal, state, ops, nodes, executors, reason)
     print(f"Abandoned incomplete upgrade {state.run_id} after explicit reconciliation audit.")
     return 0
+
+
+def close_incomplete_run(
+    journal: Journal, state: RunState, ops: Any, nodes: Sequence[Node],
+    executors: dict[str, Any], reason: str, *, automatic: bool = False,
+) -> None:
+    """Journal and audit `run_abandoned` for `state`. The caller holds the
+    install lock and the PostgreSQL upgrade lock. NAN-5969: `automatic` marks
+    the upgrade closing a run stopped only at its SIEM Health gate."""
+    # NAN-5488: an abandoned run must not leave an ingest edge closed.
+    for node in node_sort(nodes, "ingest"):
+        try:
+            reopened = executors[node.name].reconcile_ingest_edge_closure()
+        except (UpgradeError, OSError, ValueError) as error:
+            eprint(
+                f"WARNING: could not reopen the ingest edge on {node.name}: {error}. Check it "
+                "with `scripts/nano cluster-health` there"
+            )
+            continue
+        if reopened.get("reconciled"):
+            journal.append(state, "ingest_edge_reopened_on_abandon", node=node.name)
+    extra = {"automatic": True} if automatic else {}
+    journal.append(
+        state, "run_abandoned", reason=reason, reconciled_by_uid=os.getuid(),
+        reconciled_on=socket.gethostname(), **extra,
+    )
+    ops.audit(
+        state.run_id, "nano_upgrade_abandon", True,
+        {"reason": reason, "reconciled_by_uid": os.getuid(), **extra},
+    )
+
+
+def probe_running_versions(ops: Any) -> list[str]:
+    """NAN-5969: the running first-party release tags, or [] (which never
+    closes a run) when they cannot be read."""
+    try:
+        return list(ops.running_first_party_versions())
+    except (UpgradeError, OSError, ValueError, AttributeError) as error:
+        eprint(f"note: could not list the running nano images: {error}")
+        return []
+
+
+def stuck_run_refusal(run_id: str) -> UpgradeError:
+    return UpgradeError(
+        f"incomplete upgrade journal {run_id} exists; resume it or use "
+        "the explicit audited abandon operation"
+    )
+
+
+def only_unfinished_run(journal: Journal, expected: RunState | None = None) -> RunState | None:
+    """NAN-5969: the single unfinished run, or None. More than one (or, with
+    `expected`, any other run or a changed journal) refuses before any write."""
+    unfinished = journal.find_all_incomplete()
+    if not unfinished:
+        return None
+    if len(unfinished) > 1:
+        raise stuck_run_refusal(unfinished[0].run_id)
+    current = unfinished[0]
+    if expected is not None and (
+        current.run_id != expected.run_id or current.events != expected.events
+    ):
+        raise UpgradeError(
+            f"incomplete upgrade journal {current.run_id} changed while the upgrade was "
+            "checking it; run the upgrade again"
+        )
+    return current
+
+
+def close_stuck_run(
+    journal: Journal, stuck: RunState, ops: Any, nodes: Sequence[Node],
+    executors: dict[str, Any], *, new_target: str,
+) -> None:
+    """NAN-5969: close an earlier upgrade that stopped only at its SIEM Health
+    gate (NAN-5957/5958) so the newer release can install. The caller holds the
+    install lock and the PostgreSQL upgrade lease, and preflight has passed.
+    The journal is re-read and re-checked here; any change refuses."""
+    current = only_unfinished_run(journal, stuck)
+    if current is None:
+        raise UpgradeError(
+            f"incomplete upgrade journal {stuck.run_id} changed while the upgrade was "
+            "checking it; run the upgrade again"
+        )
+    why_not = stuck_at_siem_health(
+        current, installed_version=ops.version, edition=ops.edition,
+        new_target=new_target, running_versions=probe_running_versions(ops),
+        role_split=bool(ops.role_env) or len(nodes) != 1,
+    )
+    if why_not is not None:
+        raise stuck_run_refusal(current.run_id)
+    started = current.latest("run_started") or {}
+    source = str(started.get("installed_version", ""))
+    target = str(started.get("target_version", ""))
+    reason = (
+        f"Closed by the upgrade to {new_target}: the {source} to {target} upgrade finished "
+        f"every change step and {target} is installed and running; it stopped only at "
+        "the final SIEM Health check (NAN-5958), so there was nothing to undo."
+    )
+    eprint(
+        f"note: closing unfinished upgrade {current.run_id} ({source} to {target}). Every "
+        f"change step finished and {target} is installed; it stopped only at the final "
+        "SIEM Health check. This is recorded in its journal and in the audit log."
+    )
+    close_incomplete_run(journal, current, ops, nodes, executors, reason, automatic=True)
+    remaining = journal.find_latest_incomplete()
+    if remaining is not None:
+        raise stuck_run_refusal(remaining.run_id)
 
 
 def upgrade_command(args: argparse.Namespace) -> int:
@@ -11585,13 +12705,19 @@ def upgrade_command(args: argparse.Namespace) -> int:
                     document = pending_deployment.get("document")
                     if isinstance(document, dict) and document.get("remote_install_dir"):
                         args.remote_install_dir = str(document["remote_install_dir"])
+            # NAN-5969: an unfinished run stopped only at its SIEM Health gate,
+            # with its release installed, is closed (audited) after preflight
+            # passes; every other unfinished run refuses exactly as before.
+            stuck_run: RunState | None = None
             if not args.resume and not args.dry_run:
-                incomplete = journal.find_latest_incomplete()
+                incomplete = only_unfinished_run(journal)
                 if incomplete is not None:
-                    raise UpgradeError(
-                        f"incomplete upgrade journal {incomplete.run_id} exists; resume it or use "
-                        "the explicit audited abandon operation"
-                    )
+                    if stuck_at_siem_health(
+                        incomplete, installed_version=ops.version, edition=ops.edition,
+                        role_split=bool(args.inventory or ops.role_env),
+                    ) is not None:
+                        raise stuck_run_refusal(incomplete.run_id)
+                    stuck_run = incomplete
             if args.resume:
                 state = journal.load_latest_incomplete()
                 started = state.latest("run_started") or {}
@@ -11625,6 +12751,14 @@ def upgrade_command(args: argparse.Namespace) -> int:
             stale = older_upgrader_warning(canonical_version(str(manifest["version"])))
             if stale:
                 eprint(stale)
+            if stuck_run is not None and stuck_at_siem_health(
+                stuck_run, installed_version=ops.version, edition=ops.edition,
+                new_target=canonical_version(str(manifest["version"])),
+                running_versions=probe_running_versions(ops),
+                role_split=bool(args.inventory or ops.role_env),
+            ) is not None:
+                # NAN-5969: before anything below writes .env or recovers a fence.
+                raise stuck_run_refusal(stuck_run.run_id)
             # NAN-5470: right after the bundle's signature is verified and
             # before preflight, the backup, prepare or any other compose call
             # (args.inventory is final here, `--resume` included). A dry run
@@ -11686,6 +12820,13 @@ def upgrade_command(args: argparse.Namespace) -> int:
             if not isinstance(recorded_workers, dict):
                 raise UpgradeError("journaled worker identities are invalid")
             checks = check_version_path(ops.version, manifest, ops.edition, resuming=state is not None)
+            if args.dry_run and not args.resume:
+                checks.append(unfinished_upgrade_check(
+                    journal, installed_version=ops.version, edition=ops.edition,
+                    new_target=target,
+                    running_versions=lambda: probe_running_versions(ops),
+                    role_split=role_split,
+                ))
             if legacy_transition:
                 checks.append(legacy_backup_retention_check(args.backup_output, install_dir))
             for node in nodes:
@@ -11732,7 +12873,10 @@ def upgrade_command(args: argparse.Namespace) -> int:
                 cluster_lease.__enter__()
                 if state is None:
                     incomplete = journal.find_latest_incomplete()
-                    if incomplete is not None:
+                    if incomplete is not None and (
+                        stuck_run is None
+                        or only_unfinished_run(journal, stuck_run) is None
+                    ):
                         raise UpgradeError(
                             f"incomplete upgrade journal {incomplete.run_id} appeared while acquiring "
                             "the cluster lease; resume or explicitly abandon it"
@@ -11920,6 +13064,12 @@ def upgrade_command(args: argparse.Namespace) -> int:
                 print("Dry run complete: verification and all read-only preflight checks passed.")
                 return 0
 
+            if stuck_run is not None:
+                close_stuck_run(
+                    journal, stuck_run, ops, nodes, executors, new_target=target,
+                )
+                stuck_run = None
+
             if state is None:
                 run_id = f"upgrade-{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
                 state = journal.create(run_id, {
@@ -11949,6 +13099,25 @@ def upgrade_command(args: argparse.Namespace) -> int:
                     raise UpgradeError("resume target does not match the journal")
                 run_id = state.run_id
 
+            # NAN-6046 review r2 P2-2: the upgrade's start on PostgreSQL's
+            # clock, read before the first step is journaled (never on a
+            # resume that already started steps). Best effort: without it no
+            # rule counts as pre-existing in the SIEM Health check.
+            if not any(
+                event.get("event") in ("step_started", POSTGRES_CLOCK_EVENT) for event in state.events
+            ):
+                try:
+                    postgres_clock = executors[postgres_nodes[0].name].postgres_now()
+                    journal.append(
+                        state, POSTGRES_CLOCK_EVENT,
+                        postgres_now=postgres_clock.astimezone(dt.timezone.utc).isoformat(),
+                    )
+                except Exception as error:  # noqa: BLE001 - only makes the gate stricter
+                    eprint(
+                        "note: could not read PostgreSQL's clock before the upgrade "
+                        f"({str(error)[:200]}); the final SIEM Health check counts every "
+                        "detection rule failure it lists"
+                    )
             backup_root = pathlib.Path(
                 args.backup_output or install_dir / "backups" / run_id
             ).expanduser().resolve()
@@ -12168,6 +13337,41 @@ def upgrade_command(args: argparse.Namespace) -> int:
                 )
                 wait_seconds = env_seconds("NANO_UPGRADE_SIEM_HEALTH_WAIT_SECONDS", 600)
                 fetch_report = executors[postgres_node.name].siem_health
+
+                def record_rollout_windows() -> bool:
+                    # NAN-5976: before the report runs (and again after each
+                    # nano-jobs restart for a fresh one), so SIEM Health shows
+                    # this rollout's own ClickHouse errors without scoring
+                    # them. Best effort: without the record SIEM Health counts
+                    # every error, exactly as before.
+                    try:
+                        read_started = dt.datetime.now(dt.timezone.utc)
+                        clickhouse_now = executors[clickhouse_node.name].clickhouse_now()
+                        read_finished = dt.datetime.now(dt.timezone.utc)
+                        record = rollout_window_record(
+                            state.events, clickhouse_errors_before,
+                            clickhouse_now=clickhouse_now, read_started=read_started,
+                            read_finished=read_finished,
+                        )
+                        if record is None:
+                            return False
+                        written = executors[postgres_node.name].record_upgrade_rollout_windows(
+                            state.run_id, record,
+                        )
+                    except Exception as error:  # noqa: BLE001 - never fails the upgrade
+                        eprint(
+                            "note: could not record the upgrade's rollout window for SIEM "
+                            f"Health ({str(error)[:200]}); a ClickHouse error from the "
+                            "rollout may lower the SIEM Health score for up to 24 hours"
+                        )
+                        return False
+                    return bool(written.get("recorded"))
+
+                def on_restarted() -> None:
+                    journal.append(state, "siem_health_refresh_restarted")
+                    record_rollout_windows()
+
+                recorded = record_rollout_windows()
                 app_nodes = node_sort(nodes, "app")
                 after, fresh = siem_health_report_for_gate(
                     fetch_report,
@@ -12178,6 +13382,7 @@ def upgrade_command(args: argparse.Namespace) -> int:
                     siem_health_before, rollout_started, wait_seconds,
                     resumed=siem_health_gate_resumed(state.events),
                     on_requested=lambda: journal.append(state, "siem_health_refresh_requested"),
+                    on_restarted=on_restarted,
                 )
                 if not fresh:
                     eprint(
@@ -12201,15 +13406,33 @@ def upgrade_command(args: argparse.Namespace) -> int:
                         TRANSIENT_ERROR_QUIET_SECONDS,
                     ),
                 )
+                transient.update(recovered_rule_failure_transients(
+                    siem_health_before, after, state.events,
+                ))
                 result = gate_siem_health_regressions(
                     siem_health_before, after, args.allow_siem_health_regression,
                     transient=transient,
+                    counted=recovered_rule_failures_counted(siem_health_before, after, state.events),
                 )
                 result["compared"] = True
+                if recorded and not result["regressions"] and rollout_error_findings(
+                    siem_health_before, after,
+                ):
+                    refresh_report_after_rollout_errors(
+                        [executors[node.name] for node in app_nodes],
+                        on_requested=lambda: journal.append(state, "siem_health_report_refresh_requested"),
+                    )
                 for note in result["transient"]:
                     eprint(
                         f"note: SIEM Health finding from the upgrade's own rollout, not "
                         f"counted as a regression: {note}"
+                    )
+                for note in result["no_data_dimensions"]:
+                    eprint(
+                        f"WARNING: SIEM Health status worsened from {siem_health_before.get('status')} "
+                        f"to {after.get('status')} only because a dimension had no data before "
+                        f"the upgrade and is now measured ({note}). Not counted as a regression; "
+                        "check that dimension in Settings > SIEM Health."
                     )
                 if result["override"]:
                     details = {
@@ -12553,6 +13776,14 @@ def worker_command(args: argparse.Namespace) -> int:
         value = ops.clickhouse_error_counters()
     elif args.worker_action == "siem-health-refresh":
         value = ops.request_siem_health_report()
+    elif args.worker_action == "clickhouse-now":
+        value = {"now": ops.clickhouse_now().isoformat()}
+    elif args.worker_action == "postgres-now":
+        value = {"now": ops.postgres_now().isoformat()}
+    elif args.worker_action == "record-rollout-windows":
+        value = ops.record_upgrade_rollout_windows(
+            args.run_id, json_object(json.loads(sys.stdin.read(65536) or "{}"), "rollout windows"),
+        )
     elif args.worker_action == "rollback-preflight":
         value = [
             check.as_dict()
@@ -12645,7 +13876,7 @@ def parser() -> argparse.ArgumentParser:
     rollback.add_argument("--nano-cli", help=argparse.SUPPRESS)
 
     worker = commands.add_parser("_upgrade-worker", help=argparse.SUPPRESS)
-    worker.add_argument("worker_action", choices=("identity", "preflight", "ledger", "pg-ha-status", "pg-switchover", "backup-gate", "api-mutation-capability", "api-mutation-fence", "backup", "running-writers", "quiesce", "resume-writers", "hold-advisory-lock", "prepare", "render-config", "rollout", "post-verify", "smoke-ingest", "smoke-search", "siem-health", "clickhouse-errors", "siem-health-refresh", "rollback-preflight", "rollback", "reopen-ingest-edge"))
+    worker.add_argument("worker_action", choices=("identity", "preflight", "ledger", "pg-ha-status", "pg-switchover", "backup-gate", "api-mutation-capability", "api-mutation-fence", "backup", "running-writers", "quiesce", "resume-writers", "hold-advisory-lock", "prepare", "render-config", "rollout", "post-verify", "smoke-ingest", "smoke-search", "siem-health", "clickhouse-errors", "siem-health-refresh", "record-rollout-windows", "clickhouse-now", "postgres-now", "rollback-preflight", "rollback", "reopen-ingest-edge"))
     worker.add_argument("--install-dir", required=True)
     worker.add_argument("--candidate", default="")
     worker.add_argument("--bundle")

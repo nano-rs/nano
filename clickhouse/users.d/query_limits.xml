@@ -94,6 +94,18 @@
             <read_in_order_two_level_merge_threshold>100</read_in_order_two_level_merge_threshold>
             <optimize_aggregation_in_order>1</optimize_aggregation_in_order>
 
+            <!-- NAN-5909: on a replicated cluster a Distributed read picks one
+                 replica per shard. ClickHouse's own default lets that replica
+                 be up to 300 s behind, so a scheduled detection could read a
+                 window its replica has not received yet and miss events. Skip
+                 a replica more than 30 s behind (the local one too) when a
+                 fresher one exists. If every replica of a shard is behind, the
+                 query still runs on the freshest one (fallback = 1): stale
+                 reads beat a failed search during a replication incident.
+                 No effect on a single node. -->
+            <max_replica_delay_for_distributed_queries>30</max_replica_delay_for_distributed_queries>
+            <fallback_to_stale_replicas_for_distributed_queries>1</fallback_to_stale_replicas_for_distributed_queries>
+
             <!-- Index Usage -->
             <force_index_by_date>0</force_index_by_date>
             <force_primary_key>0</force_primary_key>
@@ -188,6 +200,10 @@
              ================================================================= -->
         <analytics>
             <network_compression_method>LZ4</network_compression_method>
+            <!-- NAN-5909: this profile does not inherit `default`; same 30 s
+                 replica-lag cap for hunts and reports. -->
+            <max_replica_delay_for_distributed_queries>30</max_replica_delay_for_distributed_queries>
+            <fallback_to_stale_replicas_for_distributed_queries>1</fallback_to_stale_replicas_for_distributed_queries>
             <!-- NAN-4903: never infer Date/DateTime from JSON strings. Inference is per
                  insert block, so one date-like vendor value retyped the whole path and
                  coerced the other rows ("1" became 2026-01-01) in event/unmapped/ext. -->
@@ -265,6 +281,11 @@
             <!-- Optimization for time-series queries -->
             <optimize_read_in_order>1</optimize_read_in_order>
             <read_in_order_two_level_merge_threshold>10</read_in_order_two_level_merge_threshold>
+
+            <!-- NAN-5909: real-time detections read the newest events, so a
+                 lagging replica hurts them most. Same cap as `default`. -->
+            <max_replica_delay_for_distributed_queries>30</max_replica_delay_for_distributed_queries>
+            <fallback_to_stale_replicas_for_distributed_queries>1</fallback_to_stale_replicas_for_distributed_queries>
 
             <!-- ClickHouse 25.3+ Query Condition Cache - Critical for NRT rules
                  that run the same time-window filters repeatedly -->
@@ -420,6 +441,11 @@
              ================================================================= -->
         <search>
             <profile>default</profile>
+            <!-- NAN-5909: inherited from `default`; stated here so a change to
+                 the parent cannot silently let searches read a lagging
+                 replica. -->
+            <max_replica_delay_for_distributed_queries>30</max_replica_delay_for_distributed_queries>
+            <fallback_to_stale_replicas_for_distributed_queries>1</fallback_to_stale_replicas_for_distributed_queries>
             <allow_ddl>0</allow_ddl>
             <allow_introspection_functions>0</allow_introspection_functions>
             <constraints>
@@ -566,6 +592,10 @@
              ================================================================= -->
         <rawsql>
             <network_compression_method>LZ4</network_compression_method>
+            <!-- NAN-5909: this profile does not inherit `default`; same 30 s
+                 replica-lag cap for raw SQL, dashboards included. -->
+            <max_replica_delay_for_distributed_queries>30</max_replica_delay_for_distributed_queries>
+            <fallback_to_stale_replicas_for_distributed_queries>1</fallback_to_stale_replicas_for_distributed_queries>
             <!-- NAN-4903: never infer Date/DateTime from JSON strings. Inference is per
                  insert block, so one date-like vendor value retyped the whole path and
                  coerced the other rows ("1" became 2026-01-01) in event/unmapped/ext. -->

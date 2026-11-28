@@ -86,7 +86,7 @@ const FIXTURES: &[(&str, &str)] = &[
 ];
 
 fn ch_url() -> String {
-    std::env::var("CLICKHOUSE_TEST_URL").unwrap_or_else(|_| "http://localhost:8123".into())
+    nanosiem_test_db::require_ch_url()
 }
 fn ch_user() -> String {
     std::env::var("CLICKHOUSE_ADMIN_USER").unwrap_or_else(|_| "nanosiem_admin".into())

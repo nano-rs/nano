@@ -70,7 +70,12 @@ fn subscriptions_follow_the_profile_and_edition() {
 #[test]
 fn first_party_repo_lookup() {
     assert_eq!(channels::for_repo("nano-rs", "parsers", "main").unwrap().id, "parsers.main");
-    assert_eq!(channels::for_repo("NANOS-SH", "Rules.git", "legacy/clickhouse").unwrap().id, "rules.legacy-clickhouse");
+    assert_eq!(channels::for_repo("NANO-RS", "Rules.git", "legacy/clickhouse").unwrap().id, "rules.legacy-clickhouse");
+    // NAN-5954: the unregistered pre-rename org is third-party.
+    assert!(channels::for_repo("nanos-sh", "rules", "main").is_none());
+    assert!(channels::for_repo("NANOS-SH", "Parsers.git", "main").is_none());
+    assert!(!channels::is_first_party_owner("nanos-sh"));
+    assert!(!channels::is_first_party_owner(" NANOS-SH "));
     assert!(channels::for_repo("nano-rs", "parsers", "my-fork-branch").is_none());
     assert!(channels::for_repo("SigmaHQ", "sigma", "master").is_none());
     assert!(channels::is_first_party_owner("nano-rs"));
@@ -83,10 +88,17 @@ fn first_party_repo_lookup() {
 #[test]
 fn repo_url_pattern_matches_first_party_spellings_only() {
     let re = regex::RegexBuilder::new(&repo_url_pattern("parsers")).case_insensitive(true).build().unwrap();
-    for ok in ["https://github.com/nano-rs/parsers", "github.com/nanos-sh/parsers.git", "https://www.github.com/NANO-RS/Parsers/"] {
+    for ok in ["https://github.com/nano-rs/parsers", "github.com/nano-rs/parsers.git", "https://www.github.com/NANO-RS/Parsers/"] {
         assert!(re.is_match(ok), "{ok}");
     }
-    for bad in ["https://github.com/nano-rs/parsers-fork", "https://github.com/evil/parsers", "https://github.com/nano-rs/parsers/tree/x"] {
+    for bad in [
+        "https://github.com/nano-rs/parsers-fork",
+        "https://github.com/evil/parsers",
+        "https://github.com/nano-rs/parsers/tree/x",
+        // NAN-5954: the unregistered pre-rename org is third-party.
+        "https://github.com/nanos-sh/parsers",
+        "github.com/NANOS-SH/parsers.git",
+    ] {
         assert!(!re.is_match(bad), "{bad}");
     }
 }

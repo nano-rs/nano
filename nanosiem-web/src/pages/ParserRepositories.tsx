@@ -80,18 +80,10 @@ import {
   type ActionAccess,
 } from '@/components/repositories/repository-action-policy';
 import { Term } from '@/components/ui/term';
+import { ingestionMethodForConfigType } from '@/lib/log-source-transports';
 
-// Maps a SourceConfiguration.config_type to the source_type / ingestion_method
-// values the parser-import endpoint expects. Mirrors the legacy SOURCE_TYPE_MAP.
-const SOURCE_TYPE_MAP: Record<string, { sourceType: string; label: string }> = {
-  http: { sourceType: 'routed', label: 'HTTP (Routed)' },
-  vector: { sourceType: 'vector', label: 'Vector' },
-  otlp: { sourceType: 'otlp', label: 'OpenTelemetry (OTLP)' },
-  splunk_hec: { sourceType: 'splunk_hec', label: 'Splunk HEC' },
-  kafka: { sourceType: 'kafka', label: 'Kafka' },
-  aws_s3: { sourceType: 'aws_s3', label: 'AWS S3' },
-  gcp_pubsub: { sourceType: 'gcp_pubsub', label: 'GCP Pub/Sub' },
-};
+// NAN-6036: the config_type -> ingestion_method table lives in
+// lib/log-source-transports so the Add source wizard uses the same one.
 
 export function ParserRepositories() {
   useDocumentTitle('Parser Repositories');
@@ -287,7 +279,7 @@ export function ParserRepositories() {
   const ingestionMethodForConfig = (configId: string | null): string => {
     const selectedConfig = sourceConfigs.find((config) => config.id === configId);
     return selectedConfig
-      ? (SOURCE_TYPE_MAP[selectedConfig.config_type]?.sourceType ?? 'routed')
+      ? (ingestionMethodForConfigType(selectedConfig.config_type) ?? 'routed')
       : 'routed';
   };
 
@@ -475,7 +467,7 @@ export function ParserRepositories() {
     }) => {
       const selectedConfig = deployedConfigs.find((c) => c.id === configId);
       const ingestionMethod = selectedConfig
-        ? (SOURCE_TYPE_MAP[selectedConfig.config_type]?.sourceType ?? 'routed')
+        ? (ingestionMethodForConfigType(selectedConfig.config_type) ?? 'routed')
         : 'routed';
 
       const result = await api.parserRepositories.importParser(repoId, path, {

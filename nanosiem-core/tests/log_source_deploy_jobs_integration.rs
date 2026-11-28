@@ -55,7 +55,7 @@ fn result(success: bool, message: &str) -> DeploymentResult {
 }
 
 #[tokio::test]
-#[ignore = "needs PostgreSQL (DATABASE_URL)"]
+#[ignore = "needs PostgreSQL (NANOSIEM_TEST_DATABASE_URL)"]
 async fn concurrent_requests_coalesce_into_one_queued_job() {
     let pool = pool().await;
     let store = Arc::new(PgDeployJobStore::new(pool.clone()));
@@ -107,7 +107,7 @@ async fn concurrent_requests_coalesce_into_one_queued_job() {
 }
 
 #[tokio::test]
-#[ignore = "needs PostgreSQL (DATABASE_URL)"]
+#[ignore = "needs PostgreSQL (NANOSIEM_TEST_DATABASE_URL)"]
 async fn stale_jobs_are_interrupted_and_a_real_finish_still_lands() {
     let pool = pool().await;
     let store = PgDeployJobStore::new(pool.clone());
@@ -177,7 +177,7 @@ async fn stale_jobs_are_interrupted_and_a_real_finish_still_lands() {
 }
 
 #[tokio::test]
-#[ignore = "needs PostgreSQL (DATABASE_URL)"]
+#[ignore = "needs PostgreSQL (NANOSIEM_TEST_DATABASE_URL)"]
 async fn runner_on_postgres_serializes_and_records_failures_and_rollbacks() {
     let pool = pool().await;
     let runner = DeployJobRunner::with_pool(pool.clone());

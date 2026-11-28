@@ -608,6 +608,26 @@ fn test_git_source() -> bool {
     TEST_GIT_SOURCE.with(|f| f.get())
 }
 
+/// Turn on [`TEST_GIT_SOURCE`] for this thread until the guard drops (also on
+/// panic), so a test that needs the local git source never leaks it into the
+/// next test on the same thread (`--test-threads=1`).
+#[cfg(test)]
+#[must_use = "the local git source is on only while the guard lives"]
+pub(super) fn use_test_git_source() -> TestGitSourceGuard {
+    TestGitSourceGuard(TEST_GIT_SOURCE.with(|f| f.replace(true)))
+}
+
+#[cfg(test)]
+pub(super) struct TestGitSourceGuard(bool);
+
+#[cfg(test)]
+impl Drop for TestGitSourceGuard {
+    fn drop(&mut self) {
+        let previous = self.0;
+        TEST_GIT_SOURCE.with(|f| f.set(previous));
+    }
+}
+
 #[cfg(not(test))]
 fn test_git_source() -> bool {
     false
@@ -634,7 +654,7 @@ async fn test_git_checkout(repo: &EnrichmentMarketplaceRepo, repo_dir: &PathBuf)
     }
 }
 
-/// `(owner, repo)` of a first-party catalog URL (`nano-rs` / `nanos-sh`).
+/// `(owner, repo)` of a first-party catalog URL (`nano-rs` only, NAN-5954).
 fn first_party_repo(url: &str) -> Option<(String, String)> {
     let (owner, name) = crate::rule_repository::GitHubClient::parse_url(url).ok()?;
     let lowered = url.trim().to_ascii_lowercase();

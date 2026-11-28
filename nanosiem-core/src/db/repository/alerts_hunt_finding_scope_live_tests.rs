@@ -19,7 +19,7 @@ use uuid::Uuid;
 use super::*;
 
 async fn pool() -> PgPool {
-    let url = std::env::var("NANO_TEST_DATABASE_URL").expect("NANO_TEST_DATABASE_URL");
+    let url = nanosiem_test_db::require_pg_url();
     sqlx::postgres::PgPoolOptions::new().max_connections(3).connect(&url).await.unwrap()
 }
 

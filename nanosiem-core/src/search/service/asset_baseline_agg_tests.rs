@@ -138,9 +138,14 @@ mod live {
     }
 
     async fn local() -> Option<(SearchService, clickhouse::Client)> {
+        // NAN-5964: no localhost default. Skip unless both URLs name a stack.
+        let (Ok(pg_url), Ok(ch_url)) = (nanosiem_test_db::pg_url(), nanosiem_test_db::ch_url()) else {
+            eprintln!("Skipping: set DATABASE_URL and CLICKHOUSE_TEST_URL to a throwaway stack");
+            return None;
+        };
         let config = DualPoolConfig::with_auth(
-            "postgres://nanosiem:nanosiem@localhost:5432/nanosiem",
-            "http://localhost:8123",
+            pg_url.clone(),
+            ch_url.clone(),
             "nanosiem",
             "default",
             "",
@@ -148,7 +153,7 @@ mod live {
         match DualPool::new(&config).await {
             Ok(pool) => {
                 let ch = clickhouse::Client::default()
-                    .with_url("http://localhost:8123")
+                    .with_url(ch_url)
                     .with_database("nanosiem");
                 Some((
                     SearchService::with_dual_pool_and_profile(&pool, Arc::new(UdmProfile::new())),

@@ -554,9 +554,71 @@ impl TokenService {
             iat: now.timestamp(),
             jti: Uuid::now_v7(),
             token_type: "refresh".to_string(),
+            sid: None,
         };
 
-        encode(&Header::new(Algorithm::HS256), &claims, &self.encoding_key)
+        self.encode_refresh_claims(&claims)
+    }
+
+    /// NAN-5973: a fresh refresh token for a login session whose id is known
+    /// before the session row is written (`sid` claim set).
+    pub fn create_refresh_token_for_session(
+        &self,
+        user_id: Uuid,
+        session_id: Uuid,
+    ) -> Result<String, TokenError> {
+        let now = Utc::now();
+        let exp = now + Duration::seconds(self.config.refresh_token_ttl);
+        self.encode_refresh_claims(&RefreshTokenClaims {
+            sub: user_id,
+            exp: exp.timestamp(),
+            iat: now.timestamp(),
+            jti: Uuid::now_v7(),
+            token_type: "refresh".to_string(),
+            sid: Some(session_id),
+        })
+    }
+
+    /// NAN-5973: the refresh token a rotation of `previous_token_hash` hands
+    /// out, expiring at `exp` (Unix seconds; the session row stores the same
+    /// instant as `expires_at`).
+    ///
+    /// It is a pure function of (signing key, user, session, previous token
+    /// hash, expiry, refresh TTL): HS256 is deterministic and the `jti` is
+    /// derived from the session and the token it replaces. That lets a
+    /// reuse-interval replay of the immediately previous token get back the
+    /// session's CURRENT refresh token without the server storing any token
+    /// material (only its hash). Re-deriving it requires the JWT signing key,
+    /// which can mint any token anyway, so this adds no new capability to a
+    /// database-only reader. Callers must compare the result's hash against
+    /// the stored current hash before handing it out.
+    pub fn rotated_refresh_token(
+        &self,
+        user_id: Uuid,
+        session_id: Uuid,
+        previous_token_hash: &str,
+        exp: i64,
+    ) -> Result<String, TokenError> {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"nanosiem.refresh.jti.v1\0");
+        h.update(session_id.as_bytes());
+        h.update(previous_token_hash.as_bytes());
+        let digest = h.finalize();
+        let mut jti = [0u8; 16];
+        jti.copy_from_slice(&digest[..16]);
+        self.encode_refresh_claims(&RefreshTokenClaims {
+            sub: user_id,
+            exp,
+            iat: exp - self.config.refresh_token_ttl,
+            jti: uuid::Builder::from_random_bytes(jti).into_uuid(),
+            token_type: "refresh".to_string(),
+            sid: Some(session_id),
+        })
+    }
+
+    fn encode_refresh_claims(&self, claims: &RefreshTokenClaims) -> Result<String, TokenError> {
+        encode(&Header::new(Algorithm::HS256), claims, &self.encoding_key)
             .map_err(|e| TokenError::CreationFailed(e.to_string()))
     }
 
@@ -993,6 +1055,14 @@ pub struct RefreshTokenClaims {
     pub jti: Uuid,
     /// Token type identifier
     pub token_type: String,
+    /// NAN-5973: the session (token family) this refresh token belongs to.
+    /// Absent on tokens minted before NAN-5973 and on sessions opened by a
+    /// path that does not know its id up front (demo, legacy). Lets refresh
+    /// tell a token that is older than the session's previous one (reuse of
+    /// a stolen or leaked token) from an unknown token, and revoke that
+    /// family.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<Uuid>,
 }
 
 #[cfg(test)]
@@ -1022,6 +1092,47 @@ mod tests {
         assert!(!token.is_empty());
         // JWT tokens have 3 parts separated by dots
         assert_eq!(token.split('.').count(), 3);
+    }
+
+    /// NAN-5973: the rotated refresh token is re-derivable (same inputs, same
+    /// token), carries its session, validates, and changes with every input.
+    #[test]
+    fn rotated_refresh_token_is_deterministic_and_bound() {
+        let service = create_test_service();
+        let user = Uuid::now_v7();
+        let sid = Uuid::now_v7();
+        let exp = Utc::now().timestamp() + 604800;
+        let a = service.rotated_refresh_token(user, sid, "prevhash", exp).unwrap();
+        assert_eq!(a, service.rotated_refresh_token(user, sid, "prevhash", exp).unwrap());
+        let claims = service.validate_refresh_token(&a).unwrap();
+        assert_eq!((claims.sub, claims.sid, claims.exp), (user, Some(sid), exp));
+        assert_eq!(claims.iat, exp - 604800);
+        for other in [
+            service.rotated_refresh_token(user, sid, "otherhash", exp).unwrap(),
+            service.rotated_refresh_token(user, Uuid::now_v7(), "prevhash", exp).unwrap(),
+            service.rotated_refresh_token(Uuid::now_v7(), sid, "prevhash", exp).unwrap(),
+            service.rotated_refresh_token(user, sid, "prevhash", exp + 1).unwrap(),
+        ] {
+            assert_ne!(a, other);
+        }
+        // A different signing key cannot reproduce it.
+        let other_key = TokenService::new(
+            TokenConfig::new("another-secret-key-for-testing".to_string()).with_refresh_ttl(604800),
+        );
+        assert_ne!(a, other_key.rotated_refresh_token(user, sid, "prevhash", exp).unwrap());
+    }
+
+    /// NAN-5973: tokens minted before the `sid` claim still validate.
+    #[test]
+    fn refresh_token_without_sid_still_validates() {
+        let service = create_test_service();
+        let claims = service
+            .validate_refresh_token(&service.create_refresh_token(Uuid::now_v7()).unwrap())
+            .unwrap();
+        assert_eq!(claims.sid, None);
+        let sid = Uuid::now_v7();
+        let with = service.create_refresh_token_for_session(Uuid::now_v7(), sid).unwrap();
+        assert_eq!(service.validate_refresh_token(&with).unwrap().sid, Some(sid));
     }
 
     #[test]

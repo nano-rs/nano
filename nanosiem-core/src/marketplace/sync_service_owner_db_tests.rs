@@ -4,13 +4,15 @@
 //! repository owns, and two syncs of one repository exclude each other across
 //! service instances (the advisory lock, not process memory).
 //!
-//! Needs a disposable, fully migrated nano PostgreSQL at
-//! `NANOSIEM_TEST_DATABASE_URL` (skips otherwise).
+//! Needs a disposable nano PostgreSQL at `NANOSIEM_TEST_DATABASE_URL` (skips
+//! locally when unset, fails in CI), git and DNS (a failure of either always
+//! fails); `#[ignore]`d, run by pg-integration. Applies the open migrations
+//! itself (NAN-5988).
 
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::db_tests::local_repo;
+use super::db_tests::{local_repo, migrated_pool, pg_url_or_skip};
 use super::{MarketplaceSyncService, RepoSyncLock};
 use crate::marketplace::MarketplaceError;
 
@@ -26,25 +28,24 @@ async fn insert_repo(pool: &PgPool, slug: &str) -> Uuid {
 }
 
 #[tokio::test]
+#[ignore = "db-backed; runs in pg-integration CI (marketplace::sync_service -- --ignored)"]
 async fn a_sync_skips_slugs_owned_elsewhere_and_syncs_are_mutually_exclusive() {
-    let Ok(url) = std::env::var("NANOSIEM_TEST_DATABASE_URL") else {
-        eprintln!("skipped: NANOSIEM_TEST_DATABASE_URL not set");
-        return;
-    };
-    let pool = PgPool::connect(&url).await.expect("connect");
+    // Locally an unset URL skips; in CI it fails. Git or DNS failures fail.
+    let Some(url) = pg_url_or_skip() else { return };
+    let pool = migrated_pool(&url).await;
     let tag = Uuid::new_v4().simple().to_string()[..12].to_string();
     let owner_slug = format!("nan4946-owner-{tag}");
     let other_slug = format!("nan4946-other-{tag}");
     let shared = format!("nan4946-shared-{tag}");
     let own = format!("nan4946-own-{tag}");
-    let Some(data_dir) = local_repo(&other_slug, &[&shared, &own]) else {
-        eprintln!("skipped: git not available");
-        return;
-    };
-    if super::validate_repo_url("https://github.com/nano-rs/nano-integrations").await.is_err() {
-        eprintln!("skipped: DNS unavailable");
-        return;
-    }
+    let data_dir = local_repo(&other_slug, &[&shared, &own]).expect("local git repository fixture (is git installed?)");
+    super::validate_repo_url("https://github.com/nano-rs/nano-integrations")
+        .await
+        .expect("validate_repo_url (needs DNS for github.com)");
+    // NAN-4955: a first-party URL reads the installed content channel in
+    // production. The parse/record logic under test is source-independent, so
+    // drive it through the local git repository (as sync_service_tests does).
+    let _git = super::use_test_git_source();
     let owner = insert_repo(&pool, &owner_slug).await;
     let other = insert_repo(&pool, &other_slug).await;
     sqlx::query(

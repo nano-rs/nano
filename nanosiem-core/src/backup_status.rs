@@ -396,6 +396,28 @@ impl BackupStatusRepository {
     }
 }
 
+/// NAN-5938: backup reports are being refused when the backup service has
+/// run against this database (`service_has_run`, see
+/// [`backup_service_has_run`]) but not one report was ever stored. Any stored
+/// row (success, failure or disabled) means reports reach nano-api; a later
+/// loss of reports is the stale-backup finding's job. Decided from database
+/// state only, so nano-jobs (which never has the status token) and nano-api
+/// agree.
+pub fn reports_refused(status: Option<&BackupStatus>, service_has_run: bool) -> bool {
+    service_has_run && status.is_none()
+}
+
+/// NAN-5938: whether the automatic backup service has run against this
+/// database. Every run (re)creates its read-only `nano_backup` role first;
+/// nothing else creates it, and a restored dump never carries roles.
+pub async fn backup_service_has_run(pool: &PgPool) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'nano_backup')",
+    )
+    .fetch_one(pool)
+    .await
+}
+
 #[cfg(test)]
 #[path = "backup_status_tests.rs"]
 mod tests;

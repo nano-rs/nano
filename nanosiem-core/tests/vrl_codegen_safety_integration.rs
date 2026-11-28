@@ -30,10 +30,8 @@ struct Ctx {
 }
 
 async fn ctx() -> Ctx {
-    let url = std::env::var("NANOSIEM_TEST_DATABASE_URL")
-        .expect("NANOSIEM_TEST_DATABASE_URL (a throwaway postgres)");
-    let ch = std::env::var("NANOSIEM_TEST_CLICKHOUSE_URL")
-        .expect("NANOSIEM_TEST_CLICKHOUSE_URL (a throwaway clickhouse)");
+    let url = nanosiem_test_db::require_pg_url();
+    let ch = nanosiem_test_db::require_ch_url();
     assert_eq!(
         std::env::var("NANOSIEM_ALLOW_DESTRUCTIVE_TESTS").as_deref(),
         Ok("1"),
@@ -399,4 +397,108 @@ async fn import_refuses_unknown_ingestion_method_and_records_real_validity() {
             .unwrap();
     assert!(!row.0, "a blocked-function import is not validated");
     assert!(row.1.unwrap_or_default().contains("parser_vrl"));
+}
+
+/// NAN-6036: the Add source wizard imports a library parser on a Vector
+/// source configuration. `routed` with that configuration is refused as a
+/// caller error (400, not a 500); the matching `vector` method imports, binds
+/// the configuration, adds the identity routing rule, and renders on the
+/// central router (the lane the Vector listener feeds), so events reach it.
+#[tokio::test]
+#[ignore = "needs a throwaway PostgreSQL + ClickHouse"]
+async fn import_on_a_vector_source_configuration_uses_the_vector_method() {
+    let c = ctx().await;
+    let service = ParserRepositoryService::new(c.pg.clone());
+    let grants = TargetGrants::system();
+    let (repo, path) = repo_parser(&c.pg, ".parsed = true").await;
+    let config: (Uuid,) = sqlx::query_as(
+        "INSERT INTO source_configurations (name, config_type, enabled, deployed) VALUES ($1, 'vector', true, true) RETURNING id",
+    )
+    .bind(unique("Vector Ingestion"))
+    .fetch_one(&c.pg)
+    .await
+    .unwrap();
+    let key = format!("routeros_{}", &Uuid::new_v4().simple().to_string()[..8]);
+
+    // What the wizard sent before the fix.
+    let routed = ParserImportRequest {
+        import_type: ParserImportType::Linked,
+        source_type: Some(key.clone()),
+        ingestion_method: Some("routed".into()),
+        dispatch_source_config_id: Some(config.0),
+    };
+    let err = service
+        .import_parser(repo, &path, &routed, None, &grants)
+        .await
+        .unwrap_err();
+    assert_eq!(err.status_code(), 400, "{err}");
+    assert!(err.to_string().contains("incompatible"), "{err}");
+
+    // What it sends now.
+    let vector = ParserImportRequest {
+        ingestion_method: Some("vector".into()),
+        ..routed
+    };
+    let imported = service
+        .import_parser(repo, &path, &vector, None, &grants)
+        .await
+        .expect("vector import");
+    assert!(
+        imported.routing_rule_id.is_some(),
+        "the identity routing rule is added"
+    );
+    let row: (String, Option<Uuid>) = sqlx::query_as(
+        "SELECT source_type, dispatch_source_config_id FROM log_sources WHERE id = $1",
+    )
+    .bind(imported.log_source_id)
+    .fetch_one(&c.pg)
+    .await
+    .unwrap();
+    assert_eq!(row, ("vector".to_string(), Some(config.0)));
+
+    // Rendered: the central router has a route whose condition is exactly
+    // this key, and a parser transform consumes that route.
+    sqlx::query("UPDATE log_sources SET enabled = true WHERE id = $1")
+        .bind(imported.log_source_id)
+        .execute(&c.pg)
+        .await
+        .unwrap();
+    let dir = TempDir::new().unwrap();
+    let parsers = ParserService::with_vector_config_dir(c.pg.clone(), dir.path());
+    parsers.render_to_vector_config().await.expect("render");
+    let rendered: Vec<toml::Table> = std::fs::read_dir(dir.path().join("sources/parsers"))
+        .unwrap()
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "toml"))
+        .map(|e| {
+            let text = std::fs::read_to_string(e.path()).unwrap();
+            text.parse::<toml::Table>()
+                .unwrap_or_else(|err| panic!("{}: {err}", e.path().display()))
+        })
+        .collect();
+    let transforms = || {
+        rendered
+            .iter()
+            .filter_map(|t| t.get("transforms").and_then(|v| v.as_table()))
+            .flat_map(|t| t.iter())
+    };
+    let routes = transforms()
+        .find(|(name, _)| name.as_str() == "source_router")
+        .and_then(|(_, t)| t.get("route"))
+        .and_then(|r| r.as_table())
+        .expect("source_router.route is rendered")
+        .clone();
+    let wanted = format!(".source_type == \"{key}\"");
+    let route_name = routes
+        .iter()
+        .find(|(_, cond)| cond.as_str() == Some(wanted.as_str()))
+        .map(|(name, _)| name.clone())
+        .unwrap_or_else(|| panic!("source_router must route {key}; routes: {routes:?}"));
+    let output = format!("source_router.{route_name}");
+    let consumed = transforms().any(|(_, t)| {
+        t.get("inputs")
+            .and_then(|i| i.as_array())
+            .is_some_and(|i| i.iter().any(|v| v.as_str() == Some(output.as_str())))
+    });
+    assert!(consumed, "a parser transform must read {output}");
 }

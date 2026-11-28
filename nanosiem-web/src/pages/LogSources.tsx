@@ -58,6 +58,7 @@ import {
 } from '@/hooks/use-api';
 import { useToast } from '@/hooks/use-toast';
 import { useAuth } from '@/contexts/AuthContext';
+import { findAssociatedRoutingRules } from '@/lib/log-source-routing-rules';
 import { api } from '@/lib/api';
 import { toastDeployResult } from '@/lib/deploy-delivery';
 import type { LogSource } from '@/lib/api';
@@ -116,6 +117,7 @@ export function LogSources() {
   const canEdit = hasPermission('log_sources:edit');
   const canDelete = hasPermission('log_sources:delete');
   const canDeploy = hasPermission('log_sources:deploy');
+  const canViewSourceConfigs = hasPermission('source_configs:view');
 
   // Per-source RBAC scoping (NAN-1802): mark feeds whose `source_type` is in the
   // restricted registry. Only fetched for admins who can view scopes — others
@@ -151,7 +153,7 @@ export function LogSources() {
   const { data: sourceConfigs } = useQuery({
     queryKey: ['sourceConfigs'],
     queryFn: () => api.listSourceConfigs(),
-    enabled: hasPermission('source_configs:view'),
+    enabled: canViewSourceConfigs,
     staleTime: 30_000,
   });
   const { data: connectorFeeds } = useQuery({
@@ -327,38 +329,18 @@ export function LogSources() {
   };
 
   // Routing-rule guard: a delete must surface any source-config rules that route events
-  // to this log source's match_values, so the user can clear them up first.
+  // to this log source's match_values, so the user can clear them up first. Only for
+  // users who can view source configs (NAN-5972).
   const checkAssociatedRoutingRules = async (logSource: LogSource) => {
-    if (!logSource.match_values?.length) {
+    if (!logSource.match_values?.length || !canViewSourceConfigs) {
       setAssociatedRoutingRules([]);
       return;
     }
     setCheckingAssociatedRules(true);
     try {
-      const configs = await api.listSourceConfigs({ enabled: true });
-      const matchValues = new Set(logSource.match_values ?? []);
-      const perConfig = await Promise.all(
-        configs.map(async (config) => {
-          try {
-            const full = await api.getSourceConfigWithRules(config.id);
-            return full.routing_rules
-              .filter((rule) => matchValues.has(rule.target_source_type))
-              .map((rule) => ({
-                configId: config.id,
-                configName: config.name,
-                ruleId: rule.id,
-                matchValue: rule.match_value || '(default)',
-              }));
-          } catch (err) {
-            console.error(`Failed to fetch rules for ${config.name}:`, err);
-            return [];
-          }
-        }),
+      setAssociatedRoutingRules(
+        await findAssociatedRoutingRules(logSource.match_values, canViewSourceConfigs, api),
       );
-      setAssociatedRoutingRules(perConfig.flat());
-    } catch (err) {
-      console.error('Failed to check associated routing rules:', err);
-      setAssociatedRoutingRules([]);
     } finally {
       setCheckingAssociatedRules(false);
     }

@@ -220,11 +220,24 @@ async fn async_main() -> Result<()> {
         state.add_task_handle(lc_handle).await;
         tracing::info!("License checker started (24h interval)");
     } else if state.config.online_license_config().is_ok() {
-        match nanosiem_api::license_admission::refresh_offline_snapshot(&state, false).await {
+        let boot = nanosiem_api::license_admission::refresh_offline_snapshot(&state, false).await;
+        // A failed boot refresh retries soon (NAN-5890 / NAN-5946).
+        let first_delay = nanosiem_api::license_admission::next_refresh_delay(
+            boot.as_ref().map(|_| ()),
+            true,
+        );
+        match boot {
             Ok(snapshot) if snapshot.legacy_grace().is_some() => tracing::warn!(
                 "Legacy offline license upgrade grace active in jobs; import a C05 license"
             ),
             Ok(_) => tracing::info!("Loaded read-only C05 component admission for jobs"),
+            // NAN-5946: booted mid-way through a first import. The default
+            // snapshot is already closed; the refresh loop retries in seconds
+            // and still escalates a pending run that never ends.
+            Err(error @ nanosiem_enterprise::sovereign_license::EntitlementError::WitnessPending) => {
+                tracing::info!("C05 license import in progress at jobs start; workers wait for it");
+                nanosiem_api::license_admission::record_refresh_failure(&state, &error).await;
+            }
             Err(error) => {
                 tracing::error!(%error, "C05 admission unavailable in jobs; workers fail closed");
                 let snapshot = nanosiem_api::license_admission::unavailable_snapshot(&error);
@@ -234,9 +247,15 @@ async fn async_main() -> Result<()> {
         }
         let refresh_state = state.clone();
         let refresh_handle = tokio::spawn(async move {
-            run_read_only_sovereign_license_refresh(refresh_state).await;
+            run_read_only_sovereign_license_refresh(refresh_state, first_delay).await;
         });
         state.add_task_handle(refresh_handle).await;
+        // NAN-5890: close admission at the monotonic hard stop or when no
+        // validation lands within the outage grace.
+        let enforcer_handle = tokio::spawn(
+            nanosiem_api::license_admission::run_admission_enforcer(state.clone()),
+        );
+        state.add_task_handle(enforcer_handle).await;
         tracing::info!("Read-only C05/legacy jobs admission refresh started (30s interval)");
     } else {
         let error = state
@@ -292,20 +311,17 @@ async fn async_main() -> Result<()> {
         state.add_task_handle(supervisor).await;
     }
 
-    // Case change listener (SSE broadcast via pg_notify).
-    // Phase 3.2 (NAN-744): cases moved to enterprise; only register when
-    // the enterprise feature is enabled.
+    // Case investigation recovery. Phase 3.2 (NAN-744): cases moved to
+    // enterprise; only register when the enterprise feature is enabled.
+    // NAN-5957 review: no case_changes listener here. Its only subscriber is
+    // nano-api's SSE stream, so in nano-jobs it held a PostgreSQL session for
+    // nothing.
     #[cfg(feature = "enterprise")]
     {
         let supervisor = state.start_component_worker_supervisor(
             nanosiem_api::license_admission::WorkerCapability::Cases,
             "jobs_cases",
-            |state| {
-                vec![
-                    state.start_case_change_listener(),
-                    state.start_shadow_investigation_recovery(),
-                ]
-            },
+            |state| vec![state.start_shadow_investigation_recovery()],
         );
         state.add_task_handle(supervisor).await;
     }
@@ -463,18 +479,62 @@ async fn async_main() -> Result<()> {
     Ok(())
 }
 
+/// Read-only C05 admission refresh for jobs: every 30s, within
+/// `CHANGE_POLL` of a license import, renewal or recovery (a one-row
+/// PostgreSQL read through the shared pool, so no dedicated session beyond
+/// the NAN-5822 budget), and after
+/// [`WITNESS_PENDING_RETRY`](nanosiem_api::license_admission::WITNESS_PENDING_RETRY)
+/// when a refresh saw a first import still writing its witness (NAN-5946).
+/// `first_delay` lets a boot that saw a pending import retry at once.
 #[cfg(feature = "enterprise")]
-async fn run_read_only_sovereign_license_refresh(state: AppState) {
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-    interval.tick().await;
+async fn run_read_only_sovereign_license_refresh(state: AppState, first_delay: std::time::Duration) {
+    use nanosiem_api::license_admission::{
+        next_refresh_delay, record_refresh_failure, refresh_offline_snapshot,
+    };
+
+    const CHANGE_POLL: std::time::Duration = std::time::Duration::from_secs(3);
+    const MARKER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+    let shutdown = state.shutdown_token();
+    // Review r2 P2-4: the marker read is bounded and shutdown-aware, so a
+    // stalled PostgreSQL connection cannot hold the refresh loop.
+    let read_marker = || async {
+        tokio::time::timeout(MARKER_TIMEOUT, state.sovereign_license.license_change_marker())
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .flatten()
+    };
+    let mut marker = read_marker().await;
+    let mut next = tokio::time::Instant::now() + first_delay;
     loop {
-        interval.tick().await;
-        if let Err(error) =
-            nanosiem_api::license_admission::refresh_offline_snapshot(&state, false).await
-        {
-            tracing::warn!(%error, "C05 jobs admission refresh failed");
-            nanosiem_api::license_admission::record_refresh_failure(&state, &error).await;
+        let wake = next.min(tokio::time::Instant::now() + CHANGE_POLL);
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = tokio::time::sleep_until(wake) => {}
         }
+        if tokio::time::Instant::now() < next {
+            // Between full refreshes: only a changed license triggers one.
+            let current = tokio::select! {
+                _ = shutdown.cancelled() => return,
+                current = read_marker() => current,
+            };
+            if current.is_none() || current == marker {
+                continue;
+            }
+            tracing::debug!("license changed; refreshing jobs admission");
+            marker = current;
+        }
+        // `record_refresh_failure` owns the (rate-limited) logging, and the
+        // shared cadence: 5s while a storage outage rides the grace (NAN-5890),
+        // 2s while a first import finishes (NAN-5946), else 30s.
+        let delay = match refresh_offline_snapshot(&state, false).await {
+            Ok(_) => next_refresh_delay(Ok(()), false),
+            Err(error) => {
+                let kept = record_refresh_failure(&state, &error).await;
+                next_refresh_delay(Err(&error), kept)
+            }
+        };
+        next = tokio::time::Instant::now() + delay;
     }
 }
 

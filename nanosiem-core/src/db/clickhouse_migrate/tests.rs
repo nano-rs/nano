@@ -615,6 +615,37 @@ mod tests {
     }
 
     #[test]
+    fn test_shipped_storage_xml_keeps_the_injected_tiered_policy() {
+        // NAN-5922 (G14): cluster mode writes `storage_policy = 'tiered'` into
+        // every new logs/signals/ingestion_errors/custom_enrichment_results
+        // table (role-split Compose runs the migrator with
+        // CLICKHOUSE_CLUSTER=default). ClickHouse cannot load a table that
+        // names a policy the config does not define (code 478, checked on
+        // 26.10), so the static policy in clickhouse/config.d/storage.xml must
+        // stay while this injection does.
+        let sql = "CREATE TABLE IF NOT EXISTS nanosiem.ingestion_errors (id UUID) ENGINE = MergeTree ORDER BY id SETTINGS index_granularity = 8192";
+        let result = ClickHouseMigrator::transform_for_cluster(sql, "default", "nanosiem", false);
+        assert!(result.contains("storage_policy = 'tiered'"), "{result}");
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let shipped = std::fs::read_to_string(root.join("clickhouse/config.d/storage.xml")).unwrap();
+        let policies = shipped.split("<policies>").nth(1).and_then(|s| s.split("</policies>").next());
+        assert!(
+            policies.is_some_and(|p| p.contains("<tiered>")),
+            "clickhouse/config.d/storage.xml must define the `tiered` policy that cluster-mode tables use"
+        );
+        // The open-core mirror strips ludus/; the private tree still fails
+        // loudly when the copy is missing or drifts.
+        if root.join("ludus").is_dir() {
+            let ludus = std::fs::read_to_string(
+                root.join("ludus/roles/nanosiem_stack/files/clickhouse/config.d/storage.xml"),
+            )
+            .unwrap();
+            assert_eq!(shipped, ludus, "the ludus copy of storage.xml drifted from clickhouse/config.d/storage.xml");
+        }
+    }
+
+    #[test]
     fn test_in_cluster_still_injects_storage_policy_tiered() {
         // Regression guard: operator-managed in-cluster deploys must still get
         // `storage_policy = 'tiered'` injected on the main data tables.
@@ -2080,6 +2111,29 @@ mod tests {
                     .unwrap_or_else(|| panic!("{t} missing in {path}"));
                 let stmt = &sql[start..start + sql[start..].find("SETTINGS").unwrap() + 120];
                 assert!(stmt.contains("allow_dimensions_outside_sorting_key = 1"), "{t} in {path}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_event_tables_materialize_ttl_recalculate_only() {
+        // NAN-5907: without the setting a retention change (MODIFY TTL ->
+        // MATERIALIZE TTL) rewrites every part of the table. Fresh installs
+        // get it from the init DDL, existing ones from the migrator step
+        // `ensure_ttl_recalculate_only` (ttl_recalc.rs).
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../clickhouse");
+        for (path, tables) in [
+            ("init.sql", &["logs", "signals", "ingestion_errors"][..]),
+            ("ocsf/init.sql", &["ocsf_logs"][..]),
+        ] {
+            let sql = std::fs::read_to_string(root.join(path)).expect("read init sql");
+            for t in tables {
+                let start = sql
+                    .find(&format!("CREATE TABLE IF NOT EXISTS nanosiem.{t}\n"))
+                    .unwrap_or_else(|| panic!("{t} missing in {path}"));
+                let stmt = &sql[start..start + sql[start..].find("\n;").unwrap()];
+                let settings = &stmt[stmt.rfind("\nSETTINGS ").expect("table SETTINGS")..];
+                assert!(settings.contains("materialize_ttl_recalculate_only = 1"), "{t} in {path}");
             }
         }
     }

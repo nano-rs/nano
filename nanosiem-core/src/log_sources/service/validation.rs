@@ -700,10 +700,10 @@ mod tests {
 
     /// Live: the OCSF sample read returns the raw messages an OCSF install
     /// stores, where the UDM read finds no `logs` table at all. Point
-    /// `NANO_OCSF_TEST_CH_URL` at a throwaway ClickHouse whose
+    /// `CLICKHOUSE_TEST_URL` at a throwaway ClickHouse whose
     /// `nanosiem.ocsf_logs` was created from `clickhouse/ocsf/init.sql`.
     #[tokio::test]
-    #[ignore = "requires NANO_OCSF_TEST_CH_URL (a ClickHouse with nanosiem.ocsf_logs)"]
+    #[ignore = "requires CLICKHOUSE_TEST_URL (a ClickHouse with nanosiem.ocsf_logs)"]
     async fn ocsf_live_samples_come_from_ocsf_logs() {
         #[derive(clickhouse::Row, serde::Deserialize)]
         struct MessageRow {
@@ -713,8 +713,7 @@ mod tests {
         struct SampleRow {
             sample: String,
         }
-        let client = clickhouse::Client::default()
-            .with_url(std::env::var("NANO_OCSF_TEST_CH_URL").expect("NANO_OCSF_TEST_CH_URL"))
+        let client = nanosiem_test_db::require_ch_client()
             .with_database("nanosiem")
             // Plain HTTP: a stock server image's LZ4 reply did not decompress.
             .with_compression(clickhouse::Compression::None);

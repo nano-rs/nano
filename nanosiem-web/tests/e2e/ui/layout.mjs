@@ -103,6 +103,10 @@ export function redactTokens(text) {
   return String(text)
     .replace(/eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(\.[A-Za-z0-9_-]+)?/g, '<token>')
     .replace(/\b(?:nano|nsk|sk|pk|ghp|gho|xox[abp]|AKIA|ASIA|AIza)[_-]?[A-Za-z0-9_-]{12,}/g, '<token>')
+    // Tokens nano issues (ingest nit_, Agent Lane nal_, SCIM nscim_) and Sentry
+    // auth tokens; the mixed-case rule below misses lowercase or hex ones.
+    .replace(/\b(?:nit|nal|nscim)_[A-Za-z0-9_-]{12,}/g, '<token>')
+    .replace(/\bsntry[su]_[A-Za-z0-9+/=_-]{12,}/g, '<token>')
     // 32+ chars, no '-' or '/': hostnames, paths and ATT&CK labels stay readable.
     .replace(/[A-Za-z0-9+_=]{32,}/g, (m) => (/[a-z]/.test(m) && /[A-Z]/.test(m) && /[0-9]/.test(m) ? '<token>' : m));
 }

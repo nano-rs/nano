@@ -552,9 +552,19 @@ pub struct ApiKeyCreated {
 pub struct CreateApiKeyRequest {
     pub name: String,
     pub description: Option<String>,
+    /// The scopes to grant. Must be empty when `preset` is set: the server
+    /// fills it from the preset. Defaults to empty so a preset-only body works.
+    #[serde(default)]
     pub permissions: Vec<String>,
     pub expires_at: Option<DateTime<Utc>>,
     pub rate_limit: Option<i32>,
+    /// NAN-5900: a named scope preset the SERVER resolves, instead of a
+    /// hand-picked list. Only `"admin"` exists: every permission in the
+    /// catalogue at creation time (a snapshot; later-added permissions are not
+    /// granted automatically). The caller must hold every one of them, and an
+    /// expiry is required.
+    #[serde(default)]
+    pub preset: Option<String>,
 }
 
 /// JWT token claims

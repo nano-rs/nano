@@ -94,7 +94,9 @@ impl AuthApiError {
                 "invalid_token",
                 "Invalid or expired token",
             ),
-            AuthError::SessionNotFound => (
+            // NAN-5973: detected reuse answers exactly like an unknown
+            // session; the revocation is recorded in the audit row only.
+            AuthError::SessionNotFound | AuthError::RefreshTokenReused { .. } => (
                 StatusCode::UNAUTHORIZED,
                 "session_not_found",
                 "Session not found or expired",
@@ -579,26 +581,46 @@ pub async fn refresh_token(
         .map(|claims| claims.sub);
     let client_ctx = ClientContext::new(ip_address.clone(), user_agent.clone());
 
-    let outcome = match state
-        .auth_service
-        .refresh_token(
-            &refresh_token_value,
-            ip_address.as_deref(),
-            user_agent.as_deref(),
-        )
-        .await
-    {
-        Ok(outcome) => {
-            state.emit_audit(refresh_audit_event(
+    // NAN-5973: run the refresh and its audit row on a spawned task. If the
+    // client disconnects (a page navigation aborts the request), axum drops
+    // this handler future; the rotation and the audit still run to
+    // completion instead of stopping between statements. A rotation whose
+    // response never reached the client is recovered by the reuse interval
+    // (the previous token gets the current one back).
+    let task_state = state.clone();
+    let outcome = tokio::spawn(async move {
+        let result = task_state
+            .auth_service
+            .refresh_token(
+                &refresh_token_value,
+                ip_address.as_deref(),
+                user_agent.as_deref(),
+            )
+            .await;
+        match &result {
+            Ok(outcome) => task_state.emit_audit(refresh_audit_event(
+                refresh_owner,
+                &client_ctx,
+                Some(outcome.session_id),
+                None,
+                outcome.is_grace(),
+            )),
+            Err(e) => task_state.emit_audit(refresh_audit_event(
                 refresh_owner,
                 &client_ctx,
                 None,
-                !outcome.rotated,
-            ));
-            outcome
+                Some(e),
+                false,
+            )),
         }
+        result
+    })
+    .await
+    .unwrap_or_else(|e| Err(AuthError::InternalError(format!("refresh task failed: {e}"))));
+
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
         Err(e) => {
-            state.emit_audit(refresh_audit_event(refresh_owner, &client_ctx, Some(&e), false));
             let (status, err) = AuthApiError::from_auth_error(&e);
             // Clear stale cookies so they don't persist and keep failing
             let mut res = (status, Json(err)).into_response();
@@ -613,7 +635,7 @@ pub async fn refresh_token(
         }
     };
 
-    let rotated = outcome.rotated;
+    let sets_refresh_token = outcome.sets_refresh_token();
     let token_pair = outcome.tokens;
     let response = RefreshTokenResponse {
         access_token: token_pair.access_token,
@@ -623,16 +645,17 @@ pub async fn refresh_token(
     };
 
     // Set updated cookies (append pattern for multiple Set-Cookie headers).
-    // NAN-2453: a grace refresh (another tab already rotated this token) does
-    // not rotate, so it must not touch the refresh cookie — the browser
-    // already holds the winner's newer one.
+    // NAN-5973: a reuse-interval refresh returns the session's CURRENT
+    // refresh token, so the cookie is (re)set to it and a client that missed
+    // the rotation catches up. Only the access-only grace fallback (no token
+    // to hand back) leaves the refresh cookie untouched.
     let access_cookie = build_access_token_cookie(&response.access_token, response.expires_in);
     let mut res = Json(&response).into_response();
     res.headers_mut().append(
         SET_COOKIE,
         access_cookie.parse().expect("valid cookie header"),
     );
-    if rotated {
+    if sets_refresh_token {
         append_refresh_token_cookies(
             res.headers_mut(),
             &response.refresh_token,
@@ -651,30 +674,46 @@ pub async fn refresh_token(
 /// recorded too: after rotation, a second presentation of the same refresh
 /// token is either a lost multi-tab race or token replay from another client,
 /// and only the client address separates the two.
+///
+/// NAN-5973: the row names the session (token family). Detected reuse, which
+/// revokes the whole session, is its own reason (`refresh_token_reuse`) with
+/// `family_revoked: true`.
 pub(crate) fn refresh_audit_event(
     user_id: Option<Uuid>,
     client_ctx: &ClientContext,
+    session_id: Option<Uuid>,
     failure: Option<&AuthError>,
     grace: bool,
 ) -> AuditEvent {
+    let session_id = session_id.or(match failure {
+        Some(AuthError::RefreshTokenReused { session_id }) => Some(*session_id),
+        _ => None,
+    });
     let mut builder = AuditEvent::builder(AuditSource::Auth, TOKEN_REFRESH)
         .actor(user_id, None)
-        .resource("session", None, None)
+        .resource("session", session_id, None)
         .client_context(client_ctx)
         .success(failure.is_none());
     if let Some(err) = failure {
-        let reason = match err {
-            AuthError::SessionNotFound | AuthError::InvalidToken => "refresh_token_rejected",
-            AuthError::AccountDisabled | AuthError::AccountLocked | AuthError::UserNotFound => {
-                "account_unavailable"
+        let details = match err {
+            AuthError::RefreshTokenReused { .. } => serde_json::json!({
+                "reason": "refresh_token_reuse",
+                "family_revoked": true,
+            }),
+            AuthError::SessionNotFound | AuthError::InvalidToken => {
+                serde_json::json!({ "reason": "refresh_token_rejected" })
             }
-            _ => "refresh_failed",
+            AuthError::AccountDisabled | AuthError::AccountLocked | AuthError::UserNotFound => {
+                serde_json::json!({ "reason": "account_unavailable" })
+            }
+            _ => serde_json::json!({ "reason": "refresh_failed" }),
         };
-        builder = builder.details(serde_json::json!({ "reason": reason }));
+        builder = builder.details(details);
     } else if grace {
-        // NAN-2453: served from the previous-token grace window (a concurrent
-        // tab rotated first). Recorded so replay of a just-rotated token from
-        // a different client stays visible.
+        // NAN-2453 / NAN-5973: served from the previous-token reuse interval
+        // (a concurrent tab rotated first, or the rotation response was
+        // lost). Recorded so replay of a just-rotated token from a different
+        // client stays visible.
         builder = builder.details(serde_json::json!({ "grace": true }));
     }
     builder.build()

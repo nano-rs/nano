@@ -38,7 +38,7 @@ fn update(name: Option<&str>, query: Option<&str>, description: Option<&str>) ->
 }
 
 #[tokio::test]
-#[ignore = "requires a disposable Postgres (DATABASE_URL)"]
+#[ignore = "requires a disposable Postgres (NANOSIEM_TEST_DATABASE_URL)"]
 async fn description_survives_create_edit_and_clear_and_the_owner_can_delete() {
     let pool = common::migrated_pool().await;
     let repo = SavedSearchRepository::new(pool.clone());

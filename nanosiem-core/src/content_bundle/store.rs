@@ -30,6 +30,8 @@ pub struct ChannelRow {
     pub installed_at: Option<DateTime<Utc>>,
     pub applied_at: Option<DateTime<Utc>>,
     pub apply_error: Option<String>,
+    /// The applier's summary of the last successful apply (NAN-5956).
+    pub apply_summary: Option<String>,
     pub last_check_at: Option<DateTime<Utc>>,
     pub last_check_status: Option<String>,
     pub last_error: Option<String>,
@@ -50,7 +52,7 @@ pub struct ContentStore {
 }
 
 const STATE_COLUMNS: &str = "channel, enabled, signed_descriptor, sequence, upstream_commit, tree_sha256, \
-    file_count, source, route, installed_at, applied_at, apply_error, last_check_at, last_check_status, \
+    file_count, source, route, installed_at, applied_at, apply_error, apply_summary, last_check_at, last_check_status, \
     last_error, last_error_at";
 
 fn row_from(r: &sqlx::postgres::PgRow) -> ChannelRow {
@@ -67,6 +69,7 @@ fn row_from(r: &sqlx::postgres::PgRow) -> ChannelRow {
         installed_at: r.get("installed_at"),
         applied_at: r.get("applied_at"),
         apply_error: r.get("apply_error"),
+        apply_summary: r.get("apply_summary"),
         last_check_at: r.get("last_check_at"),
         last_check_status: r.get("last_check_status"),
         last_error: r.get("last_error"),
@@ -151,14 +154,20 @@ impl ContentStore {
     }
 
     /// Record the outcome of applying an installed snapshot to its consumer
-    /// (repository rows marked due, or an extension's applier).
-    pub async fn record_apply(&self, channel: &str, error: Option<&str>) -> Result<(), sqlx::Error> {
+    /// (repository rows marked due, or an extension's applier): `Ok(summary)`
+    /// or `Err(error)`. A failure clears the summary of the previous apply.
+    pub async fn record_apply(&self, channel: &str, outcome: Result<&str, &str>) -> Result<(), sqlx::Error> {
+        let (summary, error) = match outcome {
+            Ok(summary) => (Some(summary), None),
+            Err(error) => (None, Some(error)),
+        };
         sqlx::query(
             "UPDATE content_channel_state SET applied_at = CASE WHEN $2::text IS NULL THEN NOW() ELSE applied_at END, \
-             apply_error = $2, updated_at = NOW() WHERE channel = $1",
+             apply_error = $2, apply_summary = $3, updated_at = NOW() WHERE channel = $1",
         )
         .bind(channel)
         .bind(error)
+        .bind(summary)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -486,4 +495,58 @@ pub fn installed_from(stored: Option<&serde_json::Value>) -> Option<SignedConten
     let signed: SignedContentDescriptor = serde_json::from_value(stored?.clone()).ok()?;
     signed.descriptor.validate().ok()?;
     Some(signed)
+}
+
+/// An installed snapshot's commit and some of its files, read on the
+/// caller's connection (NAN-5956).
+#[derive(Debug, PartialEq, Eq)]
+pub struct SnapshotFiles {
+    pub commit: String,
+    /// One entry per requested path, in request order.
+    pub files: Vec<CappedFile>,
+}
+
+/// Read the installed commit of `channel` and the files at `paths` (each
+/// refused over `cap` bytes) in ONE statement on `conn`: one MVCC snapshot,
+/// no pool checkout. For small files read under a lock the caller holds on
+/// `conn` (the model catalog); large files go through [`ContentStore`].
+/// `None` when the channel is not installed.
+pub async fn read_snapshot_files_on(
+    conn: &mut sqlx::PgConnection,
+    channel: &str,
+    paths: &[&str],
+    cap: u64,
+) -> Result<Option<SnapshotFiles>, sqlx::Error> {
+    let paths: Vec<String> = paths.iter().map(|p| p.trim_start_matches('/').to_string()).collect();
+    let cap = i64::try_from(cap).unwrap_or(i64::MAX);
+    let rows = sqlx::query(
+        "SELECT s.upstream_commit, p.ord, octet_length(f.content)::bigint AS size, \
+                CASE WHEN octet_length(f.content) <= $3 THEN f.content END AS content \
+           FROM content_channel_state s \
+           CROSS JOIN unnest($2::text[]) WITH ORDINALITY AS p(path, ord) \
+           LEFT JOIN content_channel_files f ON f.channel = s.channel AND f.path = p.path \
+          WHERE s.channel = $1 AND s.tree_sha256 IS NOT NULL \
+            AND COALESCE(s.upstream_commit, '') <> '' \
+          ORDER BY p.ord",
+    )
+    .bind(channel)
+    .bind(&paths)
+    .bind(cap)
+    .fetch_all(&mut *conn)
+    .await?;
+    let Some(first) = rows.first() else { return Ok(None) };
+    let commit: String = first.get("upstream_commit");
+    let files = rows
+        .iter()
+        .map(|r| {
+            let size: Option<i64> = r.get("size");
+            let content: Option<Vec<u8>> = r.get("content");
+            match (size, content) {
+                (None, _) => CappedFile::Missing,
+                (Some(_), Some(body)) => CappedFile::Body(body),
+                (Some(size), None) => CappedFile::TooLarge(size.max(0) as u64),
+            }
+        })
+        .collect();
+    Ok(Some(SnapshotFiles { commit, files }))
 }

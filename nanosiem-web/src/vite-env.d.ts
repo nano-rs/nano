@@ -12,4 +12,6 @@ interface ImportMetaEnv {
   readonly VITE_NANO_SENTRY_RELEASE?: string;
   readonly VITE_NANO_SENTRY_TRACES_SAMPLE_RATE?: string;
   readonly VITE_NANO_SENTRY_TEST_TRIGGER?: string;
+  readonly VITE_NANO_SENTRY_REPLAY?: string;
+  readonly VITE_NANO_SENTRY_REPLAY_ON_ERROR_RATE?: string;
 }

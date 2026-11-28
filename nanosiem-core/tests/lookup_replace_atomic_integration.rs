@@ -34,7 +34,7 @@ fn rec(pairs: &[(&str, serde_json::Value)]) -> HashMap<String, serde_json::Value
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn failed_replace_preserves_existing_data() {
     let pool = common::migrated_pool().await;
     let svc = LookupService::new(LookupRepository::new(pool.clone()));
@@ -99,7 +99,7 @@ async fn failed_replace_preserves_existing_data() {
 }
 
 #[tokio::test]
-#[ignore = "requires an explicitly disposable Postgres (DATABASE_URL)"]
+#[ignore = "requires an explicitly disposable Postgres (NANOSIEM_TEST_DATABASE_URL)"]
 async fn successful_replace_and_delete_with_rule_conflict() {
     let pool = common::migrated_pool().await;
     let svc = LookupService::new(LookupRepository::new(pool.clone()));

@@ -117,7 +117,7 @@ fn dotted_fields(npl: &str) -> Vec<String> {
 }
 
 async fn exec(sql: &str) -> Result<String, String> {
-    let url = std::env::var("CLICKHOUSE_TEST_URL").unwrap_or_else(|_| "http://localhost:8123".into());
+    let url = nanosiem_test_db::require_ch_url();
     // Never `default`: nano's users.d keeps it container-local.
     let user = std::env::var("CLICKHOUSE_ADMIN_USER").unwrap_or_else(|_| "nanosiem_admin".into());
     let pass = std::env::var("CLICKHOUSE_ADMIN_PASSWORD").unwrap_or_default();

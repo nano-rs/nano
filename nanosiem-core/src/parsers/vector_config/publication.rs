@@ -2188,7 +2188,7 @@ mod tests {
         std::fs::write(source_dir.path().join("parsers/example.toml"), "[x]\na = 1\n").unwrap();
         let snapshot = build_snapshot(source_dir.path()).unwrap();
         let pool = sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy("postgresql://unused:unused@127.0.0.1/unused")
+            .connect_lazy("postgresql://unused:unused@127.0.0.1:1/unused")
             .unwrap();
         let publisher = VectorConfigPublisher {
             pool,
@@ -2217,7 +2217,7 @@ mod tests {
         .unwrap();
         let snapshot = build_snapshot(source_dir.path()).unwrap();
         let pool = sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy("postgresql://unused:unused@127.0.0.1/unused")
+            .connect_lazy("postgresql://unused:unused@127.0.0.1:1/unused")
             .unwrap();
         let publisher = VectorConfigPublisher::new(pool, config_dir.path(), "test-node");
 
@@ -2258,7 +2258,7 @@ mod tests {
         .unwrap();
         let snapshot = build_snapshot(source_dir.path()).unwrap();
         let pool = sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy("postgresql://unused:unused@127.0.0.1/unused")
+            .connect_lazy("postgresql://unused:unused@127.0.0.1:1/unused")
             .unwrap();
         let publisher = VectorConfigPublisher::new(pool, config_dir.path(), "test-node");
 
@@ -2298,7 +2298,7 @@ mod tests {
         .unwrap();
         let snapshot = build_snapshot(source_dir.path()).unwrap();
         let pool = sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy("postgresql://unused:unused@127.0.0.1/unused")
+            .connect_lazy("postgresql://unused:unused@127.0.0.1:1/unused")
             .unwrap();
         let publisher = VectorConfigPublisher::new(pool, config_dir.path(), "test-node");
         let destination = config_dir.path().join("publications/00000000000000000005");
@@ -2378,7 +2378,7 @@ mod tests {
         .unwrap();
         let snapshot = build_snapshot(source_dir.path()).unwrap();
         let pool = sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy("postgresql://unused:unused@127.0.0.1/unused")
+            .connect_lazy("postgresql://unused:unused@127.0.0.1:1/unused")
             .unwrap();
         let publisher = VectorConfigPublisher::new(pool, config_dir.path(), "test-node");
         let destination = config_dir.path().join("publications/00000000000000000006");
@@ -2426,7 +2426,7 @@ mod tests {
         let signing_key = SigningKey::from_bytes(&[0x42; 32]);
         let verifying_key = signing_key.verifying_key();
         let pool = sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy("postgresql://unused:unused@127.0.0.1/unused")
+            .connect_lazy("postgresql://unused:unused@127.0.0.1:1/unused")
             .unwrap();
         let publisher = VectorConfigPublisher::new(pool, config_dir.path(), "test-node");
         let destination = config_dir.path().join("publications/00000000000000000007");
@@ -2480,7 +2480,7 @@ mod tests {
         .unwrap();
         let snapshot = build_snapshot(source_dir.path()).unwrap();
         let pool = sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy("postgresql://unused:unused@127.0.0.1/unused")
+            .connect_lazy("postgresql://unused:unused@127.0.0.1:1/unused")
             .unwrap();
         let publisher = VectorConfigPublisher::new(pool, config_dir.path(), "test-node");
 

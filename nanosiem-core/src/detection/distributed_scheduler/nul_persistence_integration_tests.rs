@@ -48,13 +48,21 @@ impl Harness {
             println!("Skipping (SKIP_DB_TESTS set)");
             return None;
         }
-        let config = match DualPoolConfig::from_env() {
-            Ok(c) => c,
-            Err(e) => {
-                println!("Skipping: no PG/CH configuration in the environment: {e}");
-                return None;
-            }
+        // NAN-5964: these tests install triggers and write rows, so they need an
+        // explicit throwaway ClickHouse (never CLICKHOUSE_URL) and the opt-in.
+        let Ok(ch_url) = nanosiem_test_db::ch_url() else {
+            println!("Skipping: CLICKHOUSE_TEST_URL not set");
+            return None;
         };
+        if !matches!(std::env::var("NANOSIEM_ALLOW_DESTRUCTIVE_TESTS").as_deref(), Ok("1" | "true")) {
+            println!("Skipping: set NANOSIEM_ALLOW_DESTRUCTIVE_TESTS=1 to run these write tests");
+            return None;
+        }
+        let Ok(pg_url) = nanosiem_test_db::pg_url() else {
+            println!("Skipping: NANOSIEM_TEST_DATABASE_URL not set");
+            return None;
+        };
+        let config = DualPoolConfig::from_env_with_urls(pg_url, ch_url.clone());
         let dual_pool = match DualPool::new(&config).await {
             Ok(p) => p,
             Err(e) => {
@@ -87,10 +95,6 @@ impl Harness {
             println!("Skipping: cannot create the test trigger function: {e}");
             return None;
         }
-        let Ok(ch_url) = std::env::var("CLICKHOUSE_URL") else {
-            println!("Skipping: CLICKHOUSE_URL not set");
-            return None;
-        };
         Some(Self {
             svc,
             repo: DetectionRuleRepository::new(pg.clone()),

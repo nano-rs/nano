@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<!--
+  NAN-6000: operator workaround for a CPU that does not report PCLMULQDQ,
+  BMI1 or BMI2 (for example a Proxmox VM with CPU type x86-64-v3 or x86-64-v4).
+
+  ClickHouse's fast JSON parser (simdjson) cannot run on such a CPU, so every
+  JSON value fails to parse ("Cannot parse JSON object here: {}"). This file
+  switches every nano ClickHouse profile to the slower rapidjson parser.
+
+  The better fix is to give the VM its host's CPU (Proxmox: CPU type 'host').
+  Use this only when you cannot change the CPU type:
+
+      cp clickhouse/preflight/zz-local-no-simdjson.xml clickhouse/users.d/
+      ./install.sh            (or: scripts/nano upgrade)
+
+  Remove it from clickhouse/users.d/ once the CPU type is fixed.
+  Keep this list in sync with the profiles in clickhouse/users.d/query_limits.xml
+  (clickhouse/preflight/test-clickhouse-preflight.sh checks it).
+-->
+<clickhouse>
+    <profiles>
+        <default><allow_simdjson>0</allow_simdjson></default>
+        <analytics><allow_simdjson>0</allow_simdjson></analytics>
+        <realtime><allow_simdjson>0</allow_simdjson></realtime>
+        <ingestion><allow_simdjson>0</allow_simdjson></ingestion>
+        <ingest_direct><allow_simdjson>0</allow_simdjson></ingest_direct>
+        <search><allow_simdjson>0</allow_simdjson></search>
+        <dict_source><allow_simdjson>0</allow_simdjson></dict_source>
+        <admin><allow_simdjson>0</allow_simdjson></admin>
+        <rawsql><allow_simdjson>0</allow_simdjson></rawsql>
+    </profiles>
+</clickhouse>

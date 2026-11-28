@@ -12,15 +12,23 @@ on:
     paths:
       - "scripts/release/**"
       - "scripts/tests/customer-images.test.sh"
+      - "scripts/tests/ghcr-public.test.sh"
       - "scripts/tests/helm-chart-package.test.sh"
       - "scripts/tests/lock-provenance.test.sh"
       - "scripts/tests/release-notes-preflight.test.sh"
+      # NAN-5965: restore takes a missing overlay from the backup.
+      - "scripts/tests/nano-restore-missing-overlay.test.sh"
       - "scripts/tests/check-mirror-includes.test.sh"
+      # NAN-5966: no bare `docker compose` hints; backup-schedule --run-now.
+      - "scripts/tests/nano-compose-hints.test.sh"
+      - "scripts/tests/compose-overlay-parity.test.sh"
       # NAN-5440: awk portability across every shipped shell script, under Debian 12's mawk.
       - "scripts/tests/awk-portability.test.sh"
       # NAN-5495: every interactive install prompt on a real pty, and shellcheck of shipped scripts.
       - "scripts/tests/install-tty-prompts.test.sh"
       - "scripts/tests/install_tty_prompts.py"
+      # NAN-5963: scripts/nano restart, the documented way to apply .env changes.
+      - "scripts/tests/nano-restart.test.sh"
       - "config/**"
       - "deploy/helm/nano/**"
       - "deploy/release/**"
@@ -64,15 +72,23 @@ on:
     paths:
       - "scripts/release/**"
       - "scripts/tests/customer-images.test.sh"
+      - "scripts/tests/ghcr-public.test.sh"
       - "scripts/tests/helm-chart-package.test.sh"
       - "scripts/tests/lock-provenance.test.sh"
       - "scripts/tests/release-notes-preflight.test.sh"
+      # NAN-5965: restore takes a missing overlay from the backup.
+      - "scripts/tests/nano-restore-missing-overlay.test.sh"
       - "scripts/tests/check-mirror-includes.test.sh"
+      # NAN-5966: no bare `docker compose` hints; backup-schedule --run-now.
+      - "scripts/tests/nano-compose-hints.test.sh"
+      - "scripts/tests/compose-overlay-parity.test.sh"
       # NAN-5440: awk portability across every shipped shell script, under Debian 12's mawk.
       - "scripts/tests/awk-portability.test.sh"
       # NAN-5495: every interactive install prompt on a real pty, and shellcheck of shipped scripts.
       - "scripts/tests/install-tty-prompts.test.sh"
       - "scripts/tests/install_tty_prompts.py"
+      # NAN-5963: scripts/nano restart, the documented way to apply .env changes.
+      - "scripts/tests/nano-restart.test.sh"
       - "config/**"
       - "deploy/helm/nano/**"
       - "deploy/release/**"

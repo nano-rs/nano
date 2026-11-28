@@ -62,7 +62,7 @@ const SCHEDULERS: SchedulerRow[] = [
     key: 'model_catalog_sync_scheduler_enabled',
     name: 'Model Catalog Auto-Sync',
     interval: '24hr',
-    clickhouseImpact: 'None (GitHub fetch + PG only)',
+    clickhouseImpact: 'None (signed content bundle + PG only)',
   },
 ];
 

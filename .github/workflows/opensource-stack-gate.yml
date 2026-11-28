@@ -44,6 +44,9 @@ on:
       - tools/check-mirror-enterprise-strip.py
       - tools/tests/**
       - scripts/tests/install-edition.test.sh
+      - scripts/tests/install-replica-question.test.sh
+      - scripts/tests/test_replica_setup.py
+      - scripts/lib/replica_setup.py
       - scripts/tests/install-env-set-keys.test.sh
       - scripts/tests/install-ingest-ack-durability.test.sh
       - scripts/lib/generated-secrets.sh
@@ -178,6 +181,9 @@ on:
       - tools/check-mirror-enterprise-strip.py
       - tools/tests/**
       - scripts/tests/install-edition.test.sh
+      - scripts/tests/install-replica-question.test.sh
+      - scripts/tests/test_replica_setup.py
+      - scripts/lib/replica_setup.py
       - scripts/tests/install-env-set-keys.test.sh
       - scripts/tests/install-ingest-ack-durability.test.sh
       - scripts/lib/generated-secrets.sh
@@ -338,6 +344,18 @@ jobs:
             echo "install-edition test not in this tree (public mirror); skipping"
           fi
 
+      # NAN-5929: "Keep a second copy of your event data?" (unattended paths
+      # and the checker / starter inventory; the pty paths run in
+      # install-tty-prompts.test.sh at release preflight).
+      - name: install.sh second-copy question
+        run: |
+          if [ -f scripts/tests/install-replica-question.test.sh ]; then
+            bash scripts/tests/install-replica-question.test.sh
+            python3 -m unittest scripts/tests/test_replica_setup.py
+          else
+            echo "install replica-question test not in this tree (public mirror); skipping"
+          fi
+
       # NAN-5124: installer -> edge calls succeed only on a 2xx (a TLS-overlay
       # 301 used to read as "Admin user created").
       - name: install.sh edge calls are 2xx-only
@@ -434,6 +452,16 @@ jobs:
       # NAN-5509: installer errors, prerequisites and recovery hints (TLS
       # certificate preflight, python3/git, docker permissions, log hint,
       # host-minimum re-run commands, license login on upgrade, ports).
+      # NAN-5909 review: no Python module defines a function or class twice
+      # (pyflakes F811); deploy/compose/render-inventory.py shipped five.
+      - name: no duplicate Python defs
+        run: |
+          if [ -f scripts/tests/test_python_no_duplicate_defs.py ]; then
+            python3 -I scripts/tests/test_python_no_duplicate_defs.py
+          else
+            echo "duplicate-defs check not in this tree (public mirror); skipping"
+          fi
+
       - name: install.sh errors and prerequisites
         run: |
           if [ -f scripts/tests/install-errors-prereqs.test.sh ]; then
@@ -754,6 +782,7 @@ jobs:
             -e CARGO_TARGET_DIR=/tmp/target \
             -e CARGO_BUILD_JOBS \
             -e TEST_DATABASE_URL="$TEST_DATABASE_URL" \
+            -e NANOSIEM_TEST_DATABASE_URL="$TEST_DATABASE_URL" \
             -e NANOSIEM_ALLOW_DESTRUCTIVE_TESTS=1 \
             -e NANOSIEM_REQUIRE_RELATION_INVENTORY=1 \
             "$RUST_IMAGE" \

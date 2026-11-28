@@ -62,8 +62,8 @@ fn env() -> Option<Env> {
         hec: get("NAN4912_E2E_HEC")?,
         metrics: get("NAN4912_E2E_METRICS")?,
         install: get("NAN4912_E2E_INSTALL_TOKEN")?,
-        ch_url: get("NAN4912_E2E_CH_URL")?,
-        database_url: get("NANOSIEM_TEST_DATABASE_URL")?,
+        ch_url: nanosiem_test_db::dedicated_url(nanosiem_test_db::Db::ClickHouse, "NAN4912_E2E_CH_TEST_URL").ok()?,
+        database_url: nanosiem_test_db::pg_url().ok()?,
     })
 }
 

@@ -293,13 +293,13 @@ mod live_ch {
     use uuid::Uuid;
 
     fn ch_url() -> String {
-        std::env::var("CLICKHOUSE_TEST_URL").unwrap_or_else(|_| "http://localhost:8123".into())
+        nanosiem_test_db::require_ch_url()
     }
     fn ch_user() -> String {
-        std::env::var("CLICKHOUSE_TEST_USER").unwrap_or_else(|_| "nanosiem".into())
+        nanosiem_test_db::ch_user().unwrap_or_else(|| "nanosiem".into())
     }
     fn ch_pass() -> String {
-        std::env::var("CLICKHOUSE_TEST_PASSWORD").unwrap_or_else(|_| "nanosiem".into())
+        nanosiem_test_db::ch_password().unwrap_or_else(|| "nanosiem".into())
     }
     fn ch_db() -> String {
         std::env::var("CLICKHOUSE_TEST_DB").unwrap_or_else(|_| "nanosiem".into())
@@ -403,6 +403,14 @@ mod live_ch {
     /// the other DB-backed tests in this crate.
     #[tokio::test]
     async fn dedup_emits_one_row_per_key_when_rows_share_an_id() {
+        // NAN-5964: no localhost default, and this test writes data, so it
+        // also needs the destructive-test opt-in.
+        if nanosiem_test_db::ch_url().is_err()
+            || !matches!(std::env::var("NANOSIEM_ALLOW_DESTRUCTIVE_TESTS").as_deref(), Ok("1" | "true"))
+        {
+            eprintln!("Skipping: set CLICKHOUSE_TEST_URL to a throwaway ClickHouse and NANOSIEM_ALLOW_DESTRUCTIVE_TESTS=1");
+            return;
+        }
         if std::env::var("SKIP_DB_TESTS").is_ok() {
             println!("Skipping (SKIP_DB_TESTS is set)");
             return;

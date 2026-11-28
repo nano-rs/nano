@@ -67,7 +67,7 @@ confirm it before you accept it. Never use `StrictHostKeyChecking=no`.
 |---|---|---|
 | user | connected as root | create or use a non-root sudo user |
 | cpu / memory / disk | below the size | resize the VM, add a data disk, or re-size the plan |
-| avx2 | no AVX2 on x86-64 | VM CPU type `host` or `x86-64-v3` |
+| avx2 | no AVX2 on x86-64 | VM CPU type `host` (`x86-64-v3` lacks pclmulqdq) |
 | tools | missing `curl`, `openssl`, `tar`, `python3`, `ss` (and `git` for single node) | `sudo apt-get install -y ...` |
 | docker / compose | missing, daemon down, user not in `docker` group, Compose < 2.24.4 for role split | Docker's official repository; `usermod -aG docker`; new SSH session |
 | peer | nodes cannot reach each other | private network or security group |

@@ -356,6 +356,11 @@ pub async fn get_key_usage(
 ///
 /// Requirements: 12.1 - Allow creating API keys with name, description, and selected permissions
 ///
+/// NAN-5900: instead of `permissions`, a body may name `"preset": "admin"`:
+/// every permission in the catalogue right now (a snapshot; permissions added
+/// in later releases are not added to the key). The caller must hold all of
+/// them, and `expires_at` is required.
+///
 /// POST /api/api-keys
 #[utoipa::path(
     post,
@@ -364,7 +369,9 @@ pub async fn get_key_usage(
     request_body = CreateApiKeyRequest,
     responses(
         (status = 201, description = "API key successfully created", body = ApiKeyCreated),
-        (status = 403, description = "Permission denied — session-only endpoint", body = ApiKeyApiError),
+        (status = 400, description = "Bad request: no permissions and no preset, unknown preset, preset sent with a permissions list, or an admin preset without a future expiry", body = ApiKeyApiError),
+        (status = 403, description = "Permission denied: session-only endpoint, or the caller does not hold every permission requested (or every permission the admin preset grants)", body = ApiKeyApiError),
+        (status = 503, description = "Permission catalogue unavailable while resolving a preset", body = ApiKeyApiError),
     ),
     security(("bearer_auth" = []))
 )]
@@ -378,6 +385,54 @@ pub async fn create_key(
         .map_err(|(s, j)| (s, Json(ApiKeyApiError::new(&j.error, &j.message))))?;
     check_permission(&auth, permissions::APIKEYS_CREATE)
         .map_err(|(s, j)| (s, Json(ApiKeyApiError::new(&j.error, &j.message))))?;
+
+    let mut request = request;
+
+    // NAN-5900: a named preset is resolved HERE, from the live permission
+    // catalogue, and is held to the same no-escalation rule as a hand-picked
+    // list: the caller must hold every permission the preset grants.
+    // A hand-picked request with no scopes is refused too (it would mint a
+    // key that can call nothing, e.g. from a mistyped `preset` field).
+    let catalogue: Vec<String> = if request.preset.is_some() {
+        state
+            .role_repo
+            .list_permissions()
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "permission catalogue load failed for api-key preset");
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ApiKeyApiError::new(
+                        "permission_catalogue_unavailable",
+                        "The permission list is temporarily unavailable; retry shortly.",
+                    )),
+                )
+            })?
+            .into_iter()
+            .map(|p| p.id)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let resolved = {
+        let caller: std::collections::HashSet<&str> =
+            auth.claims.permissions.iter().map(|s| s.as_str()).collect();
+        resolve_create_preset(
+            request.preset.as_deref(),
+            &request.permissions,
+            request.expires_at,
+            chrono::Utc::now(),
+            &catalogue,
+            &caller,
+        )
+        .map_err(|r| {
+            let (status, body) = r.into_response();
+            (status, Json(body))
+        })?
+    };
+    if let Some(perms) = resolved {
+        request.permissions = perms;
+    }
 
     // Prevent privilege escalation: caller cannot grant permissions they don't hold
     let caller_perms: std::collections::HashSet<&str> =
@@ -597,14 +652,142 @@ pub(crate) fn api_key_audit_snapshot(key: &ApiKey) -> serde_json::Value {
 }
 
 /// NAN-5324: `apikey_created` details — the granted scopes and limits.
+/// NAN-5900: `preset` names the preset the key was built from (`null` for a
+/// hand-picked list), so an "admin" key stands out in the audit log.
 pub(crate) fn api_key_created_details(request: &CreateApiKeyRequest) -> serde_json::Value {
     let mut permissions = request.permissions.clone();
     permissions.sort();
     serde_json::json!({
         "permissions": permissions,
+        "preset": request.preset,
         "expires_at": request.expires_at,
         "rate_limit": request.rate_limit,
     })
+}
+
+/// NAN-5900: the one server-side preset. "Admin" = every permission in the
+/// catalogue at creation time.
+///
+/// It is a SNAPSHOT, not a live link to the Admin role: a permission added by
+/// a later release is not granted to existing admin keys until someone edits
+/// the key. That keeps a stored key from silently gaining new powers on an
+/// upgrade; the owner clamp (NAN-5044) still withholds anything the owner
+/// later loses.
+pub(crate) const ADMIN_PRESET: &str = "admin";
+
+/// Why a preset request was refused.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PresetRefusal {
+    Unknown(String),
+    WithPermissions,
+    /// No preset and no permissions: the key could call nothing.
+    PermissionsRequired,
+    ExpiryRequired,
+    EmptyCatalogue,
+    /// The caller lacks these preset permissions (sorted).
+    Escalation(Vec<String>),
+}
+
+impl PresetRefusal {
+    fn into_response(self) -> (StatusCode, ApiKeyApiError) {
+        match self {
+            Self::Unknown(name) => (
+                StatusCode::BAD_REQUEST,
+                ApiKeyApiError::new(
+                    "unknown_preset",
+                    &format!("Unknown preset \"{name}\". The only preset is \"{ADMIN_PRESET}\"."),
+                ),
+            ),
+            Self::WithPermissions => (
+                StatusCode::BAD_REQUEST,
+                ApiKeyApiError::new(
+                    "preset_with_permissions",
+                    "Send either a preset or a permissions list, not both.",
+                ),
+            ),
+            Self::PermissionsRequired => (
+                StatusCode::BAD_REQUEST,
+                ApiKeyApiError::new(
+                    "permissions_required",
+                    "Send at least one permission, or \"preset\": \"admin\".",
+                ),
+            ),
+            Self::ExpiryRequired => (
+                StatusCode::BAD_REQUEST,
+                ApiKeyApiError::new(
+                    "expiry_required",
+                    "An admin key must have an expiry date in the future.",
+                ),
+            ),
+            Self::EmptyCatalogue => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ApiKeyApiError::new(
+                    "permission_catalogue_unavailable",
+                    "The permission list is empty; retry shortly.",
+                ),
+            ),
+            Self::Escalation(missing) => {
+                const SHOWN: usize = 20;
+                let mut list = missing.iter().take(SHOWN).cloned().collect::<Vec<_>>().join(", ");
+                if missing.len() > SHOWN {
+                    list.push_str(&format!(" and {} more", missing.len() - SHOWN));
+                }
+                (
+                    StatusCode::FORBIDDEN,
+                    ApiKeyApiError::new(
+                        "permission_escalation",
+                        &format!(
+                            "The admin preset needs every permission, and you don't hold: {list}"
+                        ),
+                    ),
+                )
+            }
+        }
+    }
+}
+
+/// Resolve `preset` to the permission list to store. `Ok(None)` means no
+/// preset was asked for and the explicit (non-empty) list is used as before.
+/// An empty list with no preset is refused: `permissions` defaults to `[]` so
+/// a preset-only body parses, and that default must not mint a 0-scope key.
+pub(crate) fn resolve_create_preset(
+    preset: Option<&str>,
+    explicit: &[String],
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+    catalogue: &[String],
+    caller: &std::collections::HashSet<&str>,
+) -> Result<Option<Vec<String>>, PresetRefusal> {
+    let Some(name) = preset else {
+        if explicit.is_empty() {
+            return Err(PresetRefusal::PermissionsRequired);
+        }
+        return Ok(None);
+    };
+    if name != ADMIN_PRESET {
+        return Err(PresetRefusal::Unknown(name.chars().take(64).collect()));
+    }
+    if !explicit.is_empty() {
+        return Err(PresetRefusal::WithPermissions);
+    }
+    if !matches!(expires_at, Some(at) if at > now) {
+        return Err(PresetRefusal::ExpiryRequired);
+    }
+    let mut all: Vec<String> = catalogue.to_vec();
+    all.sort();
+    all.dedup();
+    if all.is_empty() {
+        return Err(PresetRefusal::EmptyCatalogue);
+    }
+    let missing: Vec<String> = all
+        .iter()
+        .filter(|p| !caller.contains(p.as_str()))
+        .cloned()
+        .collect();
+    if !missing.is_empty() {
+        return Err(PresetRefusal::Escalation(missing));
+    }
+    Ok(Some(all))
 }
 
 /// NAN-5029: may a key's self-update be applied? Only changes that TIGHTEN it
@@ -1059,6 +1242,10 @@ mod self_update_tests;
 #[cfg(test)]
 #[path = "api_keys_audit_details_tests.rs"]
 mod audit_details_tests;
+
+#[cfg(test)]
+#[path = "api_keys_preset_tests.rs"]
+mod preset_tests;
 
 /// OpenAPI documentation for API key management endpoints
 #[derive(utoipa::OpenApi)]

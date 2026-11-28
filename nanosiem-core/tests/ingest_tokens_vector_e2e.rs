@@ -41,7 +41,7 @@ fn env() -> Option<Env> {
         hec: get("NAN4907_E2E_HEC")?,
         metrics: get("NAN4907_E2E_METRICS")?,
         install: get("NAN4907_E2E_INSTALL_TOKEN")?,
-        database_url: get("NANOSIEM_TEST_DATABASE_URL")?,
+        database_url: nanosiem_test_db::pg_url().ok()?,
     })
 }
 

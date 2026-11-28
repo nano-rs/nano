@@ -55,6 +55,7 @@ async fn mint(svc: &ApiKeyService, pool: &PgPool, name: &str, rate_limit: Option
                 permissions: vec!["search:view".to_string()],
                 expires_at: None,
                 rate_limit,
+                preset: None,
             },
             Some(create_user(pool).await),
             None,

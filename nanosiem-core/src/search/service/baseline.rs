@@ -378,9 +378,14 @@ mod live_tests {
     use std::sync::Arc;
 
     async fn local() -> Option<SearchService> {
+        // NAN-5964: no localhost default. Skip unless both URLs name a stack.
+        let (Ok(pg_url), Ok(ch_url)) = (nanosiem_test_db::pg_url(), nanosiem_test_db::ch_url()) else {
+            eprintln!("Skipping: set DATABASE_URL and CLICKHOUSE_TEST_URL to a throwaway stack");
+            return None;
+        };
         let config = DualPoolConfig::with_auth(
-            "postgres://nanosiem:nanosiem@localhost:5432/nanosiem",
-            "http://localhost:8123",
+            pg_url.clone(),
+            ch_url.clone(),
             "nanosiem",
             "default",
             "",

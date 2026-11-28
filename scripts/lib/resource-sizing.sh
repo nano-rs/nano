@@ -1657,6 +1657,35 @@ if (( tiered )); then
 "
 fi
 
+# NAN-5915: lighter ClickHouse system logging on small hosts. ClickHouse
+# advises turning off metric_log, asynchronous_metric_log and text_log under
+# 16 GB; clickhouse/config.d/system_logs.xml keeps them on for every size.
+# Under 8 GiB of ClickHouse memory (the final limit, an override included):
+#   * text_log is removed. Nothing in nano reads it; the same warnings stay
+#     in the server log files.
+#   * metric_log samples every 60 s instead of 10 s and both metric logs
+#     flush every 60 s instead of 7.5 s: 8x fewer small parts to write and
+#     merge. They stay on because SIEM Health's shard-skew probe reads them
+#     (nanosiem-core siem_health/shard_skew.rs, 5-minute buckets), and 60 s
+#     samples still fill those buckets.
+# A later config.d file merges element by element, so these keep the
+# database, table and TTL from system_logs.xml. 8 GiB and up: unchanged.
+CH_LIGHT_SYSTEM_LOGS_BELOW_MIB=8192
+ch_final_mib=$(mib_from_memory_string "$CLICKHOUSE_MEM_LIMIT")
+[[ -n "$ch_final_mib" ]] || ch_final_mib=$ch_mib
+small_system_log_lines=""
+if (( ch_final_mib < CH_LIGHT_SYSTEM_LOGS_BELOW_MIB )); then
+    small_system_log_lines='  <text_log remove="1"/>
+  <metric_log>
+    <collect_interval_milliseconds>60000</collect_interval_milliseconds>
+    <flush_interval_milliseconds>60000</flush_interval_milliseconds>
+  </metric_log>
+  <asynchronous_metric_log>
+    <flush_interval_milliseconds>60000</flush_interval_milliseconds>
+  </asynchronous_metric_log>
+'
+fi
+
 if [[ -n "$server_output" ]]; then
     mkdir -p "$(dirname "$server_output")"
     cat > "$server_output" <<EOF
@@ -1685,7 +1714,7 @@ ${tier_merge_tree_lines}  </merge_tree>
   <concurrent_threads_scheduler>round_robin</concurrent_threads_scheduler>
   <async_insert_threads>$CLICKHOUSE_ASYNC_INSERT_THREADS</async_insert_threads>
   <max_temporary_data_on_disk_size>$CLICKHOUSE_MAX_TEMPORARY_DATA_ON_DISK_SIZE</max_temporary_data_on_disk_size>
-</clickhouse>
+${small_system_log_lines}</clickhouse>
 EOF
     chmod 644 "$server_output"
 fi

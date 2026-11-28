@@ -114,7 +114,24 @@ pub async fn run_health_check_with_trigger(
     let metrics =
         collector::collect_metrics(pool, ch_client, system_probe_client, is_clustered, scope).await;
     let provenance = metrics.source_provenance();
-    let metrics_json = serde_json::to_value(&metrics).unwrap_or_default();
+    let mut metrics_json = serde_json::to_value(&metrics).unwrap_or_default();
+    // NAN-6012: record which dimensions had no data, so the upgrade's SIEM
+    // Health gate can tell "no data before" from "measured and got worse".
+    // A report collected under a restricted scope may see no data only
+    // because the sources are denied to the viewer, so it claims none (an
+    // empty list, never omitted: the gate would otherwise re-derive the same
+    // viewer-filtered metrics).
+    let no_data = if scope.is_restricted() {
+        Vec::new()
+    } else {
+        analyzer::no_data_dimensions(&metrics)
+    };
+    if let Some(object) = metrics_json.as_object_mut() {
+        object.insert(
+            analyzer::NO_DATA_DIMENSIONS_KEY.to_string(),
+            serde_json::json!(no_data),
+        );
+    }
 
     // Step 1b: Load active suppressions so the AI can omit classes the tenant
     // has already marked as not-an-issue (NAN-615).
@@ -245,7 +262,20 @@ pub async fn run_health_check_with_trigger(
     // NAN-5204: automatic backups enabled but none succeeded in 36 hours.
     match crate::backup_status::BackupStatusRepository::new(pool.clone()).get().await {
         Ok(status) => {
-            analyzer::ensure_backup_findings(&mut analysis, status.as_ref(), chrono::Utc::now())
+            analyzer::ensure_backup_findings(&mut analysis, status.as_ref(), chrono::Utc::now());
+            // NAN-5938: the backup service has run against this database (it
+            // made its `nano_backup` role) but no report ever arrived: nano-api
+            // refuses them (it started without the status token). Database
+            // state only, so nano-jobs and nano-api reach the same answer.
+            if status.is_none() {
+                match crate::backup_status::backup_service_has_run(pool).await {
+                    Ok(ran) => analyzer::ensure_backup_report_findings(
+                        &mut analysis,
+                        crate::backup_status::reports_refused(status.as_ref(), ran),
+                    ),
+                    Err(e) => warn!("Failed to check for the backup service role: {}", e),
+                }
+            }
         }
         Err(e) => warn!("Failed to read backup status: {}", e),
     }
@@ -311,6 +341,10 @@ pub async fn run_health_check_with_trigger(
     // NAN-5622: SOAR dead letters, trigger backlog and dropped events.
     #[cfg(feature = "enterprise")]
     super::soar_findings::ensure_all(pool, &mut analysis).await;
+
+    // NAN-5952: AI agents whose model the provider retired (every call fails).
+    #[cfg(feature = "enterprise")]
+    super::retired_model_findings::ensure_all(pool, &mut analysis).await;
 
     let duration_ms = start.elapsed().as_millis() as i32;
     let status = HealthStatus::from_score(analysis.overall_score);

@@ -77,7 +77,7 @@ fn assert_invalid_input_without_sql(err: SavedSearchRepositoryError) {
 }
 
 #[tokio::test]
-#[ignore = "requires a disposable Postgres (DATABASE_URL)"]
+#[ignore = "requires a disposable Postgres (NANOSIEM_TEST_DATABASE_URL)"]
 async fn invalid_visibility_is_rejected_before_any_write() {
     let pool = common::migrated_pool().await;
     let repo = SavedSearchRepository::new(pool.clone());
@@ -107,7 +107,7 @@ async fn invalid_visibility_is_rejected_before_any_write() {
 }
 
 #[tokio::test]
-#[ignore = "requires a disposable Postgres (DATABASE_URL)"]
+#[ignore = "requires a disposable Postgres (NANOSIEM_TEST_DATABASE_URL)"]
 async fn unknown_group_ids_are_rejected_before_any_write() {
     let pool = common::migrated_pool().await;
     let repo = SavedSearchRepository::new(pool.clone());
@@ -142,7 +142,7 @@ async fn unknown_group_ids_are_rejected_before_any_write() {
 }
 
 #[tokio::test]
-#[ignore = "requires a disposable Postgres (DATABASE_URL)"]
+#[ignore = "requires a disposable Postgres (NANOSIEM_TEST_DATABASE_URL)"]
 async fn normal_save_share_and_list_still_work() {
     let pool = common::migrated_pool().await;
     let repo = SavedSearchRepository::new(pool.clone());

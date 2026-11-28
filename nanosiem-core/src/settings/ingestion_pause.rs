@@ -167,13 +167,22 @@ impl IngestionPauseService {
 
     /// The current state, read from PostgreSQL.
     pub async fn state(&self) -> Result<IngestionPauseState, IngestionPauseError> {
+        self.state_on(&self.pg).await
+    }
+
+    /// [`Self::state`] on a given executor: the transition paths read it on
+    /// the connection that holds the transition lock (NAN-5957 review).
+    async fn state_on<'e, E: sqlx::PgExecutor<'e>>(
+        &self,
+        executor: E,
+    ) -> Result<IngestionPauseState, IngestionPauseError> {
         let row: Option<(bool, Option<String>, Option<String>, Option<DateTime<Utc>>, Option<Uuid>)> =
             sqlx::query_as(
                 "SELECT ingestion_paused, ingestion_pause_source, ingestion_pause_reason, \
                         ingestion_paused_at, ingestion_paused_by \
                  FROM system_settings WHERE id = 'default'",
             )
-            .fetch_optional(&self.pg)
+            .fetch_optional(executor)
             .await?;
         let state = match row {
             Some((paused, source, reason, paused_at, paused_by)) => IngestionPauseState {
@@ -230,14 +239,15 @@ impl IngestionPauseService {
         reason: Option<&str>,
         actor: Option<Uuid>,
     ) -> Result<(IngestionPauseState, bool), IngestionPauseError> {
-        let lock = self.lock_transitions().await?;
-        let result = self.pause_locked(source, reason, actor).await;
+        let (_slot, mut lock) = self.lock_transitions().await?;
+        let result = self.pause_locked(&mut lock, source, reason, actor).await;
         unlock_transitions(lock).await;
         result
     }
 
     async fn pause_locked(
         &self,
+        lock: &mut sqlx::PgConnection,
         source: IngestionPauseSource,
         reason: Option<&str>,
         actor: Option<Uuid>,
@@ -257,7 +267,7 @@ impl IngestionPauseService {
         .bind(source.as_str())
         .bind(reason.as_deref())
         .bind(actor)
-        .execute(&self.pg)
+        .execute(&mut *lock)
         .await?
         .rows_affected()
             > 0;
@@ -268,7 +278,7 @@ impl IngestionPauseService {
                 warn!(%error, "ingestion pause: ClickHouse guard not applied; the next reconcile retries");
             }
         }
-        let state = self.state().await?;
+        let state = self.state_on(&mut *lock).await?;
         if changed {
             warn!(source = source.as_str(), reason = ?state.reason, "Ingestion PAUSED");
         }
@@ -282,17 +292,18 @@ impl IngestionPauseService {
         &self,
         only_auto: bool,
     ) -> Result<(IngestionPauseState, bool), IngestionPauseError> {
-        let lock = self.lock_transitions().await?;
-        let result = self.resume_locked(only_auto).await;
+        let (_slot, mut lock) = self.lock_transitions().await?;
+        let result = self.resume_locked(&mut lock, only_auto).await;
         unlock_transitions(lock).await;
         result
     }
 
     async fn resume_locked(
         &self,
+        lock: &mut sqlx::PgConnection,
         only_auto: bool,
     ) -> Result<(IngestionPauseState, bool), IngestionPauseError> {
-        let before = self.state().await?;
+        let before = self.state_on(&mut *lock).await?;
         let changed = sqlx::query(
             "UPDATE system_settings SET \
                 ingestion_paused = false, \
@@ -304,7 +315,7 @@ impl IngestionPauseService {
                AND (NOT $1 OR ingestion_pause_source IS DISTINCT FROM 'manual')",
         )
         .bind(only_auto)
-        .execute(&self.pg)
+        .execute(&mut *lock)
         .await?
         .rows_affected()
             > 0;
@@ -325,14 +336,14 @@ impl IngestionPauseService {
     /// Make the ClickHouse guard match PostgreSQL. Run by the jobs leader every
     /// disk-pressure cycle.
     pub async fn reconcile(&self) -> Result<(), IngestionPauseError> {
-        let lock = self.lock_transitions().await?;
-        let result = self.reconcile_locked().await;
+        let (_slot, mut lock) = self.lock_transitions().await?;
+        let result = self.reconcile_locked(&mut lock).await;
         unlock_transitions(lock).await;
         result
     }
 
-    async fn reconcile_locked(&self) -> Result<(), IngestionPauseError> {
-        let state = self.state().await?;
+    async fn reconcile_locked(&self, lock: &mut sqlx::PgConnection) -> Result<(), IngestionPauseError> {
+        let state = self.state_on(&mut *lock).await?;
         let guard = self.guard_state().await;
         match (state.paused, guard) {
             (true, IngestionGuardState::Applied) | (false, IngestionGuardState::Absent) => Ok(()),
@@ -400,31 +411,71 @@ impl IngestionPauseService {
 }
 
 impl IngestionPauseService {
-    /// Take the transition lock on a dedicated connection (session-level, so
-    /// it spans the ClickHouse DDL, and is released if the connection dies).
+    /// Take the transition lock on a pooled connection (session-level, so it
+    /// spans the ClickHouse DDL, and is released if the connection dies).
+    ///
+    /// NAN-5957 review: the lock pins its connection across ClickHouse I/O,
+    /// so it takes a pinned slot first (nano-jobs keeps a reserve for short
+    /// queries; request handlers never wait), and every PostgreSQL statement
+    /// of the transition runs on this same connection: one connection per
+    /// transition, never a second checkout while holding the first. If the
+    /// future is cancelled while the lock may be held, [`TransitionLock`]
+    /// closes the connection instead of returning it to the pool. The slot
+    /// is returned first in the tuple so it is dropped after the connection.
     async fn lock_transitions(
         &self,
-    ) -> Result<sqlx::pool::PoolConnection<sqlx::Postgres>, IngestionPauseError> {
-        let mut conn = self.pg.acquire().await?;
+    ) -> Result<(crate::db::pinned_session::PinnedSlot, TransitionLock), IngestionPauseError> {
+        let slot = crate::db::pinned_session::pinned_slot(&self.pg).await;
+        let mut lock = TransitionLock(Some(self.pg.acquire().await?));
         sqlx::query("SELECT pg_advisory_lock($1)")
             .bind(TRANSITION_LOCK_KEY)
-            .execute(&mut *conn)
+            .execute(&mut *lock)
             .await?;
-        Ok(conn)
+        Ok((slot, lock))
     }
 }
 
-async fn unlock_transitions(mut conn: sqlx::pool::PoolConnection<sqlx::Postgres>) {
+/// The pooled connection that holds (or may hold) the transition lock.
+/// Dropped without [`unlock_transitions`] (an error mid-acquire, a cancelled
+/// future), it closes the connection: a session that may still hold the lock
+/// must never go back to the pool, where the next transition would block on
+/// it forever.
+struct TransitionLock(Option<sqlx::pool::PoolConnection<sqlx::Postgres>>);
+
+impl std::ops::Deref for TransitionLock {
+    type Target = sqlx::PgConnection;
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().expect("transition lock connection")
+    }
+}
+
+impl std::ops::DerefMut for TransitionLock {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.as_mut().expect("transition lock connection")
+    }
+}
+
+impl Drop for TransitionLock {
+    fn drop(&mut self) {
+        if let Some(mut conn) = self.0.take() {
+            conn.close_on_drop();
+        }
+    }
+}
+
+async fn unlock_transitions(mut lock: TransitionLock) {
     if let Err(error) = sqlx::query("SELECT pg_advisory_unlock($1)")
         .bind(TRANSITION_LOCK_KEY)
-        .execute(&mut *conn)
+        .execute(&mut *lock)
         .await
     {
         // Never return a connection that may still hold the lock to the pool:
-        // closing it releases the lock.
+        // closing it releases the lock (TransitionLock's drop).
         warn!(%error, "ingestion pause: advisory unlock failed; closing the connection");
-        drop(conn.detach());
+        return;
     }
+    // Unlocked: the connection goes back to the pool.
+    drop(lock.0.take());
 }
 
 fn cluster_name() -> Option<String> {

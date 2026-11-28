@@ -38,7 +38,7 @@ fn role_credential(name: &str, external_id: Option<&str>) -> CreateCloudCredenti
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn external_id_is_readable_after_creation() {
     let pool = common::migrated_pool().await;
     let repo = CredentialRepository::new(pool.clone());
@@ -62,7 +62,7 @@ async fn external_id_is_readable_after_creation() {
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn get_decrypted_merges_external_id_for_the_config_generators() {
     // The generators consume ONE credential JSON. The column is the sole store,
     // so `get_decrypted` has to merge it back in or `aws_auth_table` never sees
@@ -89,7 +89,7 @@ async fn get_decrypted_merges_external_id_for_the_config_generators() {
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn rotation_rewrites_the_external_id() {
     // A rotation can change POSTURE — static keys today, a cross-account role
     // tomorrow — so it must overwrite the column rather than inherit.
@@ -122,7 +122,7 @@ async fn rotation_rewrites_the_external_id() {
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn rotating_to_static_keys_clears_the_external_id() {
     let pool = common::migrated_pool().await;
     let repo = CredentialRepository::new(pool.clone());
@@ -160,7 +160,7 @@ async fn rotating_to_static_keys_clears_the_external_id() {
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn rollback_restores_the_external_id_belonging_to_that_version() {
     // The id is a trust-policy condition ON the role ARN, and the ARN is in the
     // versioned payload. Carrying the CURRENT id backwards would pair a
@@ -215,7 +215,7 @@ async fn rollback_restores_the_external_id_belonging_to_that_version() {
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn static_key_credentials_carry_no_external_id() {
     let pool = common::migrated_pool().await;
     let repo = CredentialRepository::new(pool.clone());

@@ -6,7 +6,7 @@ import react from '@vitejs/plugin-react';
 /// <reference types="vitest/config" />
 import { defineConfig, loadEnv, Plugin } from 'vite';
 import { configDefaults } from 'vitest/config';
-import { applyCsp, assertInlineScriptsAllowed, sentryConnectOrigin } from './csp';
+import { applyCsp, assertInlineScriptsAllowed, isSentryReplayBuildEnabled, sentryConnectOrigin } from './csp';
 import { nodeTestFiles } from './scripts/node-test-files.mjs';
 
 // Stamp the package.json version into the bundle as `__APP_VERSION__` so
@@ -28,14 +28,49 @@ function resolveEdition(env: Record<string, string>): 'open' | 'enterprise' {
 // CSP for index.html. Production hashes are derived from the inline scripts at
 // build time (see csp.ts); the build re-checks the emitted HTML and fails if an
 // inline script is not covered, so the policy can't drift from the script.
-function cspPlugin(connectExtra: string[]): Plugin {
+function cspPlugin(connectExtra: string[], allowBlobWorker: boolean): Plugin {
   return {
     name: 'csp',
     transformIndexHtml: {
       order: 'pre',
       handler(html, ctx) {
-        return applyCsp(html, !!ctx.server, connectExtra);
+        return applyCsp(html, !!ctx.server, connectExtra, allowBlobWorker);
       },
+    },
+  };
+}
+
+// Compile out the lazy Sentry and Sentry Replay chunks in builds that do not
+// opt into them so customer images emit 0 bytes of Sentry/rrweb and Sentry-only
+// builds emit 0 bytes of rrweb. Applied to `build` only so Vitest tests load
+// the real modules.
+const VIRTUAL_SENTRY_STUB = '\0nano-sentry-disabled';
+const VIRTUAL_SENTRY_REPLAY_STUB = '\0nano-sentry-replay-disabled';
+
+function sentryBuildStubPlugin(sentryEnabled: boolean, replayEnabled: boolean): Plugin {
+  const errorTrackingPrefix = path.resolve(__dirname, 'src/lib/error-tracking') + path.sep;
+  return {
+    name: 'nano-sentry-build-stub',
+    apply: 'build',
+    enforce: 'pre',
+    resolveId(source, importer) {
+      if (!importer || !importer.startsWith(errorTrackingPrefix)) return null;
+      if (!sentryEnabled && (source === './sentry' || source === './sentry.ts')) {
+        return VIRTUAL_SENTRY_STUB;
+      }
+      if (!replayEnabled && (source === './sentry-replay' || source === './sentry-replay.ts')) {
+        return VIRTUAL_SENTRY_REPLAY_STUB;
+      }
+      return null;
+    },
+    load(id) {
+      if (id === VIRTUAL_SENTRY_STUB) {
+        return 'export function initSentry() {}\n';
+      }
+      if (id === VIRTUAL_SENTRY_REPLAY_STUB) {
+        return 'export function attachReplayIntegration() {}\n';
+      }
+      return null;
     },
   };
 }
@@ -115,11 +150,18 @@ export default defineConfig(({ mode }) => {
   // connect-src; NANO_SENTRY_SOURCEMAPS=1 emits HIDDEN source maps (no
   // sourceMappingURL) that scripts/sentry-sourcemaps.sh uploads and then
   // removes from the output, so .map files are never served.
+  const sentryEnabled = Boolean((env.VITE_NANO_SENTRY_DSN ?? '').trim());
+  const replayEnabled = isSentryReplayBuildEnabled(env);
   const sentryOrigins = sentryConnectOrigin(env.VITE_NANO_SENTRY_DSN);
   const hiddenSourcemaps = env.NANO_SENTRY_SOURCEMAPS === '1';
 
   return {
-  plugins: [cspPlugin(sentryOrigins), tailwindcss(), react(), {
+  plugins: [
+    sentryBuildStubPlugin(sentryEnabled, replayEnabled),
+    cspPlugin(sentryOrigins, replayEnabled),
+    tailwindcss(),
+    react(),
+    {
     name: 'build-id',
     apply: 'build',
     transformIndexHtml: {

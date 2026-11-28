@@ -79,10 +79,10 @@ control the system). Revoking a sender removes only its anchor; Vector has no
 CRL support, so the listener restarts to apply it. Firewall it to your
 aggregators as well.
 
-`docker-compose.opensource.yml` also publishes `4317`/`4318` (OpenTelemetry) and
-`24224` (Fluent Forward), but the shipped config defines **no source on those
-ports** — nothing listens there until you add one. If you do enable an OTel or
-Fluent source, it won't carry built-in auth either, so firewall it the same way.
+`docker-compose.opensource.yml` also publishes the raw OpenTelemetry ports
+`4317`/`4318` on `127.0.0.1` only. They check no token, so if you open them to
+other hosts (`NANO_OTLP_BIND_ADDRESS`), firewall them the same way. nano has no
+Fluent Forward listener: Fluentd and Fluent Bit send over HTTP, HEC or OTLP.
 
 ### Recommended firewall posture for a public deployment
 

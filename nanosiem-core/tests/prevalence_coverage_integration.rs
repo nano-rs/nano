@@ -44,18 +44,17 @@ async fn log_at(client: &clickhouse::Client, hours_ago: u64) {
 #[tokio::test]
 #[ignore = "requires NANOSIEM_TEST_CLICKHOUSE_URL pointing at a disposable migrated ClickHouse"]
 async fn misses_are_unknown_until_prevalence_covers_the_window() {
-    let url = std::env::var("NANOSIEM_TEST_CLICKHOUSE_URL")
-        .expect("NANOSIEM_TEST_CLICKHOUSE_URL must target a disposable ClickHouse");
+    let url = nanosiem_test_db::require_ch_url();
     // Uncompressed: some disposable server builds answer the client's LZ4
     // request with an unframed body ("incorrect magic number").
     let mut client = clickhouse::Client::default()
         .with_url(url)
         .with_database("nanosiem")
         .with_compression(clickhouse::Compression::None);
-    if let Ok(user) = std::env::var("NANOSIEM_TEST_CLICKHOUSE_USER") {
+    if let Some(user) = nanosiem_test_db::ch_user() {
         client = client.with_user(user);
     }
-    if let Ok(password) = std::env::var("NANOSIEM_TEST_CLICKHOUSE_PASSWORD") {
+    if let Some(password) = nanosiem_test_db::ch_password() {
         client = client.with_password(password);
     }
     for table in [
@@ -168,16 +167,15 @@ async fn misses_are_unknown_until_prevalence_covers_the_window() {
 }
 
 async fn client_from_env() -> clickhouse::Client {
-    let url = std::env::var("NANOSIEM_TEST_CLICKHOUSE_URL")
-        .expect("NANOSIEM_TEST_CLICKHOUSE_URL must target a disposable ClickHouse");
+    let url = nanosiem_test_db::require_ch_url();
     let mut client = clickhouse::Client::default()
         .with_url(url)
         .with_database("nanosiem")
         .with_compression(clickhouse::Compression::None);
-    if let Ok(user) = std::env::var("NANOSIEM_TEST_CLICKHOUSE_USER") {
+    if let Some(user) = nanosiem_test_db::ch_user() {
         client = client.with_user(user);
     }
-    if let Ok(password) = std::env::var("NANOSIEM_TEST_CLICKHOUSE_PASSWORD") {
+    if let Some(password) = nanosiem_test_db::ch_password() {
         client = client.with_password(password);
     }
     for table in [

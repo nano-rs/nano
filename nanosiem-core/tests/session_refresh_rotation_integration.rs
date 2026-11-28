@@ -35,7 +35,7 @@ async fn create_user(pool: &PgPool) -> Uuid {
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn concurrent_rotation_mints_exactly_one_winner() {
     let pool = common::migrated_pool().await;
     let repo = SessionRepository::new(pool.clone());
@@ -84,7 +84,7 @@ async fn concurrent_rotation_mints_exactly_one_winner() {
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn replay_of_rotated_token_is_rejected() {
     let pool = common::migrated_pool().await;
     let repo = SessionRepository::new(pool.clone());

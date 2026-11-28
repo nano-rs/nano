@@ -37,13 +37,13 @@ use nanosiem_core::schema::{SchemaProfile, UdmProfile};
 const CONTRACT_CUTOFF_UTC: &str = "2026-06-13 00:00:00";
 
 fn ch_url() -> String {
-    std::env::var("CLICKHOUSE_TEST_URL").unwrap_or_else(|_| "http://localhost:8123".into())
+    nanosiem_test_db::require_ch_url()
 }
 fn ch_user() -> String {
-    std::env::var("CLICKHOUSE_TEST_USER").unwrap_or_else(|_| "nanosiem".into())
+    nanosiem_test_db::ch_user().unwrap_or_else(|| "nanosiem".into())
 }
 fn ch_pass() -> String {
-    std::env::var("CLICKHOUSE_TEST_PASSWORD").unwrap_or_else(|_| "nanosiem".into())
+    nanosiem_test_db::ch_password().unwrap_or_else(|| "nanosiem".into())
 }
 fn ch_db() -> String {
     std::env::var("CLICKHOUSE_TEST_DB").unwrap_or_else(|_| "nanosiem".into())

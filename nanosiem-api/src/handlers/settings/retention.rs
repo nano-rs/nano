@@ -494,7 +494,13 @@ pub async fn update_clickhouse_retention(
 ///
 /// POST /api/settings/storage/clickhouse/retention/run
 ///
-/// Forces ClickHouse to materialize TTL and drop expired parts.
+/// Makes ClickHouse re-check every stored part against the current retention.
+/// The check itself is quick: it updates each part's expiry date and does not
+/// rewrite the data (NAN-5907). Parts in which every event is past the
+/// retention are then deleted by ClickHouse in the background, usually within
+/// minutes (at most a few hours). A part that still holds some newer events is kept until all of
+/// them are past the retention. So `rows_deleted` counts only what was gone
+/// when the call returned and is often 0; the space frees up as those deletes finish.
 /// NAN-5450: answers 503 with recovery steps when ClickHouse has no disk
 /// space to run it, instead of a generic storage error.
 #[utoipa::path(
@@ -502,7 +508,7 @@ pub async fn update_clickhouse_retention(
     path = "/api/settings/storage/clickhouse/retention/run",
     tag = "settings",
     responses(
-        (status = 200, description = "Retention job completed", body = serde_json::Value),
+        (status = 200, description = "Expiry dates updated. `rows_deleted` counts rows already gone when the call returned and is often 0: expired parts are deleted in the background afterwards", body = serde_json::Value),
         (status = 400, description = "ClickHouse not enabled", body = ErrorResponse),
         (status = 403, description = "Missing permission", body = ErrorResponse),
         (status = 500, description = "Internal error", body = ErrorResponse),

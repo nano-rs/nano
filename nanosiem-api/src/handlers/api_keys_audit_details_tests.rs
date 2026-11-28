@@ -36,6 +36,7 @@ fn created_details_list_the_granted_scopes_sorted() {
         permissions: vec!["search:execute".into(), "alerts:view".into(), "rules:view".into(), "cases:view".into()],
         expires_at: None,
         rate_limit: Some(100),
+        preset: None,
     });
     assert_eq!(d["permissions"], json!(["alerts:view", "cases:view", "rules:view", "search:execute"]));
     assert_eq!(d["rate_limit"], json!(100));

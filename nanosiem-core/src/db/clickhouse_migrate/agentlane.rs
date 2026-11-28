@@ -495,6 +495,12 @@ pub(super) fn profile_settings_sql_for(caps: &AgentlaneSettings, workload: &str)
         "skip_unavailable_shards = 0 CONST".into(),
         "serialize_query_plan = 0 CONST".into(),
         "distributed_product_mode = 'global' CONST".into(),
+        // NAN-5909: the same 30 s replica-lag cap as the app's profiles
+        // (clickhouse/users.d/query_limits.xml): a Distributed read skips a
+        // replica more than 30 s behind when a fresher one exists, and still
+        // answers from the freshest one when all are behind.
+        "max_replica_delay_for_distributed_queries = 30 CONST".into(),
+        "fallback_to_stale_replicas_for_distributed_queries = 1 CONST".into(),
         format!("workload = '{workload}' CONST"),
         format!(
             "max_execution_time = {MAX_EXECUTION_TIME_SECS} MIN 1 MAX {MAX_EXECUTION_TIME_SECS} \

@@ -24,10 +24,23 @@ async fn rollup_matches_raw_logs_for_inserted_rows() {
         println!("Skipping (SKIP_DB_TESTS is set)");
         return;
     }
+    // NAN-5964: no localhost default. Skip unless both URLs name a stack.
+    let (pg_url, ch_url) = match nanosiem_test_db::pg_and_ch_urls() {
+        Ok(urls) => urls,
+        Err(unset) => {
+            eprintln!("Skipping: {unset}");
+            return;
+        }
+    };
+    // It inserts rows and runs ALTER TABLE ... DELETE, so it also needs the opt-in.
+    if !matches!(std::env::var("NANOSIEM_ALLOW_DESTRUCTIVE_TESTS").as_deref(), Ok("1" | "true")) {
+        eprintln!("Skipping: set NANOSIEM_ALLOW_DESTRUCTIVE_TESTS=1 to run this write test");
+        return;
+    }
 
     let config = DualPoolConfig::with_auth(
-        "postgres://nanosiem:nanosiem@localhost:5432/nanosiem",
-        "http://localhost:8123",
+        pg_url,
+        ch_url,
         "nanosiem",
         "nanosiem",
         "nanosiem",

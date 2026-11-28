@@ -1480,9 +1480,11 @@ write_stack_env() {
             put NANOSIEM_ENCRYPTION_KEY "$(env_get "$c" NANOSIEM_ENCRYPTION_KEY)"
             put VECTOR_AUTH_TOKEN "$(env_get "$c" VECTOR_AUTH_TOKEN)"
             # ClickHouse (every legacy spelling)
-            for k in NANOSIEM_TEST_CLICKHOUSE_URL CLICKHOUSE_TEST_URL CLICKHOUSE_URL SOAR_TEST_CLICKHOUSE_URL MIGRATOR_BOOTSTRAP_CH_URL; do
+            for k in NANOSIEM_TEST_CLICKHOUSE_URL CLICKHOUSE_TEST_URL CLICKHOUSE_URL SOAR_TEST_CLICKHOUSE_URL MIGRATOR_BOOTSTRAP_CH_TEST_URL; do
                 put "$k" "$churl"
             done
+            # soar_p3 acceptance: its own *_TEST_URL (needs the migrated schema).
+            put SOAR_CLICKHOUSE_TEST_URL "$churl"
             for k in NANOSIEM_TEST_CLICKHOUSE_USER CLICKHOUSE_USER CLICKHOUSE_TEST_USER; do put "$k" nanosiem; done
             for k in NANOSIEM_TEST_CLICKHOUSE_PASSWORD CLICKHOUSE_PASSWORD CLICKHOUSE_TEST_PASSWORD SOAR_TEST_CLICKHOUSE_PASSWORD; do
                 put "$k" "$chpw"
@@ -1659,8 +1661,11 @@ suite_paths() {
             personas)
                 out+=("$PY_DIR/tests/personas")
                 # Enterprise journeys (the threat hunter) live under
-                # tests/enterprise/ (the mirror strips it).
-                [[ -d "$PY_DIR/tests/enterprise/personas" ]] && out+=("$PY_DIR/tests/enterprise/personas") ;;
+                # tests/enterprise/ (the mirror strips it). Enterprise runs
+                # only: on open every one skips, and the zero-scenario gate
+                # failed open lanes with no test failures (NAN-5970).
+                [[ "$EDITION" == enterprise && -d "$PY_DIR/tests/enterprise/personas" ]] \
+                    && out+=("$PY_DIR/tests/enterprise/personas") ;;
             security_group_d)
                 out+=("$PY_DIR/tests/test_security_group_d.py")
                 # Scenario 9 (SSO link) is enterprise-only and lives under

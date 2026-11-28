@@ -74,7 +74,7 @@ async fn session_ids(pool: &PgPool, user: Uuid) -> Vec<Uuid> {
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn logging_out_one_session_leaves_the_other_signed_in() {
     let pool = common::migrated_pool().await;
     let auth = auth_service(&pool);
@@ -102,7 +102,7 @@ async fn logging_out_one_session_leaves_the_other_signed_in() {
         Err(AuthError::SessionNotFound)
     ));
     let refreshed = auth.refresh_token(&phone.refresh_token, None, None).await.unwrap();
-    assert!(refreshed.rotated);
+    assert_eq!(refreshed.kind, nanosiem_core::auth::RefreshKind::Rotated);
     // Refreshing keeps the access token bound to the same session.
     assert_eq!(claims(&refreshed.tokens).sid, Some(phone_sid));
 
@@ -116,7 +116,7 @@ async fn logging_out_one_session_leaves_the_other_signed_in() {
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn legacy_token_without_sid_falls_back_to_its_refresh_token_only() {
     let pool = common::migrated_pool().await;
     let auth = auth_service(&pool);
@@ -138,7 +138,7 @@ async fn legacy_token_without_sid_falls_back_to_its_refresh_token_only() {
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn legacy_fallback_ends_the_session_of_an_already_rotated_refresh_token() {
     let pool = common::migrated_pool().await;
     let auth = auth_service(&pool);
@@ -151,7 +151,7 @@ async fn legacy_fallback_ends_the_session_of_an_already_rotated_refresh_token() 
     // R0 was rotated to R1 (another tab, or a thief who refreshed first).
     let r0 = laptop.refresh_token.clone();
     let rotated = auth.refresh_token(&r0, None, None).await.unwrap();
-    assert!(rotated.rotated);
+    assert_eq!(rotated.kind, nanosiem_core::auth::RefreshKind::Rotated);
     let r1 = rotated.tokens.refresh_token.clone();
 
     // Logging out with the stale R0 still ends the whole session (R1 too).
@@ -163,7 +163,7 @@ async fn legacy_fallback_ends_the_session_of_an_already_rotated_refresh_token() 
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn legacy_token_with_nothing_to_identify_its_session_ends_nothing() {
     let pool = common::migrated_pool().await;
     let auth = auth_service(&pool);
@@ -188,12 +188,12 @@ async fn legacy_token_with_nothing_to_identify_its_session_ends_nothing() {
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn a_database_error_is_returned_not_swallowed() {
     let pool = common::migrated_pool().await;
     let u = user(&pool).await;
     // A service on its own pool that we then close: every query fails.
-    let broken = PgPool::connect(&std::env::var("DATABASE_URL").unwrap()).await.unwrap();
+    let broken = PgPool::connect(&nanosiem_test_db::require_pg_url()).await.unwrap();
     let auth = auth_service(&broken);
     broken.close().await;
     for (sid, refresh) in [(Some(Uuid::now_v7()), None), (None, Some("r"))] {
@@ -205,7 +205,7 @@ async fn a_database_error_is_returned_not_swallowed() {
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn logout_never_ends_another_users_session() {
     let pool = common::migrated_pool().await;
     let auth = auth_service(&pool);
@@ -229,7 +229,7 @@ async fn logout_never_ends_another_users_session() {
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn my_sessions_marks_exactly_the_callers_session_as_current() {
     let pool = common::migrated_pool().await;
     let auth = auth_service(&pool);
@@ -264,7 +264,7 @@ async fn my_sessions_marks_exactly_the_callers_session_as_current() {
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn password_login_binds_the_access_token_to_its_session() {
     let pool = common::migrated_pool().await;
     let auth = auth_service(&pool);

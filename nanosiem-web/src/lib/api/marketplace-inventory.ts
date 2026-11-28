@@ -204,12 +204,14 @@ export function applyFeedBundle(items: InventoryItem[], status: PlatformFeedsSta
   return changed ? next : items;
 }
 
-const FIRST_PARTY_OWNERS = ['nano-rs', 'nanos-sh'];
+// NAN-5954: only nano-rs. The old `nanos-sh` org is unregistered on GitHub
+// (anyone could claim it), so it is third-party.
+const FIRST_PARTY_OWNERS = ['nano-rs'];
 
 /**
  * First-party content repositories: exact parse, mirroring the server's
- * `marketplace::first_party` rule (https, host github.com, owner nano-rs /
- * nanos-sh, one repository segment, no credentials, query or fragment).
+ * `marketplace::first_party` rule (https, host github.com, owner nano-rs,
+ * one repository segment, no credentials, query or fragment).
  * Missing or unparseable metadata is NOT first-party.
  */
 export function isFirstPartyRepo(repo: Pick<EnrichmentMarketplaceRepo, 'url'> | null | undefined): boolean {

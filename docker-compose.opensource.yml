@@ -99,6 +99,12 @@ x-nano-egress-env: &nano-egress-env
 # change of any part recreates the Vector container.
 x-nano-vector-render-env: &nano-vector-render-env
   VECTOR_FANIN_SLOTS: ${VECTOR_FANIN_SLOTS:-off}
+  # NAN-5948: lets a Vector with no nano release label (an upstream or custom
+  # build) install this release's Vector config. Off by default: such a build
+  # does not mark HEC event kinds, so HEC events are handled the legacy way.
+  # Only "true" turns it on (same as Helm vector.allowCustomVector); SIEM
+  # Health reports it while it is on. See docs/configuration/vector.md.
+  NANO_ALLOW_CUSTOM_VECTOR: ${NANO_ALLOW_CUSTOM_VECTOR:-false}
   NANO_INGEST_ACK_DURABILITY: ${NANO_INGEST_ACK_DURABILITY:-fsync}
   NANO_PIPELINE_IDENTITY: ${NANO_VERSION:?NANO_VERSION is required}/${NANO_INGEST_ACK_DURABILITY:-fsync}/${VECTOR_FANIN_SLOTS:-off}
 
@@ -657,8 +663,6 @@ services:
       # the authenticated nginx edge.
       - "${NANO_OTLP_BIND_ADDRESS:-127.0.0.1}:4317:4317"
       - "${NANO_OTLP_BIND_ADDRESS:-127.0.0.1}:4318:4318"
-      # Fluent Forward is unauthenticated unless a user-added source gates it.
-      - "${NANO_FLUENT_BIND_ADDRESS:-127.0.0.1}:24224:24224"
 
   vector:
     # Digest-pinned — see the note on the postgres service (NAN-1258).
@@ -1012,6 +1016,10 @@ services:
     image: ${NANO_IMAGE_PREFIX:-ghcr.io/nano-rs/nano}-jobs:${NANO_VERSION:?NANO_VERSION is required (install.sh sets it from the images lock)}
     container_name: nano-jobs
     restart: unless-stopped
+    # NAN-6046: the jobs shutdown drains running detection rules for up to
+    # 30 s, then releases their claims. Docker's default 10 s killed it first
+    # and the next start read each running rule as a crash ("[crash?]").
+    stop_grace_period: 45s
     logging: *verbose-logging
     security_opt:
       - no-new-privileges:true

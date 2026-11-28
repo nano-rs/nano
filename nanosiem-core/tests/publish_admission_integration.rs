@@ -18,8 +18,8 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 async fn ctx() -> (PgPool, LogSourceService, TempDir) {
-    let url = std::env::var("NANOSIEM_TEST_DATABASE_URL").expect("NANOSIEM_TEST_DATABASE_URL");
-    let ch = std::env::var("NANOSIEM_TEST_CLICKHOUSE_URL").expect("NANOSIEM_TEST_CLICKHOUSE_URL");
+    let url = nanosiem_test_db::require_pg_url();
+    let ch = nanosiem_test_db::require_ch_url();
     assert_eq!(std::env::var("NANOSIEM_ALLOW_DESTRUCTIVE_TESTS").as_deref(), Ok("1"));
     let mut config = DualPoolConfig::with_auth(url, ch, "nanosiem", "default", "");
     config.clickhouse_rawsql_password = Some("unused".into());

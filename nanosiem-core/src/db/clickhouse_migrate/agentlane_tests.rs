@@ -79,6 +79,8 @@ fn profile_pins_every_lockdown_setting_and_cap() {
         "skip_unavailable_shards = 0 CONST",
         "serialize_query_plan = 0 CONST",
         "distributed_product_mode = 'global' CONST",
+        "max_replica_delay_for_distributed_queries = 30 CONST",
+        "fallback_to_stale_replicas_for_distributed_queries = 1 CONST",
         "workload = 'agentlane' CONST",
         "max_execution_time = 60 MIN 1 MAX 60 CHANGEABLE_IN_READONLY",
         "max_result_rows = 100000 MAX 100000 CHANGEABLE_IN_READONLY",

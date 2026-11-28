@@ -17,7 +17,7 @@ mod common;
 use nanosiem_core::db::repository::AlertRepository;
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn list_does_not_error_on_null_rule_id() {
     let pool = common::migrated_pool().await;
 

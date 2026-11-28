@@ -20,6 +20,7 @@
 //! - AI-powered agent enrichment for alert triage
 //! - Unified audit logging to ClickHouse
 
+pub mod ai_model_retirement;
 pub mod ai_provider;
 pub mod ai_provider_safety;
 // Air-gapped signed bundle format + Ed25519 verification (NAN-1201) — enterprise

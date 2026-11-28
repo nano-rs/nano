@@ -12,9 +12,12 @@ use url::Url;
 
 use super::MarketplaceError;
 
-/// GitHub organizations that publish nano's first-party catalogs. `nanos-sh`
-/// is the pre-rename organization (migration 178 moved rows to `nano-rs`).
-pub const FIRST_PARTY_OWNERS: &[&str] = &["nano-rs", "nanos-sh"];
+/// GitHub organizations that publish nano's first-party catalogs.
+///
+/// NAN-5954: the pre-rename organization `nanos-sh` is NOT first-party. It is
+/// unregistered on GitHub, so anyone could claim it. Stored legacy URLs were
+/// rewritten to `nano-rs` by PG migrations 178 and 403; never re-add it here.
+pub const FIRST_PARTY_OWNERS: &[&str] = &["nano-rs"];
 const FIRST_PARTY_HOST: &str = "github.com";
 
 /// Why a repository URL is not an acceptable first-party catalog URL.

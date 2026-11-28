@@ -227,6 +227,18 @@ impl ContentApplier for AppContentApplier {
                 Err(error) => Err(error.to_string()),
             };
         }
+        // NAN-5956: the model catalog has no repository rows to mark. Apply
+        // it straight from the installed snapshot, so an air-gapped import
+        // (no model catalog scheduler runs there) and an online update reach
+        // the model list at once instead of on the next daily sync. Only
+        // Paid builds subscribe to `models.main`.
+        #[cfg(feature = "enterprise")]
+        if channel.kind == Kind::ModelCatalog {
+            return nanosiem_enterprise::melod::ModelCatalogSyncService::new(self.state.pool.clone())
+                .apply_installed_channel(tree_changed)
+                .await
+                .map_err(|e| e.to_string());
+        }
         // NAN-4955: an air-gapped install never ran the first-party catalog
         // reconcile (it lives in the egress schedulers, which do not start
         // there). Now that those rows read installed snapshots instead of

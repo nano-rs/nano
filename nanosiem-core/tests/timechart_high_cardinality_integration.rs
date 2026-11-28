@@ -53,13 +53,17 @@ async fn high_cardinality_timechart_returns_via_preselected_bounded_plans() {
 
     let restore = EnvRestore(std::env::var_os("CLICKHOUSE_QUERY_MAX_MEMORY_BYTES"));
     std::env::set_var("CLICKHOUSE_QUERY_MAX_MEMORY_BYTES", MEMORY_LIMIT);
-    let config = match DualPoolConfig::from_env() {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!("Skipping: database test environment is incomplete ({error})");
-            return;
-        }
+    // NAN-5964: test ClickHouse comes from CLICKHOUSE_TEST_URL, never
+    // CLICKHOUSE_URL (a developer's shell may export the local stack).
+    let Ok(ch_url) = nanosiem_test_db::ch_url() else {
+        eprintln!("Skipping: CLICKHOUSE_TEST_URL is not set");
+        return;
     };
+    let Ok(pg_url) = nanosiem_test_db::pg_url() else {
+        eprintln!("Skipping: NANOSIEM_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let config = DualPoolConfig::from_env_with_urls(pg_url, ch_url);
     let pool = match DualPool::new(&config).await {
         Ok(pool) => pool,
         Err(error) => {

@@ -32,7 +32,7 @@ async fn scratch_db() -> (PgPool, PgPool, String) {
         .execute(&admin)
         .await
         .expect("create scratch database");
-    let base = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+    let base = nanosiem_test_db::require_pg_url();
     let (head, query) = match base.split_once('?') {
         Some((h, q)) => (h.to_string(), format!("?{q}")),
         None => (base.clone(), String::new()),
@@ -88,7 +88,7 @@ async fn admin_role_holders(pool: &PgPool) -> i64 {
 }
 
 #[tokio::test]
-#[ignore = "needs a disposable Postgres (DATABASE_URL + NANOSIEM_ALLOW_DESTRUCTIVE_TESTS=1)"]
+#[ignore = "needs a disposable Postgres (NANOSIEM_TEST_DATABASE_URL + NANOSIEM_ALLOW_DESTRUCTIVE_TESTS=1)"]
 async fn concurrent_initialize_creates_exactly_one_admin() {
     let (admin, pool, name) = scratch_db().await;
 
@@ -124,7 +124,7 @@ async fn concurrent_initialize_creates_exactly_one_admin() {
 }
 
 #[tokio::test]
-#[ignore = "needs a disposable Postgres (DATABASE_URL + NANOSIEM_ALLOW_DESTRUCTIVE_TESTS=1)"]
+#[ignore = "needs a disposable Postgres (NANOSIEM_TEST_DATABASE_URL + NANOSIEM_ALLOW_DESTRUCTIVE_TESTS=1)"]
 async fn already_initialized_is_refused() {
     let (admin, pool, name) = scratch_db().await;
 
@@ -139,7 +139,7 @@ async fn already_initialized_is_refused() {
 }
 
 #[tokio::test]
-#[ignore = "needs a disposable Postgres (DATABASE_URL + NANOSIEM_ALLOW_DESTRUCTIVE_TESTS=1)"]
+#[ignore = "needs a disposable Postgres (NANOSIEM_TEST_DATABASE_URL + NANOSIEM_ALLOW_DESTRUCTIVE_TESTS=1)"]
 async fn existing_users_are_refused() {
     let (admin, pool, name) = scratch_db().await;
     sqlx::query(
@@ -160,7 +160,7 @@ async fn existing_users_are_refused() {
 }
 
 #[tokio::test]
-#[ignore = "needs a disposable Postgres (DATABASE_URL + NANOSIEM_ALLOW_DESTRUCTIVE_TESTS=1)"]
+#[ignore = "needs a disposable Postgres (NANOSIEM_TEST_DATABASE_URL + NANOSIEM_ALLOW_DESTRUCTIVE_TESTS=1)"]
 async fn failed_claim_leaves_nothing_behind() {
     let (admin, pool, name) = scratch_db().await;
 

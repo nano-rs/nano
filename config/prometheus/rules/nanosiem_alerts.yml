@@ -207,6 +207,109 @@ groups:
           summary: "Keeper on {{ $labels.host }} is down"
           description: "With three Keepers, one may be lost. With one, every replicated table goes read-only."
 
+      # NAN-5914: ClickHouse lost its Keeper session. Single-node installs run
+      # without Keeper and always report 0, so the rule needs evidence from
+      # the SAME server that it uses Keeper: a session within the last day,
+      # or replicated tables gone read-only (which also covers a server that
+      # never connected, an outage longer than a day, and a Prometheus
+      # restart that lost the history). All three series come from one
+      # scrape, so they match on every label (no on()): two installs in a
+      # shared Prometheus that differ only in cluster, namespace or another
+      # label never vouch for each other.
+      - alert: NanoClickHouseKeeperSessionLost
+        expr: |
+          ClickHouseMetrics_ZooKeeperSession{job="clickhouse"} < 1
+          and (
+            max_over_time(ClickHouseMetrics_ZooKeeperSession{job="clickhouse"}[1d]) > 0
+            or ClickHouseMetrics_ReadonlyReplica{job="clickhouse"} > 0
+          )
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "ClickHouse on {{ $labels.host }} has no Keeper session"
+          description: "Replicated tables go read-only and inserts to them fail until it reconnects. Check that Keeper is up and reachable from this host."
+
+      # NAN-5914: a mutation (ALTER ... DELETE/UPDATE) left parts unfinished
+      # for longer than max_pending_mutations_execution_time_to_warn (1 hour,
+      # clickhouse/config.d/mergetree.xml). ClickHouse refreshes the count
+      # every few minutes. A stuck mutation holds merge slots and can block
+      # later ones on the same table.
+      - alert: NanoClickHouseMutationStuck
+        expr: ClickHouseAsyncMetrics_NumberOfPendingMutationsOverExecutionTime{job="clickhouse"} > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "ClickHouse on {{ $labels.host }} has {{ $value }} mutation(s) running for over an hour"
+          description: "Find them with SELECT database, table, mutation_id, command, create_time, latest_fail_reason FROM system.mutations WHERE NOT is_done. Fix the failure reason, or KILL MUTATION if it is no longer needed."
+
+      # NAN-5914: ClickHouse refused inserts (too many parts in a partition).
+      # Vector retries, but its buffer fills and senders get back-pressure.
+      - alert: NanoClickHouseInsertsRejected
+        expr: increase(ClickHouseProfileEvents_RejectedInserts{job="clickhouse"}[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "ClickHouse on {{ $labels.host }} rejected {{ $value | humanize }} insert(s) in 5 minutes"
+          description: "A partition has too many parts and merges are not keeping up. Check NanoClickHouseTooManyParts, disk speed and the merge pool."
+
+      # NAN-5914: ClickHouse is slowing inserts down on purpose (parts_to_delay_insert),
+      # the step before it rejects them.
+      - alert: NanoClickHouseInsertsDelayed
+        expr: rate(ClickHouseProfileEvents_DelayedInserts{job="clickhouse"}[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "ClickHouse on {{ $labels.host }} has been delaying inserts for 10 minutes"
+          description: "Merges are falling behind the insert rate. If it continues, ClickHouse starts rejecting inserts."
+
+      # NAN-5914: tracked memory near the server limit. ClickHouse does not
+      # export that limit; it is max_server_memory_usage_to_ram_ratio of the
+      # container (cgroup) memory, or of the host memory without a container
+      # limit. A cgroup v1 host without a limit reports a huge sentinel
+      # (about 8 EiB) as CGroupMemoryTotal, so a cgroup total that is not
+      # below the host's memory counts as "no limit". Resource sizing sets
+      # the ratio to 0.99 on ClickHouse containers of 2 GiB or less (they
+      # idle at 70-80 %) and 0.8 above: the rule fires at 90 % of the total
+      # on those small containers (about 91 % of their limit) and at 75 %
+      # elsewhere (about 94 % of the 0.8 limit). Past the limit, queries and
+      # inserts fail with error 241.
+      - alert: NanoClickHouseMemoryNearLimit
+        expr: |
+          (
+            ClickHouseMetrics_MemoryTracking{job="clickhouse"}
+            / (
+              (ClickHouseAsyncMetrics_CGroupMemoryTotal{job="clickhouse"} > 0 < ClickHouseAsyncMetrics_OSMemoryTotal{job="clickhouse"})
+              or ClickHouseAsyncMetrics_OSMemoryTotal{job="clickhouse"}
+            )
+            > 0.90
+          )
+          or
+          (
+            ClickHouseMetrics_MemoryTracking{job="clickhouse"}
+            / (
+              (ClickHouseAsyncMetrics_CGroupMemoryTotal{job="clickhouse"} > 0 < ClickHouseAsyncMetrics_OSMemoryTotal{job="clickhouse"})
+              or ClickHouseAsyncMetrics_OSMemoryTotal{job="clickhouse"}
+            )
+            > 0.75
+            and (
+              (
+                (ClickHouseAsyncMetrics_CGroupMemoryTotal{job="clickhouse"} > 0 < ClickHouseAsyncMetrics_OSMemoryTotal{job="clickhouse"})
+                or ClickHouseAsyncMetrics_OSMemoryTotal{job="clickhouse"}
+              )
+              > 2147483648
+            )
+          )
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "ClickHouse on {{ $labels.host }} is using {{ $value | humanizePercentage }} of its memory"
+          description: "Queries and inserts start failing with error 241 (memory limit exceeded) at the server limit. Look for heavy searches in system.processes, or give ClickHouse more memory."
+
   - name: nano_postgres
     rules:
       - alert: NanoPostgresNoPrimary

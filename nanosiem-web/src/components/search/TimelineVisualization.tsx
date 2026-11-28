@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import { memo, useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
@@ -479,7 +479,7 @@ interface TimelineVisualizationProps {
   };
 }
 
-export function TimelineVisualization({
+function TimelineVisualizationImpl({
   timelineData,
   eventCount,
   collapsed,
@@ -869,6 +869,26 @@ export function TimelineVisualization({
   const tooltipContent = useMemo(
     () => <HistogramTooltip bucketInterval={bucketInterval} formatTime={formatTooltipTime} />,
     [bucketInterval, formatTooltipTime],
+  );
+
+  // NAN-5950: recharts' ReferenceArea re-registers itself in the chart store
+  // (removeArea + addArea) on EVERY render it gets. Built once per data / drag
+  // change, the same elements are reused and React skips re-rendering them.
+  const partialSpanAreas = useMemo(
+    () =>
+      plotData
+        .filter(p => p.partialSpan)
+        .map(p => (
+          <ReferenceArea key={p.timestamp} x1={p.partialSpan![0]} x2={p.partialSpan![1]} strokeOpacity={0} fill="var(--primary)" fillOpacity={0.06} />
+        )),
+    [plotData],
+  );
+  const dragArea = useMemo(
+    () =>
+      !staticMode && refArea ? (
+        <ReferenceArea x1={refArea[0]} x2={refArea[1]} strokeOpacity={0.3} fill="var(--primary)" fillOpacity={0.2} />
+      ) : null,
+    [staticMode, refArea],
   );
 
   // Helper: build scatter points from per-event artifact occurrences.
@@ -1359,10 +1379,8 @@ export function TimelineVisualization({
                       <YAxis stroke={CHART_AXIS_LINE} fontSize={10} tickLine={false} axisLine={false} width={55} tickFormatter={formatYAxisTick} tick={AXIS_TICK} />
                       <Tooltip content={tooltipContent} cursor={BAR_TOOLTIP_CURSOR} />
                       <Bar dataKey="events" fill="var(--primary)" radius={0} minPointSize={2} />
-                      {plotData.filter(p => p.partialSpan).map(p => (
-                        <ReferenceArea key={p.timestamp} x1={p.partialSpan![0]} x2={p.partialSpan![1]} strokeOpacity={0} fill="var(--primary)" fillOpacity={0.06} />
-                      ))}
-                      {!staticMode && refArea && <ReferenceArea x1={refArea[0]} x2={refArea[1]} strokeOpacity={0.3} fill="var(--primary)" fillOpacity={0.2} />}
+                      {partialSpanAreas}
+                      {dragArea}
                     </BarChart>
                   ) : chartType === 'line' ? (
                     <LineChart
@@ -1381,7 +1399,7 @@ export function TimelineVisualization({
                       <Line type="linear" dataKey="solid" stroke="var(--primary)" strokeWidth={2} dot={renderLineDot} activeDot={LINE_ACTIVE_DOT} />
                       <Line type="linear" dataKey="leadingPartial" stroke="var(--primary)" strokeOpacity={0.5} strokeDasharray="3 3" strokeWidth={2} dot={renderLineDot} activeDot={LINE_ACTIVE_DOT} />
                       <Line type="linear" dataKey="trailingPartial" stroke="var(--primary)" strokeOpacity={0.5} strokeDasharray="3 3" strokeWidth={2} dot={renderLineDot} activeDot={LINE_ACTIVE_DOT} />
-                      {!staticMode && refArea && <ReferenceArea x1={refArea[0]} x2={refArea[1]} strokeOpacity={0.3} fill="var(--primary)" fillOpacity={0.2} />}
+                      {dragArea}
                     </LineChart>
                   ) : (
                     <AreaChart
@@ -1400,7 +1418,7 @@ export function TimelineVisualization({
                       <Area type="linear" dataKey="solid" stroke="var(--primary)" strokeWidth={2} fill="var(--primary)" fillOpacity={0.2} />
                       <Area type="linear" dataKey="leadingPartial" stroke="var(--primary)" strokeWidth={2} strokeOpacity={0.5} strokeDasharray="3 3" fill="var(--primary)" fillOpacity={0.07} />
                       <Area type="linear" dataKey="trailingPartial" stroke="var(--primary)" strokeWidth={2} strokeOpacity={0.5} strokeDasharray="3 3" fill="var(--primary)" fillOpacity={0.07} />
-                      {!staticMode && refArea && <ReferenceArea x1={refArea[0]} x2={refArea[1]} strokeOpacity={0.3} fill="var(--primary)" fillOpacity={0.2} />}
+                      {dragArea}
                     </AreaChart>
                   )}
                 </ResponsiveContainer>
@@ -1452,3 +1470,10 @@ export function TimelineVisualization({
     </Card>
   );
 }
+
+// NAN-5950 (Sentry NANO-FRONTEND-3): memoized so a Search page re-render
+// that changes none of its props (every keystroke in the query editor) does
+// not re-render the chart. Search.tsx passes only stable props. The crash was
+// "Maximum update depth exceeded", thrown from recharts' animation frame
+// while the analyst typed during the bar animation.
+export const TimelineVisualization = memo(TimelineVisualizationImpl);

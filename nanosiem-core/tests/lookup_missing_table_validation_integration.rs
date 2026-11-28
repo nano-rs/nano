@@ -26,7 +26,7 @@ fn lookup_cmd(table: &str) -> LookupCommandInfo {
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn missing_lookup_table_is_rejected_with_actionable_message() {
     let pool = common::migrated_pool().await;
     let service = LookupService::new(LookupRepository::new(pool.clone()));

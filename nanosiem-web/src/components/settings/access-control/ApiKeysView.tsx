@@ -56,6 +56,7 @@ import { CreateApiKeyDialog } from './CreateApiKeyDialog';
 import { EditApiKeyDialog } from './EditApiKeyDialog';
 import { CallVolumeChart } from './CallVolumeChart';
 import { Term } from '@/components/ui/term';
+import { isAdminKey } from './admin-preset';
 
 type DerivedStatus = 'active' | 'expiring' | 'unused' | 'revoked';
 
@@ -95,13 +96,27 @@ function Labeled({ label, mono, children }: { label: string; mono?: boolean; chi
   );
 }
 
+/** NAN-5900: marks a key that holds every permission, so admin keys stand out. */
+function AdminKeyPill() {
+  return (
+    <span
+      data-testid="admin-key-pill"
+      title="This key holds every permission. It can do anything an admin can."
+      className="inline-flex items-center h-4 px-1 rounded-sm border text-[9.5px] font-medium shrink-0 border-yellow-500/40 text-yellow-500 bg-yellow-500/5"
+    >
+      Admin
+    </span>
+  );
+}
+
 interface ApiKeyListItemProps {
   apiKey: ApiKeySummary;
+  isAdmin?: boolean;
   selected: boolean;
   onSelect: (id: string) => void;
 }
 
-function ApiKeyListItem({ apiKey, selected, onSelect }: ApiKeyListItemProps) {
+function ApiKeyListItem({ apiKey, isAdmin = false, selected, onSelect }: ApiKeyListItemProps) {
   const status = deriveStatus(apiKey);
   return (
     <button
@@ -125,6 +140,7 @@ function ApiKeyListItem({ apiKey, selected, onSelect }: ApiKeyListItemProps) {
           )}>
             {STATUS_PILL[status].label}
           </span>
+          {isAdmin && <AdminKeyPill />}
         </div>
         <div className="font-mono text-[10.5px] text-muted-foreground truncate mt-0.5">{apiKey.key_prefix}…</div>
         <div className="flex items-center gap-2 mt-1 text-[10.5px] text-muted-foreground">
@@ -244,6 +260,7 @@ function ApiKeyDetail({ apiKey, permissions, onEdit, onRotate, onRevoke, onEnabl
           <div className="flex items-center gap-2 mb-2">
             <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground font-medium"><Term id="api-key-scope">Scopes</Term></div>
             <span className="font-mono text-[10px] text-muted-foreground/70 tabular-nums">{apiKey.permissions.length}</span>
+            {isAdminKey(apiKey.permissions, permissions) && <AdminKeyPill />}
           </div>
           {apiKey.permissions.length === 0 ? (
             <div className="text-[11.5px] text-muted-foreground">No scopes, so this key cannot call anything.</div>
@@ -618,6 +635,7 @@ export function ApiKeysView() {
                 <ApiKeyListItem
                   key={k.id}
                   apiKey={k}
+                  isAdmin={isAdminKey(k.permissions, permissions)}
                   selected={selected?.id === k.id}
                   onSelect={setSelectedId}
                 />

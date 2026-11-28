@@ -474,7 +474,11 @@ def test_time_picker_preset_absolute_range_and_drag_zoom(analyst, soc: SocData, 
     timeline.step("absolute", frag=frag, shown=shown)
     assert frag.get("start", "").startswith(start.strftime("%Y-%m-%dT06:00")), frag
     assert frag.get("end", "").startswith(end.strftime("%Y-%m-%dT18:00")), frag
-    api_abs = int(client.search(query, limit=1, time_range={"start": start.isoformat(), "end": end.isoformat()})
+    # Ask the API for the window the UI ran: "to 18:00" ends inclusive at
+    # 18:00:00.999 in the URL, so an event seeded at exactly 18:00:00 is in
+    # the UI count and was missing from an API query ending 18:00:00
+    # (NAN-5971: 183 != 182).
+    api_abs = int(client.search(query, limit=1, time_range={"start": frag["start"], "end": frag["end"]})
                   ["total_count"])
     assert shown == api_abs
 

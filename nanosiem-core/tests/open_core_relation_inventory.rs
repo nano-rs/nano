@@ -726,7 +726,7 @@ fn referenced_relations(workspace: &Path) -> BTreeMap<String, BTreeSet<PathBuf>>
 }
 
 fn admin_url() -> Option<String> {
-    std::env::var("TEST_DATABASE_URL").ok()
+    nanosiem_test_db::pg_url().ok()
 }
 
 fn database_url(admin: &str, database: &str) -> String {

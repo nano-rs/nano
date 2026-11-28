@@ -53,9 +53,20 @@ async fn third_party_owner_is_refused_by_every_read() {
 #[tokio::test]
 async fn first_party_owner_reads_the_content_channel() {
     let client = GitHubClient::new();
-    for owner in ["nano-rs", "nanos-sh"] {
+    for owner in ["nano-rs", "NANO-RS"] {
         let result = client.get_latest_commit(owner, "parsers", "main").await;
         assert!(!matches!(result, Err(GitHubClientError::NotFirstParty { .. })), "{owner} refused as third party");
+    }
+}
+
+/// NAN-5954: the pre-rename `nanos-sh` org is unregistered on GitHub (anyone
+/// could claim it), so it is third-party: refused, never fetched.
+#[tokio::test]
+async fn legacy_nanos_sh_owner_is_third_party() {
+    let client = GitHubClient::new();
+    for owner in ["nanos-sh", "NANOS-SH"] {
+        let result = client.get_latest_commit(owner, "parsers", "main").await;
+        assert!(matches!(result, Err(GitHubClientError::NotFirstParty { .. })), "{owner} must be refused: {result:?}");
     }
 }
 

@@ -69,6 +69,18 @@ MIN_PART = 64 * 1024 * 1024
 STALE_HOURS = 36
 BACKOFF_MINUTES = (15, 30, 60, 120)
 REPORT_URL = "http://nano-api:3000/api/internal/backup-status"
+REPORT_FIELDS = frozenset({"enabled", "outcome", "started_at", "finished_at", "backup_id", "size_bytes",
+                           "destination_kind", "destination", "clickhouse_data", "schedule", "keep",
+                           "next_run_at", "error"})
+# NAN-5945: one JSON line per run (start and end) in the state directory, a
+# host path that outlives the container, capped to the newest RUN_LOG_KEEP.
+RUN_LOG = "runs.jsonl"
+RUN_LOG_KEEP = 1000
+# NAN-5945: a random start delay so installs that share one store (or one
+# schedule) do not all start at the same minute. NANO_BACKUP_START_DELAY_MAX
+# minutes, default 15, 0 turns it off.
+START_DELAY_DEFAULT = 15
+START_DELAY_LIMIT = 180
 
 
 class BackupError(Exception):
@@ -208,6 +220,9 @@ class Config:
         self.schedule = env.get("NANO_BACKUP_SCHEDULE", "02:00")
         self.keep = int(env.get("NANO_BACKUP_KEEP", "7") or 7)
         self.token = env.get("NANO_BACKUP_STATUS_TOKEN", "")
+        delay = env.get("NANO_BACKUP_START_DELAY_MAX", "").strip()
+        self.start_delay_max = int(delay) if re.fullmatch(r"[0-9]{1,3}", delay) and int(delay) <= START_DELAY_LIMIT \
+            else START_DELAY_DEFAULT
         self.state_dir = pathlib.Path(os.environ.get("NANO_BACKUP_STATE_DIR")
                                       or install_dir / ".nano-backup" / "state")
 
@@ -379,10 +394,11 @@ class S3:
         status, _, body = self.request("DELETE", self.key(name))
         self._check(status, body, "delete", (200, 204))
 
-    def list(self) -> list[str]:
+    def list(self, under: str = "") -> list[str]:
+        """Object names directly under the prefix (or under prefix/<under>)."""
         names: list[str] = []
         token = ""
-        prefix = f"{self.prefix}/" if self.prefix else ""
+        prefix = f"{self.key(under)}/" if under else (f"{self.prefix}/" if self.prefix else "")
         while True:
             query = {"list-type": "2", "prefix": prefix}
             if token:
@@ -470,8 +486,17 @@ def sha256_file(path: pathlib.Path) -> str:
 
 # --------------------------------------------------------------------------- destinations
 
-def probe_destination(config: Config) -> None:
-    """Write and delete a small probe; listing must work too (retention)."""
+# NAN-5944: S3 probes live under <prefix>/.nano-backup-probe/, outside the
+# `<prefix>/nano-auto-` keys an object lock should cover. A store that still
+# refuses the delete (a lock over the whole prefix, or a key without delete
+# permission) passes with a warning: writing and listing are what backups need,
+# and the probe object stays until its lock expires.
+PROBE_DIR = ".nano-backup-probe"
+
+
+def probe_destination(config: Config, warn: Callable[[str], None] | None = None) -> list[str]:
+    """Write, list and delete a small probe. Returns warnings."""
+    warn = warn or (lambda message: log(f"WARNING: {message}"))
     probe = f".nano-backup-probe-{secrets.token_hex(6)}"
     if config.kind == "path":
         root = pathlib.Path(config.path)
@@ -489,17 +514,30 @@ def probe_destination(config: Config) -> None:
         except OSError as error:
             with_suppressed(lambda: target.unlink())
             raise BackupError(f"backup path is not writable: {error.strerror or error}") from None
-        return
+        return []
     if config.kind == "s3":
         s3 = config.s3()
-        s3.put_bytes(probe, b"nano backup destination probe\n")
+        key = f"{PROBE_DIR}/{probe}"
+        s3.put_bytes(key, b"nano backup destination probe\n")
+        warnings: list[str] = []
         try:
-            names = s3.list()
-            if probe not in names:
+            if probe not in s3.list(PROBE_DIR):
                 raise BackupError("S3 list did not show the probe object (check the prefix and ListBucket permission)")
+            s3.list()   # retention lists the backup prefix itself
         finally:
-            s3.delete(probe)
-        return
+            try:
+                s3.delete(key)
+            except BackupError as error:
+                if "HTTP" not in str(error):
+                    raise
+                warnings.append(
+                    f"the store refused to delete the test object {s3.key(key)} ({error}). This is expected "
+                    f"with an object lock that covers the whole prefix; the object stays until its lock "
+                    f"expires. Retention also deletes old backups: keep the lock shorter than "
+                    f"{config.keep} days (NANO_BACKUP_KEEP), or lock only {s3.key(AUTO_PREFIX)}*")
+        for message in warnings:
+            warn(message)
+        return warnings
     raise BackupError("backup destination must be 'path' or 's3'")
 
 
@@ -575,13 +613,22 @@ def prune(config: Config) -> list[str]:
                 log(f"removed an incomplete copy: {leftover.name}")
     names = auto_names(config)
     doomed = names[: max(0, len(names) - config.keep)]
+    pruned: list[str] = []
     for name in doomed:
         if config.kind == "path":
             shutil.rmtree(pathlib.Path(config.path) / name)
         else:
-            config.s3().delete(name)
+            try:
+                config.s3().delete(name)
+            except BackupError as error:
+                # NAN-5944: an object lock keeps a backup longer than the
+                # retention; the new backup is stored, so this is not a failure.
+                log(f"WARNING: could not prune {name} ({error}); an object lock may still hold it. "
+                    "It is pruned on a later run once the lock expires.")
+                continue
+        pruned.append(name)
         log(f"pruned {name} (keep {config.keep})")
-    return doomed
+    return pruned
 
 
 def bundle_size(path: pathlib.Path) -> int:
@@ -996,6 +1043,410 @@ def topology(config: Config) -> dict[str, str]:
             "roles": "app,ingest,clickhouse,keeper,postgres", "shard": "1", "replica": "1", "shard_count": "1"}
 
 
+# --------------------------------------------------------------------------- host config
+#
+# NAN-5939: the host files a rebuilt host needs besides .env, inside the
+# encrypted payload (they hold private keys):
+#   nano-pki/                the Vector-native PKI (same layout `scripts/nano
+#                            backup` has written since NAN-5515)
+#   host-config/index.json   what was captured, with each file's mode
+#   host-config/files/<rel>  config/nginx/ssl, every NANO_COMPOSE_OVERLAYS file,
+#                            the install-relative paths those overlays mount,
+#                            and the backup recipient certificate + signing key
+# `scripts/nano restore` puts them back (NAN-5940). An archive without them
+# (v2.0.36 and older) restores exactly as before.
+
+HOST_CONFIG_FORMAT = "nano-host-config-v1"
+HOST_CONFIG_DIRS = ("config/nginx/ssl",)
+OVERLAY_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.ya?ml$")
+# `./path` in an overlay: a short-syntax volume (`- ./x:/y:ro`) or a long one
+# (`source: ./x`). Stops at the first `:`, quote, space or comma.
+OVERLAY_MOUNT = re.compile(r"""(?:^|[\s"'\[,=])\./([A-Za-z0-9._@+/-]+)""", re.MULTILINE)
+# `../path` mounts reach outside the install directory: never captured, named.
+OVERLAY_OUTSIDE_MOUNT = re.compile(r"""(?:^|[\s"'\[,=])(\.\./[^\s"':,\]]*)""", re.MULTILINE)
+# A YAML comment starts at `#` at the start of a line or after whitespace.
+YAML_COMMENT = re.compile(r"(?:^|(?<=\s))#.*$", re.MULTILINE)
+
+
+def overlay_mounts(text: str) -> tuple[list[str], list[str]]:
+    """(install-relative `./` mount sources, `../` sources) of an overlay,
+    ignoring YAML comments."""
+    body = YAML_COMMENT.sub("", text)
+    inside = [m.group(1).rstrip("/") for m in OVERLAY_MOUNT.finditer(body)]
+    outside = [m.group(1) for m in OVERLAY_OUTSIDE_MOUNT.finditer(body)]
+    return [item for item in inside if item], outside
+HOST_CONFIG_MAX_BYTES = 64 * 1024 * 1024
+# Never captured as host config, whatever an overlay mounts: data, state and
+# secrets that have their own place in the payload.
+HOST_CONFIG_EXCLUDE_TOP = {".env", ".nano-role.env", ".nano-backup", ".nano-pki", ".nano-restore-kept", ".nano-restore-overlays",
+                           "backups", "data", ".git"}
+
+
+def overlay_names(env: dict[str, str]) -> list[str]:
+    return [name for name in env.get("NANO_COMPOSE_OVERLAYS", "").split() if OVERLAY_NAME.fullmatch(name)]
+
+
+def _inside(install_dir: pathlib.Path, relative: str) -> pathlib.Path | None:
+    """install_dir/relative when it stays inside the install directory and no
+    component of it is a symbolic link; None otherwise."""
+    rel = pathlib.PurePosixPath(relative)
+    if rel.is_absolute() or ".." in rel.parts or not rel.parts:
+        return None
+    path = install_dir
+    for part in rel.parts:
+        path = path / part
+        if path.is_symlink():
+            return None
+    return path
+
+
+def host_config_items(install_dir: pathlib.Path, env: dict[str, str]) -> tuple[list[str], list[str]]:
+    """(install-relative paths to capture, warnings)."""
+    items: list[str] = []
+    warnings: list[str] = []
+
+    def add(relative: str, why: str) -> None:
+        relative = str(pathlib.PurePosixPath(relative))
+        if not pathlib.PurePosixPath(relative).parts or relative == ".":
+            return   # `./.` or `./`: the install directory itself is never host config
+        if relative in items or any(relative.startswith(item + "/") for item in items):
+            return
+        top = pathlib.PurePosixPath(relative).parts[0]
+        if top in HOST_CONFIG_EXCLUDE_TOP:
+            return
+        path = _inside(install_dir, relative)
+        if path is None:
+            warnings.append(f"{why} {relative} is a symbolic link or outside the install directory; not backed up")
+            return
+        if path.exists():
+            # A parent directory replaces the children already listed.
+            items[:] = [item for item in items if not item.startswith(relative + "/")]
+            items.append(relative)
+
+    for directory in HOST_CONFIG_DIRS:
+        add(directory, "TLS directory")
+    for name in overlay_names(env):
+        add(name, "Compose overlay")
+        path = _inside(install_dir, name)
+        if path is None or not path.is_file():
+            if path is not None:
+                warnings.append(f"NANO_COMPOSE_OVERLAYS names {name}, which is not on this host")
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as error:
+            warnings.append(f"cannot read overlay {name}: {error.strerror or error}")
+            continue
+        inside, outside = overlay_mounts(text)
+        for relative in inside:
+            add(relative, f"path mounted by {name}:")
+        for relative in outside:
+            warnings.append(f"{name} mounts {relative}, which is outside the install directory; not backed up")
+    for relative in sorted(backup_key_paths(env)):
+        path = _inside(install_dir, relative)
+        if path is not None and path.is_file():
+            # The keys directory is excluded above for everything else.
+            items.append(relative)
+    return items, warnings
+
+
+def export_host_config(install_dir: pathlib.Path, env: dict[str, str], payload: pathlib.Path) -> list[str]:
+    """Copy the host config into payload; returns warnings (never raises for
+    a single unreadable or oversized file: the database backup still counts)."""
+    warnings: list[str] = []
+    pki = install_dir / ".nano-pki"
+    if pki.is_dir() and not pki.is_symlink() and not (payload / "nano-pki").exists():
+        for source in sorted(pki.rglob("*")):
+            relative = source.relative_to(pki)
+            if any(part.startswith(".") for part in relative.parts) or source.is_symlink() or not source.is_file():
+                continue
+            target = payload / "nano-pki" / relative
+            target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            try:
+                shutil.copyfile(source, target)
+            except OSError as error:
+                warnings.append(f"cannot read .nano-pki/{relative}: {error.strerror or error}")
+    items, found = host_config_items(install_dir, env)
+    warnings.extend(found)
+    files: list[dict[str, Any]] = []
+    total = 0
+    root = payload / "host-config" / "files"
+    for item in items:
+        base = install_dir / item
+        try:
+            sources = [base] if base.is_file() else sorted(p for p in base.rglob("*"))
+        except OSError as error:
+            warnings.append(f"cannot read {item}: {error.strerror or error}; not backed up")
+            continue
+        for source in sources:
+            relative = str(source.relative_to(install_dir))
+            if source.is_symlink():
+                warnings.append(f"{relative} is a symbolic link; not backed up")
+                continue
+            target = root / relative
+            try:
+                if not source.is_file() or target.exists():
+                    continue
+                info = source.stat()
+                if total + info.st_size > HOST_CONFIG_MAX_BYTES:
+                    warnings.append(f"{relative} not backed up: host config is capped at {HOST_CONFIG_MAX_BYTES} bytes")
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                shutil.copyfile(source, target)
+            except OSError as error:
+                warnings.append(f"cannot read {relative}: {error.strerror or error}; not backed up")
+                with_suppressed(lambda: target.unlink())
+                continue
+            total += info.st_size
+            files.append({"path": relative, "mode": f"{info.st_mode & 0o777:04o}"})
+    if files:
+        index = payload / "host-config" / "index.json"
+        index.write_text(json.dumps({"format": HOST_CONFIG_FORMAT, "items": items, "files": files},
+                                    sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    for path in [payload / "host-config", payload / "nano-pki"]:
+        if path.exists():
+            for child in [path, *path.rglob("*")]:
+                os.chmod(child, 0o700 if child.is_dir() else 0o600)
+    for warning in warnings:
+        log(f"WARNING: {warning}")
+    return warnings
+
+
+def _site(env: dict[str, str]) -> str:
+    return (urllib.parse.urlsplit(env.get("BASE_URL", "")).hostname or "").lower()
+
+
+HOST_CONFIG_TLS_DIR = "config/nginx/ssl/"
+
+
+def _canonical(relative: Any) -> str | None:
+    """The path when it is a plain, canonical install-relative POSIX path
+    (no absolute, `.`, `..`, empty or doubled components, no control
+    characters); None otherwise."""
+    if not isinstance(relative, str) or not relative or any(ord(c) < 32 or ord(c) == 127 for c in relative):
+        return None
+    pure = pathlib.PurePosixPath(relative)
+    if pure.is_absolute() or str(pure) != relative or any(part in {".", ".."} for part in relative.split("/")):
+        return None
+    return relative
+
+
+def backup_key_paths(env: dict[str, str]) -> set[str]:
+    """The recipient certificate and signing key paths an .env names, only
+    when they are canonical paths inside .nano-backup/keys/ and never the
+    recovery key (which must never be backed up or restored)."""
+    out: set[str] = set()
+    for key, default in (("NANO_BACKUP_RECIPIENT_CERT", RECIPIENT_CERT), ("NANO_BACKUP_SIGNING_KEY", SIGNING_KEY)):
+        relative = _canonical(env.get(key) or default)
+        if relative and relative.startswith(KEYS_DIR + "/") and relative != RECOVERY_KEY:
+            out.add(relative)
+    return out
+
+
+def _secret_file(relative: str) -> bool:
+    name = relative.rsplit("/", 1)[-1].lower()
+    return relative.startswith(".nano-backup/") or name.endswith(".key") or "privkey" in name \
+        or name in {"key.pem", "tls.key"} or name.endswith("-key.pem") or name.endswith("_key.pem")
+
+
+def _link_or_conflict(install_dir: pathlib.Path, relative: str) -> str:
+    """'' when relative can be written as a regular file without following a
+    link; otherwise why it cannot (a link or a non-directory on the way, or a
+    link / non-file at the leaf)."""
+    path = install_dir
+    parts = relative.split("/")
+    for index, part in enumerate(parts):
+        path = path / part
+        leaf = index == len(parts) - 1
+        if path.is_symlink():
+            return "a symbolic link"
+        if path.exists() and not leaf and not path.is_dir():
+            return "a file where a directory is expected"
+        if leaf and path.exists() and not path.is_file():
+            return "not a regular file"
+    return ""
+
+
+def plan_host_config(install_dir: pathlib.Path, payload: pathlib.Path,
+                     source_env: dict[str, str], target_env: dict[str, str]) -> list[dict[str, Any]]:
+    """NAN-5940: validate a payload's host config against this host, without
+    changing anything. Returns one action per file: write (missing here),
+    replace (same-site TLS), keep (this host's copy stays; the backup's is
+    saved aside) or skip (identical). Raises BackupError on any entry that is
+    malformed, outside the allowlist, or missing from the payload, so a
+    restore refuses before mutation instead of failing half-way."""
+    index_path = payload / "host-config" / "index.json"
+    if not index_path.is_file():
+        return []
+    try:
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+    except ValueError as error:
+        raise BackupError(f"host-config index is invalid: {error}") from None
+    if not isinstance(index, dict) or index.get("format") != HOST_CONFIG_FORMAT \
+            or not isinstance(index.get("files"), list):
+        raise BackupError("host-config index has an unknown format")
+    files_root = payload / "host-config" / "files"
+    keys = backup_key_paths(source_env) | backup_key_paths(target_env)
+    overlays = set(overlay_names(source_env))
+    mounts: set[str] = set()
+    for name in overlays:
+        copy = files_root / name
+        if copy.is_file() and not copy.is_symlink():
+            for raw in overlay_mounts(copy.read_text(encoding="utf-8", errors="replace"))[0]:
+                # The same normal form export records (`./a/./b`, `a//b` -> `a/b`).
+                normal = _canonical(str(pathlib.PurePosixPath(raw)))
+                if normal and normal != ".":
+                    mounts.add(normal)
+
+    def allowed(relative: str) -> bool:
+        top = relative.split("/", 1)[0]
+        if relative in keys:
+            return True
+        if top in HOST_CONFIG_EXCLUDE_TOP:
+            return False
+        return relative.startswith(HOST_CONFIG_TLS_DIR) or relative in overlays \
+            or any(relative == mount or relative.startswith(mount + "/") for mount in mounts)
+
+    same_site = bool(_site(source_env)) and _site(source_env) == _site(target_env)
+    target_has_keys = any((install_dir / key).exists() or (install_dir / key).is_symlink() for key in keys)
+    plan: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for entry in index["files"]:
+        if not isinstance(entry, dict):
+            raise BackupError("host-config index entry is invalid")
+        relative = _canonical(entry.get("path"))
+        if relative is None:
+            raise BackupError(f"host-config path is not a plain install-relative path: {entry.get('path')!r}")
+        if relative in seen:
+            raise BackupError(f"host-config lists {relative} twice")
+        seen.add(relative)
+        if not allowed(relative):
+            raise BackupError(f"host-config entry {relative} is not TLS, a Compose overlay, an overlay mount "
+                              "or a backup key; refusing the backup")
+        mode_text = str(entry.get("mode", ""))
+        if not re.fullmatch(r"0?[0-7]{3}", mode_text):
+            raise BackupError(f"host-config mode is invalid for {relative}")
+        mode = int(mode_text, 8) & 0o755
+        if _secret_file(relative):
+            mode &= 0o600
+        source = files_root / relative
+        if _inside(files_root, relative) is None or not source.is_file():
+            raise BackupError(f"host-config file is missing from the backup: {relative}")
+        action = {"path": relative, "mode": mode, "source": source}
+        problem = _link_or_conflict(install_dir, relative)
+        dest = install_dir / relative
+        if problem:
+            action.update(action="keep", why=f"this host's path is {problem}")
+        elif relative in keys and target_has_keys:
+            same = dest.is_file() and dest.read_bytes() == source.read_bytes()
+            action.update(action="skip" if same else "keep", why="this host has its own backup keys")
+        elif dest.is_file():
+            if dest.read_bytes() == source.read_bytes():
+                action.update(action="skip")
+            elif relative.startswith(HOST_CONFIG_TLS_DIR) and same_site:
+                action.update(action="replace")
+            else:
+                action.update(action="keep", why="this host has its own copy")
+        else:
+            action.update(action="write")
+        plan.append(action)
+    # Review r3 P2-1: every overlay the restored .env uses must be a regular
+    # file here once the restore is done, or the post-cutover Compose call
+    # aborts half-way. A linked or missing overlay that the restore will not
+    # write is refused now, before anything on this host changes.
+    planned = {item["path"]: item["action"] for item in plan}
+    for name in overlay_names(target_env):
+        dest = install_dir / name
+        if dest.is_file() and not dest.is_symlink():
+            continue
+        if planned.get(name) != "write":
+            state = "a symbolic link" if dest.is_symlink() else "not a regular file" if dest.exists() \
+                else "missing"
+            raise BackupError(f"the restored .env uses the Compose overlay {name}, but {dest} is {state} and the "
+                              "backup cannot place it there. Replace it with a regular file (or move it away), "
+                              "then run the restore again")
+    if any(item["action"] in {"keep", "replace"} for item in plan):
+        kept = install_dir / ".nano-restore-kept"
+        if kept.is_symlink() or (kept.exists() and not kept.is_dir()):
+            raise BackupError(f"{kept} is a symbolic link or not a directory; restore saves this host's and the "
+                              "backup's differing files there. Move it away, then run the restore again")
+    return plan
+
+
+def _mkdirs(root: pathlib.Path, relative_dir: str, mode: int) -> None:
+    """Create each missing directory component with exactly `mode`,
+    whatever the caller's umask (scripts/nano runs under umask 077)."""
+    path = root
+    for part in [p for p in relative_dir.split("/") if p]:
+        path = path / part
+        if path.is_symlink():
+            raise BackupError(f"{path} is a symbolic link")
+        if path.exists() and not path.is_dir():
+            raise BackupError(f"{path} is not a directory")
+        if not path.exists():
+            path.mkdir()
+            os.chmod(path, mode)
+
+
+def _atomic_copy(source: pathlib.Path, dest: pathlib.Path, mode: int) -> None:
+    fd, temp = tempfile.mkstemp(dir=str(dest.parent), prefix=f".{dest.name}.restore.")
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "wb") as handle, source.open("rb") as reader:
+            shutil.copyfileobj(reader, handle)
+        os.chmod(temp, mode)
+        os.replace(temp, dest)
+    except BaseException:
+        with_suppressed(lambda: os.unlink(temp))
+        raise
+
+
+def restore_host_config(install_dir: pathlib.Path, payload: pathlib.Path,
+                        source_env: dict[str, str], target_env: dict[str, str],
+                        now: dt.datetime | None = None) -> list[str]:
+    """NAN-5940: apply plan_host_config. Every entry is validated before the
+    first file is written. Never writes through or replaces a symbolic link:
+    a linked path on this host (Let's Encrypt `live/` links) is kept and the
+    backup's copy saved under .nano-restore-kept/<time>/ (0700 dirs, 0600
+    files). Directories are created 0755 (0700 under .nano-backup/), files with
+    their saved mode, private keys never looser than 0600."""
+    plan = plan_host_config(install_dir, payload, source_env, target_env)
+    if not plan:
+        return []
+    stamp = (now or dt.datetime.now(dt.timezone.utc)).strftime("%Y%m%dT%H%M%SZ")
+    kept_rel = f".nano-restore-kept/{stamp}"
+    done: list[str] = []
+
+    def keep_copy(relative: str, source: pathlib.Path) -> pathlib.Path:
+        parent = f"{kept_rel}/{relative}".rsplit("/", 1)[0]
+        _mkdirs(install_dir, parent, 0o700)
+        target = install_dir / kept_rel / relative
+        _atomic_copy(source, target, 0o600)
+        return target
+
+    for item in plan:
+        relative, action = item["path"], item["action"]
+        dest = install_dir / relative
+        if action == "skip":
+            continue
+        if action == "keep":
+            copy = keep_copy(relative, item["source"])
+            done.append(f"kept this host's {relative} ({item['why']}); the backup's copy is in {copy}")
+            continue
+        if action == "replace":
+            keep_copy(relative, dest)
+            done.append(f"CHANGED replaced {relative} with the backup's (same site); this host's copy is in "
+                        f"{install_dir / kept_rel}")
+        else:
+            done.append(f"CHANGED restored {relative}")
+        parent = relative.rsplit("/", 1)[0] if "/" in relative else ""
+        _mkdirs(install_dir, parent, 0o700 if relative.startswith(".nano-backup/") else 0o755)
+        _atomic_copy(item["source"], dest, item["mode"])
+    for line in done:
+        log(line.removeprefix("CHANGED "))
+    return done
+
+
 def openssl(*args: str) -> str:
     result = subprocess.run(["openssl", *args], capture_output=True, text=True, check=False)
     if result.returncode != 0:
@@ -1034,7 +1485,8 @@ def publish_bundle(source: pathlib.Path, output_root: pathlib.Path, name: str) -
     return final
 
 
-def network_backup(config: Config, output_root: pathlib.Path, name: str) -> tuple[pathlib.Path, str]:
+def network_backup(config: Config, output_root: pathlib.Path, name: str,
+                   notes: list[str] | None = None) -> tuple[pathlib.Path, str]:
     """Write one signed nano-backup-v2 bundle (a recovery set on a role-split
     app host) under output_root/name. Nothing here needs the Docker socket."""
     recipient = config.file(config.env.get("NANO_BACKUP_RECIPIENT_CERT") or RECIPIENT_CERT)
@@ -1057,6 +1509,10 @@ def network_backup(config: Config, output_root: pathlib.Path, name: str) -> tupl
         for item in (".env", ".nano-host-identity", ".nano-role.env"):
             if (config.install_dir / item).is_file():
                 shutil.copyfile(config.install_dir / item, payload / item)
+        # NAN-5939: TLS certificate, Vector-native PKI, Compose overlays.
+        host_warnings = export_host_config(config.install_dir, config.env, payload)
+        if notes is not None:
+            notes.extend(host_warnings)
         # One REPEATABLE READ snapshot: the dump, the signed row counts and
         # (while it is held) the lookup-row export.
         exporter = subprocess.Popen(
@@ -1095,11 +1551,13 @@ SET TRANSACTION SNAPSHOT '{snapshot}';
 SELECT format('SELECT %L || ''|'' || count(*) FROM %I.%I;', schemaname || '.' || tablename, schemaname, tablename)
 FROM pg_tables
 WHERE schemaname <> 'information_schema' AND schemaname NOT LIKE 'pg\\_%' ESCAPE '\\'
-ORDER BY 1;
+ORDER BY 1
 \\gexec
 COMMIT;
 """)
-            lines = sorted(line for line in counts.splitlines() if line.strip())
+            # NAN-5945: `table|count` lines only. (A `;` before psql's gexec
+            # used to print every generated SELECT before running it.)
+            lines = sorted(line for line in counts.splitlines() if line.strip() and not line.startswith("SELECT "))
             (payload / "postgres-row-counts.tsv").write_text("".join(f"{line}\n" for line in lines))
             exporter.stdin.write("COMMIT;\n\\q\n")
             exporter.stdin.close()
@@ -1108,8 +1566,8 @@ COMMIT;
         finally:
             if exporter.poll() is None:
                 exporter.kill()
-        for path in payload.iterdir():
-            os.chmod(path, 0o600)
+        for path in payload.rglob("*"):
+            os.chmod(path, 0o700 if path.is_dir() else 0o600)
         log(f"captured PostgreSQL (migration {pg_mig})"
             + (f" and {rows} lookup-table row(s)" if not lookup_warning else " WITHOUT the lookup-table rows"))
 
@@ -1309,6 +1767,7 @@ def run_once(config: Config, now: dt.datetime | None = None,
         # and the lookup-table rows. The API's scope field is binary.
         "clickhouse_data": "excluded",
     }
+    run_log(config, "start", status)
     try:
         with InstallLock(config.install_dir), cluster_lock(config):
             taken = slot_already_taken(config, slot) if slot is not None else None
@@ -1328,18 +1787,28 @@ def run_once(config: Config, now: dt.datetime | None = None,
 
 
 def store(config: Config, status: dict[str, Any], name: str) -> None:
+    notes: list[str] = []
+    try:
+        _store(config, status, name, notes)
+    finally:
+        if notes:
+            # Local status and the run log only; the API report has a fixed shape.
+            status["warnings"] = [note[:300] for note in notes[:20]]
+
+
+def _store(config: Config, status: dict[str, Any], name: str, notes: list[str]) -> None:
     if config.kind == "path":
         root = pathlib.Path(config.path)
         if not root.is_dir():
             raise BackupError(f"backup path is not mounted: {root}")
         check_destination_marker(config)
-        bundle, warning = network_backup(config, root, name)
+        bundle, warning = network_backup(config, root, name, notes)
         size = bundle_size(bundle)
     else:
         staging = config.state_dir / "staging"
         staging.mkdir(parents=True, exist_ok=True)
         os.chmod(staging, 0o700)
-        bundle, warning = network_backup(config, staging, name)
+        bundle, warning = network_backup(config, staging, name, notes)
         archive = staging / f"{name}.tar"
         try:
             tar_bundle(bundle, archive)
@@ -1366,7 +1835,38 @@ def status_file(config: Config) -> pathlib.Path:
     return config.state_dir / "status.json"
 
 
+def run_log(config: Config, event: str, status: dict[str, Any]) -> None:
+    """NAN-5945: one structured line per run event, to stderr (Docker logs,
+    or journald through the Docker journald log driver) and to runs.jsonl in
+    the state directory. Never carries credentials: the status holds none."""
+    record: dict[str, Any] = {"event": event, "at": iso(dt.datetime.now(dt.timezone.utc))}
+    for key in ("outcome", "backup_id", "size_bytes", "started_at", "finished_at", "destination",
+                "error", "warnings", "start_delay_s"):
+        if status.get(key) is not None:
+            record[key] = status[key]
+    try:
+        started = dt.datetime.strptime(status["started_at"], "%Y-%m-%dT%H:%M:%SZ")
+        finished = dt.datetime.strptime(status["finished_at"], "%Y-%m-%dT%H:%M:%SZ")
+        record["duration_s"] = int((finished - started).total_seconds())
+    except (KeyError, TypeError, ValueError):
+        pass
+    line = json.dumps(record, sort_keys=True)
+    print(f"nano-backup-run: {line}", file=sys.stderr, flush=True)
+    path = config.state_dir / RUN_LOG
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        previous = path.read_text(encoding="utf-8").splitlines()[-(RUN_LOG_KEEP - 1):] if path.is_file() else []
+        fd, temp = tempfile.mkstemp(dir=str(path.parent), prefix=".runs.")
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write("".join(f"{item}\n" for item in [*previous, line]))
+        os.chmod(temp, 0o600)
+        os.replace(temp, path)
+    except OSError as error:
+        log(f"cannot write the run log {path}: {error.strerror or error}")
+
+
 def record_status(config: Config, status: dict[str, Any]) -> None:
+    run_log(config, "finish", status)
     path = status_file(config)
     path.parent.mkdir(parents=True, exist_ok=True)
     previous: dict[str, Any] = {}
@@ -1397,7 +1897,8 @@ def report(config: Config, status: dict[str, Any]) -> None:
     if not urllib.parse.urlsplit(url).hostname:
         return
     parsed = urllib.parse.urlsplit(url)
-    body = json.dumps({k: v for k, v in status.items() if v is not None}).encode()
+    # The API refuses unknown fields: send exactly the report's shape.
+    body = json.dumps({k: v for k, v in status.items() if v is not None and k in REPORT_FIELDS}).encode()
     try:
         conn_type = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
         conn = conn_type(parsed.hostname, parsed.port, timeout=15)
@@ -1457,9 +1958,14 @@ def serve(install_dir: pathlib.Path, *, clock: Callable[[], dt.datetime] | None 
             continue
         reported_disabled = False
         due = next_run(config.schedule, clock())
-        log(f"next backup at {due.isoformat(timespec='minutes')}")
-        while not stopping["flag"] and clock() < due:
-            sleep(min(60.0, max(1.0, (due - clock()).total_seconds())))
+        # NAN-5945: start within a random delay after the slot; the slot itself
+        # still names the backup another app host may already have stored.
+        delay = secrets.randbelow(config.start_delay_max * 60 + 1) if config.start_delay_max else 0
+        start_at = due + dt.timedelta(seconds=delay)
+        log(f"next backup at {due.isoformat(timespec='minutes')}"
+            + (f" plus a random start delay of {delay // 60}m{delay % 60:02d}s" if delay else ""))
+        while not stopping["flag"] and clock() < start_at:
+            sleep(min(60.0, max(1.0, (start_at - clock()).total_seconds())))
         if stopping["flag"]:
             break
         attempt = 0
@@ -1686,6 +2192,27 @@ def host_timezone() -> str:
     return "UTC"
 
 
+def ensure_backup_image(install_dir: pathlib.Path, say: Callable[[str], None]) -> None:
+    """NAN-5937: the nano-backup image is local, or is pulled now (enterprise:
+    with a one-hour credential from the license API, as install.sh does).
+    Raises with the helper's explanation; nothing is written to .env then."""
+    helper = install_dir / "scripts" / "lib" / "backup-image.sh"
+    composed = (install_dir / "docker-compose.opensource.yml").is_file() \
+        or (install_dir / "deploy/compose/docker-compose.enterprise.yml").is_file()
+    if not helper.is_file() or not composed or not shutil.which("docker"):
+        return
+    result = subprocess.run(["bash", str(helper), "--install-dir", str(install_dir)], stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+    for line in (result.stderr or "").splitlines():
+        if line.strip():
+            say(line.rstrip())
+    if result.returncode != 0:
+        raise BackupError("the nano-backup image is not on this host and could not be pulled (see above). "
+                          "Automatic backups were not turned on. Load it with the offline image bundle "
+                          "(scripts/nano bundle load <bundle>) or log docker in to the registry, then run "
+                          "scripts/nano backup-schedule --configure again")
+
+
 def configure(install_dir: pathlib.Path, *, from_installer: bool, force: bool) -> int:
     env_path = install_dir / ".env"
     env = read_env(env_path)
@@ -1706,13 +2233,17 @@ def configure(install_dir: pathlib.Path, *, from_installer: bool, force: bool) -
             return 0
         try:
             validate_updates(updates)
-            probe_destination(Config(install_dir, {**env, **updates}))
+            probe_destination(Config(install_dir, {**env, **updates}), warn=say)
             break
         except BackupError as error:
             say(f"Backup destination rejected: {error}")
             if not interactive or attempt == 2:
                 raise
             # Re-ask from the top; nothing was written.
+    if not from_installer:
+        # NAN-5937: the service needs its image. install.sh pulls it with the
+        # rest of the release; a later --configure makes sure it is here.
+        ensure_backup_image(install_dir, say)
     marker_id = ""
     if updates["NANO_BACKUP_DESTINATION"] == "path":
         marker_id = env.get("NANO_BACKUP_DESTINATION_ID") or secrets.token_hex(16)
@@ -1765,6 +2296,18 @@ def show_status(install_dir: pathlib.Path) -> int:
     print(f"last success: {success['finished_at'] + '  ' + success['backup_id'] + '  ' + str(success['size_bytes']) + ' bytes' if success else 'never'}")
     if failure:
         print(f"last failure: {failure['finished_at']}  {failure.get('error', '')}")
+    runs = config.state_dir / RUN_LOG
+    if runs.is_file():
+        recent = [line for line in runs.read_text(encoding="utf-8").splitlines() if '"event": "finish"' in line][-5:]
+        if recent:
+            print(f"recent runs ({runs}):")
+            for line in recent:
+                try:
+                    run = json.loads(line)
+                except ValueError:
+                    continue
+                print(f"  {run.get('finished_at', '?')}  {run.get('outcome', '?'):<8} {run.get('backup_id', '')}"
+                      f"  {run.get('duration_s', '?')}s{'  ' + run['error'][:120] if run.get('error') else ''}")
     if config.enabled:
         reference = success["finished_at"] if success else None
         if reference:
@@ -1822,6 +2365,17 @@ def main(argv: list[str] | None = None) -> int:
     export_parser.add_argument("--payload", required=True)
     import_parser = sub.add_parser("lookup-import")
     import_parser.add_argument("--payload", required=True)
+    # NAN-5939: `scripts/nano backup` adds the same host config to its payload.
+    host_parser = sub.add_parser("host-config-export")
+    host_parser.add_argument("--payload", required=True)
+    host_restore_parser = sub.add_parser("host-config-restore")
+    host_restore_parser.add_argument("--payload", required=True)
+    host_restore_parser.add_argument("--source-env", required=True)
+    host_restore_parser.add_argument("--target-env", default="")
+    host_preflight_parser = sub.add_parser("host-config-preflight")
+    host_preflight_parser.add_argument("--payload", required=True)
+    host_preflight_parser.add_argument("--source-env", required=True)
+    host_preflight_parser.add_argument("--target-env", default="")
     count_parser = sub.add_parser("lookup-count")
     count_parser.add_argument("--file", required=True)
     fetch_parser = sub.add_parser("fetch")
@@ -1835,8 +2389,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "disable":
             return disable(install_dir)
         if args.command == "probe":
-            probe_destination(load_config(install_dir))
-            print("destination ok")
+            warnings = probe_destination(load_config(install_dir))
+            print("destination ok" + (" (with warnings above)" if warnings else ""))
             return 0
         if args.command == "serve":
             return serve(install_dir)
@@ -1854,6 +2408,29 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "list":
             for name in auto_names(load_config(install_dir)):
                 print(name)
+            return 0
+        if args.command == "host-config-export":
+            export_host_config(install_dir, read_env(install_dir / ".env"), pathlib.Path(args.payload))
+            return 0
+        if args.command in {"host-config-restore", "host-config-preflight"}:
+            target_env = read_env(pathlib.Path(args.target_env)) if args.target_env else read_env(install_dir / ".env")
+            source_env = read_env(pathlib.Path(args.source_env))
+            payload_dir = pathlib.Path(args.payload)
+            if args.command == "host-config-preflight":
+                plan = plan_host_config(install_dir, payload_dir, source_env, target_env)
+                planned = {item["path"] for item in plan if item["action"] in {"write", "skip", "replace"}}
+                for name in overlay_names(target_env):
+                    if not (install_dir / name).is_file() and name not in planned:
+                        raise BackupError(f"the restored .env uses the Compose overlay {name}, which is neither on "
+                                          "this host nor restorable from the backup; nothing on this host was changed")
+                print(f"host config ok: {sum(item['action'] in {'write', 'replace'} for item in plan)} file(s) "
+                      f"to restore, {sum(item['action'] == 'keep' for item in plan)} kept as this host's")
+                return 0
+            done = restore_host_config(install_dir, payload_dir, source_env, target_env)
+            for line in done:
+                if line.startswith("CHANGED "):
+                    path = line.split(" ", 2)[2].split(" ", 1)[0]
+                    print(f"changed {path}")
             return 0
         if args.command == "lookup-count":
             print(native_lookup_counts(pathlib.Path(args.file))[1])

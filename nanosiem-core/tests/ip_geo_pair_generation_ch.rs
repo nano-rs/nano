@@ -20,13 +20,12 @@ use nanosiem_core::enrichment::ip_geo::{
 };
 
 fn client() -> clickhouse::Client {
-    let url = std::env::var("NANOSIEM_TEST_CLICKHOUSE_URL")
-        .expect("NANOSIEM_TEST_CLICKHOUSE_URL must target a disposable ClickHouse");
+    let url = nanosiem_test_db::require_ch_url();
     let mut c = clickhouse::Client::default().with_url(url).with_database("nanosiem");
-    if let Ok(user) = std::env::var("NANOSIEM_TEST_CLICKHOUSE_USER") {
+    if let Some(user) = nanosiem_test_db::ch_user() {
         c = c.with_user(user);
     }
-    if let Ok(password) = std::env::var("NANOSIEM_TEST_CLICKHOUSE_PASSWORD") {
+    if let Some(password) = nanosiem_test_db::ch_password() {
         c = c.with_password(password);
     }
     c.with_setting("network_compression_method", "LZ4")

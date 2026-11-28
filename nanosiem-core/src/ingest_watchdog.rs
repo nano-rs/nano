@@ -1688,11 +1688,10 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a live ClickHouse"]
     async fn journal_state_row_decodes_live() {
-        let env = |key: &str| std::env::var(key).unwrap_or_else(|_| panic!("{key} must be set"));
         let client = Client::default()
-            .with_url(env("NANOSIEM_TEST_CLICKHOUSE_URL"))
-            .with_user(env("NANOSIEM_TEST_CLICKHOUSE_USER"))
-            .with_password(env("NANOSIEM_TEST_CLICKHOUSE_PASSWORD"));
+            .with_url(nanosiem_test_db::require_ch_url())
+            .with_user(nanosiem_test_db::ch_user().expect("CLICKHOUSE_TEST_USER must be set for this live suite"))
+            .with_password(nanosiem_test_db::ch_password().expect("CLICKHOUSE_TEST_PASSWORD must be set for this live suite"));
         let event_id = Uuid::now_v7();
         let transition_id = Uuid::now_v7();
         let row = client

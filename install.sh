@@ -96,6 +96,12 @@
 #   floors. A host that already runs nano only gets a warning, and so does a
 #   planned volume above the recommended size. NANO_SKIP_HOST_MINIMUMS=1
 #   installs anyway with a loud warning (unsupported).
+#   Host settings (NAN-5910, scripts/lib/host-tuning.sh): on a Linux host that
+#   runs ClickHouse the installer warns (never refuses) when transparent huge
+#   pages are "always", vm.overcommit_memory is 2, the CPU governor is not
+#   "performance", or Docker's data is not on ext4/XFS; see
+#   docs/getting-started/prepare-the-host.md. NANO_SKIP_HOST_TUNING_CHECK=1
+#   skips it.
 #   Before any prompt (NAN-5509), the TLS overlay (docker-compose.tls.yml in
 #   NANO_COMPOSE_OVERLAYS) needs config/nginx/ssl/fullchain.pem and privkey.pem:
 #   present, matching and unexpired. Before the pull, every port the graph
@@ -166,10 +172,10 @@
 # NANO_CHECK_ONLY=1 validates the inputs, prints the resolved edition, release
 # and image source, and exits before writing .env, pulling or starting anything.
 # Set NANO_SKIP_IMAGE_VERIFY=1 to skip the image digest supply-chain check.
-# Unauthenticated ingest ports (raw OTLP :4317/:4318, Fluent :24224, bundled
-# Tenzir :9095) bind 127.0.0.1. Opt in to exposing them with
-# NANO_OTLP_BIND_ADDRESS / NANO_FLUENT_BIND_ADDRESS / NANO_TENZIR_BIND_ADDRESS
-# (persisted to .env).
+# Unauthenticated ingest ports (raw OTLP :4317/:4318, bundled Tenzir :9095)
+# bind 127.0.0.1. Opt in to exposing them with NANO_OTLP_BIND_ADDRESS /
+# NANO_TENZIR_BIND_ADDRESS (persisted to .env). There is no Fluent Forward
+# listener: Fluentd and Fluent Bit send over HTTP, HEC or OTLP.
 # Vector native :6000 (NAN-5515) is published on the host's ingest interface
 # like HEC and HTTP ingest, and ALWAYS requires mutual TLS: the installer
 # creates this install's Vector-native listener CA and anchor store
@@ -309,6 +315,15 @@ while [[ $# -gt 0 ]]; do
             shift 2 ;;
         --tiering-use-environment-credentials)
             export NANO_TIERING_USE_ENVIRONMENT_CREDENTIALS=true; shift ;;
+        # NAN-5929: answers "Keep a second copy of your event data?" (fresh
+        # single-host enterprise install).
+        --replicas)
+            [[ $# -ge 2 ]] || { printf '%s\n' "--replicas requires yes or no" >&2; exit 2; }
+            case "$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')" in
+                yes|no) export NANO_REPLICAS="$2"; REPLICAS_FLAG=1 ;;
+                *) printf '%s\n' "--replicas requires yes or no (got $2)" >&2; exit 2 ;;
+            esac
+            shift 2 ;;
         -h|--help)
             cat <<'EOF'
 Usage: install.sh [--non-interactive | --yes]
@@ -319,6 +334,7 @@ Usage: install.sh [--non-interactive | --yes]
                    [--tiering-cache-size 10Gi] [--tiering-use-environment-credentials]
                    [--tiering-azure-account-url URL --tiering-azure-container C
                     --tiering-azure-account-name A]]
+                  [--replicas yes|no]
        install.sh --record-pg-ha-identity
 
 Without role/inventory arguments, installs the unchanged single-node stack.
@@ -333,6 +349,15 @@ storage tiering? [y/N]", default no). Secrets come from the environment
 NANO_TIERING_AZURE_ACCOUNT_KEY) or a hidden prompt, never from flags.
 Role-split clusters use the inventory `tiering:` block. See
 docs/administration/storage-tiering.md.
+
+--replicas yes|no (enterprise, fresh single-host install) answers "Keep a second
+copy of your event data?". no (the default) installs this server alone; its
+disk then holds the only copy of your events. yes installs nothing here: it
+checks 3 servers (NANO_REPLICA_HOSTS=a,b,c, plus NANO_REPLICA_APP_HOSTNAME and
+NANO_REPLICA_INGEST_HOSTNAME), writes inventory.yaml for the 3-server layout
+and prints the steps to install it. Given values are never asked on a terminal;
+a run that already sets NANO_ADMIN_EMAIL and NANO_BASE_URL is not asked (no).
+See docs/administration/event-safety.md.
 
 --record-pg-ha-identity (first postgres host of a PostgreSQL HA cluster, after
 the other postgres hosts are installed) only records the cluster's identity
@@ -369,6 +394,10 @@ stderr. NANO_PROMPT_TIMEOUT=<seconds> stops a prompt that is not answered
   Raw or pre-shaped events          NANO_INGEST_PATH                  raw
   Event retention (days)            NANO_RETENTION_DAYS               365
   Cold storage tiering (enterprise) NANO_TIERING / --tiering          off
+  Second copy on other servers      NANO_REPLICAS / --replicas        no (this server only)
+  (enterprise, fresh install)       yes: NANO_REPLICA_HOSTS,          REQUIRED with yes
+                                    NANO_REPLICA_APP_HOSTNAME,
+                                    NANO_REPLICA_INGEST_HOSTNAME
   Vector senders on :6000 (0.1.x)   NANO_VECTOR_NATIVE_SENDERS        none (warns with the commands)
 
   Confirmation                      Variable                          Without it (non-interactive)
@@ -394,6 +423,10 @@ if [[ "$RECORD_PG_HA_IDENTITY_ONLY" == "1" && ( -n "$ROLE_ARG" || -n "$TOPOLOGY_
 fi
 if [[ -n "$TOPOLOGY_MIGRATION_SHA" && -z "$INVENTORY_ARG" ]]; then
     printf '%s\n' "--accept-topology-migration is valid only with --role/--inventory" >&2
+    exit 2
+fi
+if [[ "${REPLICAS_FLAG:-0}" == 1 && -n "$INVENTORY_ARG" ]]; then
+    printf '%s\n' "--replicas is for a single-host install; with --role/--inventory the inventory already sets the servers" >&2
     exit 2
 fi
 if [[ -n "$TOPOLOGY_MIGRATION_SHA" && ! "$TOPOLOGY_MIGRATION_SHA" =~ ^[0-9a-f]{64}$ ]]; then
@@ -3085,7 +3118,25 @@ fi
 # checks the Docker VM's /proc/cpuinfo, and each stateful role depends on it.
 if [[ -n "$AVX2_REQUIRED_BY" && "$(uname -m)" == "x86_64" && -r "$CPUINFO_PATH" ]] \
     && ! grep -qw avx2 "$CPUINFO_PATH"; then
-    fail "$AVX2_REQUIRED_BY requires AVX2 on x86-64 because it runs ClickHouse 26.6+ binaries. Use an AVX2-capable host (on Proxmox, set the VM CPU type to 'host' or x86-64-v3)."
+    fail "$AVX2_REQUIRED_BY requires AVX2 on x86-64 because it runs ClickHouse 26.6+ binaries. Use an AVX2-capable host (on Proxmox, set the VM CPU type to 'host'; x86-64-v3 lacks pclmulqdq)."
+fi
+# NAN-6000: ClickHouse's JSON parser (simdjson) also needs BMI1, BMI2 and
+# PCLMULQDQ. Without one, ClickHouse runs but cannot read any JSON value and
+# setup fails at CREATE TABLE nanosiem.logs. Keeper never parses JSON.
+# clickhouse-preflight repeats this inside Docker (macOS, manual starts).
+if [[ -n "$AVX2_REQUIRED_BY" && "$AVX2_REQUIRED_BY" != "Keeper role" \
+    && "$(uname -m)" == "x86_64" && -r "$CPUINFO_PATH" ]]; then
+    simdjson_missing=""
+    for simdjson_flag in bmi1 bmi2 pclmulqdq; do
+        grep -qw "$simdjson_flag" "$CPUINFO_PATH" || simdjson_missing+=" $simdjson_flag"
+    done
+    if [[ -n "$simdjson_missing" ]]; then
+        if grep -qs '<allow_simdjson>0</allow_simdjson>' "${NANO_INSTALL_DIR:-.}"/clickhouse/users.d/*.xml; then
+            warn "This CPU does not report${simdjson_missing}. Continuing with allow_simdjson=0 (slower JSON parsing in ClickHouse). Set the VM's CPU type to 'host' to remove this."
+        else
+            fail "This CPU does not report${simdjson_missing}. ClickHouse needs it to read JSON, so setup would fail with 'Cannot parse JSON object here: {}'. Proxmox CPU types x86-64-v3 and x86-64-v4 lack pclmulqdq. Set the VM's CPU type to 'host' (qm set <vmid> --cpu host) or a custom model with +pclmulqdq, stop and start the VM, then run install.sh again. If you cannot change it, copy clickhouse/preflight/zz-local-no-simdjson.xml into clickhouse/users.d/ and run install.sh again (slower JSON parsing)."
+        fi
+    fi
 fi
 
 ok "All prerequisites present"
@@ -4089,7 +4140,7 @@ if [[ "$RECORD_PG_HA_IDENTITY_ONLY" == "1" ]]; then
         conflict*)
             fail "PostgreSQL HA identity mismatch: ${pg_ha_outcome#conflict }. This host's database is not the cluster recorded in .env; do not continue. See 'Recovering after losing the bootstrap host and etcd' in the multi-node guide." ;;
         *)
-            fail "This host's PostgreSQL HA member holds no cluster data yet. The cluster bootstraps once a second postgres host is installed (etcd needs 2 of 3 members); install the other postgres hosts, check 'docker compose ps postgres-ha', then run this again." ;;
+            fail "This host's PostgreSQL HA member holds no cluster data yet. The cluster bootstraps once a second postgres host is installed (etcd needs 2 of 3 members); install the other postgres hosts, check 'cd $NANO_INSTALL_DIR && docker compose ${COMPOSE_ARGS[*]} ps postgres-ha', then run this again." ;;
     esac
     exit 0
 fi
@@ -4122,7 +4173,11 @@ nano_async_loader_query() {
             resolve_address="$address"
             [[ "$resolve_address" == *:* && "$resolve_address" != \[*\] ]] \
                 && resolve_address="[$resolve_address]"
-            curl_args+=(--cacert "$NANO_TLS_CA" --resolve "${NANO_TLS_SERVER_NAME}:${port}:${resolve_address}")
+            # NAN-5913: --connect-to, not --resolve: --resolve takes only an IP
+            # literal (a DNS-named inventory host failed with curl exit 49),
+            # --connect-to also takes a name. SNI and the certificate check
+            # stay on NANO_TLS_SERVER_NAME either way.
+            curl_args+=(--cacert "$NANO_TLS_CA" --connect-to "${NANO_TLS_SERVER_NAME}:${port}:${resolve_address}:${port}")
         else
             url_address="$address"
             [[ "$url_address" == *:* && "$url_address" != \[*\] ]] \
@@ -4584,6 +4639,19 @@ fi
 log "Checking host size"
 nano_host_minimums_gate "$ROLE_ARG" "$PWD"
 
+# NAN-5910: host settings ClickHouse needs (huge pages, overcommit, CPU
+# governor, data filesystem). Warn-only: never refuses, never changes the host,
+# so a tree without the helper skips it instead of failing.
+if [[ -r scripts/lib/host-tuning.sh ]]; then
+    # shellcheck source=scripts/lib/host-tuning.sh
+    . scripts/lib/host-tuning.sh
+    host_tuning_data_dir=""
+    if [[ "$(uname -s 2>/dev/null)" == Linux ]] && command -v docker >/dev/null 2>&1; then
+        host_tuning_data_dir=$(docker info --format '{{.DockerRootDir}}' </dev/null 2>/dev/null || true)
+    fi
+    nano_host_tuning_check "$ROLE_ARG" "$host_tuning_data_dir"
+fi
+
 [[ -r scripts/lib/install-preflight.sh ]] \
     || fail "scripts/lib/install-preflight.sh not found in $NANO_INSTALL_DIR. The source tree or release bundle is incomplete."
 # shellcheck source=scripts/lib/install-preflight.sh
@@ -4783,6 +4851,294 @@ agentlane_ensure_gate_token() {
     NANO_BACKFILLED_SECRET_KEYS="${NANO_BACKFILLED_SECRET_KEYS:+$NANO_BACKFILLED_SECRET_KEYS, }NANO_AGENTLANE_GATE_TOKEN"
     ok "Generated NANO_AGENTLANE_GATE_TOKEN in .env (the Agent Lane gate's key to nano-api)"
 }
+# >>> second copy of the event data (NAN-5929) >>>
+# ----------------------------------------------------------------------------
+# "Keep a second copy of your event data?" A copy only protects events when it
+# lives on another server, so this is a choice of topology, asked first on a
+# fresh single-host enterprise install (before the admin questions; nothing is
+# written yet). No (the default, and the unattended default): this server
+# alone, plus a data-safety note. Yes: nothing is installed here; the three
+# servers are checked (count, all different, never this box twice, reachable),
+# inventory.yaml is written for the validated 3-server layout and checked with
+# the real renderer, and the steps to install it are printed.
+# NANO_REPLICAS / --replicas answers it; NANO_REPLICA_HOSTS,
+# NANO_REPLICA_APP_HOSTNAME and NANO_REPLICA_INGEST_HOSTNAME answer the
+# follow-ups. The open edition (no role-split) never asks, refuses yes, and
+# still shows the note.
+# ----------------------------------------------------------------------------
+REPLICA_HOSTNAME_RE='^[a-z0-9][a-z0-9-]*(\.[a-z0-9][a-z0-9-]*)+$'
+REPLICA_ANSWER="" REPLICA_HOSTS="" REPLICA_APP_HOSTNAME="" REPLICA_INGEST_HOSTNAME=""
+
+replica_data_safety_note() {
+    warn "This server keeps the only copy of your events. If this server or its disk fails, those events are lost."
+    printf '%s\n' \
+        "  Ways to protect them:" \
+        "  - keep nano's data on a disk that survives a server failure (RAID, or a cloud volume with snapshots);" \
+        "  - add events to your backups with --include-clickhouse-data (left out by default because they are large);" \
+        "  - move to 3 servers, where two of them each keep a full copy." \
+        "  Storage tiering saves disk space but is not a copy: the list of what is stored where stays on this server." \
+        "  More: docs/administration/event-safety.md"
+}
+
+# NANO_REPLICAS -> yes / no / "" (not given); anything else stops the install.
+replicas_input() {
+    case "$(printf '%s' "${NANO_REPLICAS:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" in
+        "") printf '' ;;
+        y|yes|true|1|on) printf 'yes' ;;
+        n|no|false|0|off) printf 'no' ;;
+        *) fail "NANO_REPLICAS must be yes or no (got '${NANO_REPLICAS}'). Nothing was written." ;;
+    esac
+}
+
+# Asks one line into ANSWER_REPLY, again on `back` (there is nothing before it).
+replica_ask_question() {
+    local rc
+    printf '\n%s\n%s\n%s\n%s\n%s\n%s\n\n' \
+        "Keep a second copy of your event data?" \
+        "  Yes: nano runs on 3 servers. Two of them each keep a full copy of your events," \
+        "       so if one server or its disk fails, nothing is lost. You set up the servers next." \
+        "  No:  nano runs on this server only. If its disk fails, the events on it are lost." \
+        "A second copy only helps on a different server, so this needs 3 servers." \
+        "Nothing is written until you answer. Ctrl-C stops and leaves this server untouched." > /dev/tty
+    ANSWER_ENV_HINT="NANO_REPLICAS"
+    while :; do
+        rc=0
+        answer_yes_no "Keep a second copy on another server?" false || rc=$?
+        (( rc == 0 )) && break
+        warn "This is the first question; answer y or n."
+    done
+    ANSWER_ENV_HINT=""
+    REPLICA_ANSWER=no
+    [[ "$ANSWER_REPLY" == true ]] && REPLICA_ANSWER=yes
+    return 0
+}
+
+# Prints each non-empty line of $1 as a warning (never fails under set -e).
+replica_warn_lines() {
+    local line
+    while IFS= read -r line; do
+        if [[ -n "$line" ]]; then warn "$line"; fi
+    done <<< "$1"
+}
+
+# Checks REPLICA_HOSTS; prints the reasons and returns 1 when refused.
+replica_check_hosts() {
+    local probe_port="$1" err
+    local -a skip=()
+    [[ "${NANO_REPLICA_SKIP_PROBE:-0}" == 1 ]] && skip=(--skip-probe)
+    log "Checking the 3 servers (each one must answer on port $probe_port)"
+    if err=$(python3 -I scripts/lib/replica_setup.py check --hosts "$REPLICA_HOSTS" \
+            --probe-port "$probe_port" ${skip[@]+"${skip[@]}"} </dev/null 2>&1); then
+        if [[ "${NANO_REPLICA_SKIP_PROBE:-0}" == 1 ]]; then
+            ok "The 3 servers are different machines (not checked whether this server can reach them: NANO_REPLICA_SKIP_PROBE=1)"
+        else
+            ok "The 3 servers are different machines and this server can reach them"
+        fi
+        return 0
+    fi
+    replica_warn_lines "$err"
+    return 1
+}
+
+# Asks, on the terminal, only the follow-ups the environment did not answer.
+# `back` steps to the previous question; a refused set of servers asks the
+# three addresses again.
+replica_ask_missing() {
+    local probe_port="$1" ask_hosts=0 ask_app=0 ask_ingest=0 idx=0 rc value
+    local -a hosts=("" "" "") prompts=()
+    [[ -n "$REPLICA_HOSTS" ]] || ask_hosts=1
+    [[ -n "$REPLICA_APP_HOSTNAME" ]] || ask_app=1
+    [[ -n "$REPLICA_INGEST_HOSTNAME" ]] || ask_ingest=1
+    # Every question this run asks, in order: s1 s2 s3 app ingest.
+    (( ask_hosts )) && prompts+=(s1 s2 s3)
+    (( ask_app )) && prompts+=(app)
+    (( ask_ingest )) && prompts+=(ingest)
+    if (( ask_hosts )); then
+        printf '\n%s\n%s\n\n' "Enter each server's private network address: an IP address like 10.0.0.11, or its name." \
+            "The other servers must be able to reach it there. They need nothing installed yet." > /dev/tty
+    elif ! replica_check_hosts "$probe_port"; then
+        fail "The 3 servers in NANO_REPLICA_HOSTS did not pass the checks above. Fix NANO_REPLICA_HOSTS and re-run. Nothing was written."
+    fi
+    while (( idx < ${#prompts[@]} )); do
+        rc=0
+        case "${prompts[idx]}" in
+            s1) ANSWER_ENV_HINT="NANO_REPLICA_HOSTS"
+                answer_read "Server 1 (runs the web app and database; usually this server) address" "${hosts[0]}" || rc=$? ;;
+            s2) ANSWER_ENV_HINT="NANO_REPLICA_HOSTS"
+                answer_read "Server 2 (keeps copy 1 of your events) address" "${hosts[1]}" || rc=$? ;;
+            s3) ANSWER_ENV_HINT="NANO_REPLICA_HOSTS"
+                answer_read "Server 3 (keeps copy 2 of your events) address" "${hosts[2]}" || rc=$? ;;
+            app) ANSWER_ENV_HINT="NANO_REPLICA_APP_HOSTNAME"
+                answer_read "Web address people will open nano at (a name like nano.example.com)" "$REPLICA_APP_HOSTNAME" || rc=$? ;;
+            ingest) ANSWER_ENV_HINT="NANO_REPLICA_INGEST_HOSTNAME"
+                answer_read "Address your log senders will send to (a name like ingest.nano.example.com)" "$REPLICA_INGEST_HOSTNAME" || rc=$? ;;
+        esac
+        if (( rc == 2 )); then
+            if (( idx == 0 )); then
+                warn "This is the first of these questions; answer it to go on."
+            else
+                idx=$(( idx - 1 ))
+            fi
+            continue
+        fi
+        value=$(trim_space "$ANSWER_REPLY")
+        case "${prompts[idx]}" in
+            s1) hosts[0]=$value ;;
+            s2) hosts[1]=$value ;;
+            s3)
+                hosts[2]=$value
+                REPLICA_HOSTS=$(IFS=,; printf '%s' "${hosts[*]}")
+                if ! replica_check_hosts "$probe_port"; then
+                    printf '%s\n\n' "Enter the 3 addresses again." > /dev/tty
+                    REPLICA_HOSTS="" hosts=("" "" "") idx=0
+                    continue
+                fi ;;
+            app)
+                value=$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')
+                if [[ ! "$value" =~ $REPLICA_HOSTNAME_RE ]]; then
+                    warn "Enter a full name like nano.example.com (no http://, no port)."
+                    continue
+                fi
+                REPLICA_APP_HOSTNAME=$value ;;
+            ingest)
+                value=$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')
+                if [[ ! "$value" =~ $REPLICA_HOSTNAME_RE ]]; then
+                    warn "Enter a full name like ingest.nano.example.com (no http://, no port)."
+                    continue
+                elif [[ "$value" == "$REPLICA_APP_HOSTNAME" ]]; then
+                    warn "Use a different name than the web address (for example ingest.$REPLICA_APP_HOSTNAME)."
+                    continue
+                fi
+                REPLICA_INGEST_HOSTNAME=$value ;;
+        esac
+        idx=$(( idx + 1 ))
+    done
+    ANSWER_ENV_HINT=""
+}
+
+# "Yes": check the servers, write inventory.yaml, print the steps. Exits.
+# The environment always wins: NANO_REPLICA_* values are used as given and
+# only the missing ones are asked (on a terminal) or named (without one).
+replica_setup_cluster() {
+    local probe_port="${NANO_REPLICA_PROBE_PORT:-22}" out="$PWD/inventory.yaml" deployment_id err err_file h1 h2 h3
+    local -a replica_missing=()
+    command -v python3 >/dev/null 2>&1 \
+        || fail "Setting up 3 servers needs python3 on this server. Install it and re-run. Nothing was written."
+    # Enterprise-only helper (the open bundle never gets here): checked, not required.
+    if [[ ! -f scripts/lib/replica_setup.py || ! -f deploy/compose/render-inventory.py ]]; then
+        fail "This bundle has no 3-server setup tooling (scripts/lib/replica_setup.py). Use the enterprise bundle. Nothing was written."
+    fi
+    [[ "$probe_port" =~ ^[0-9]{1,5}$ ]] && (( probe_port >= 1 && probe_port <= 65535 )) \
+        || fail "NANO_REPLICA_PROBE_PORT must be a port number from 1 to 65535 (got '$probe_port'). Nothing was written."
+    [[ ! -e "$out" && ! -L "$out" ]] \
+        || fail "$out already exists. To use it, run the steps in docs/getting-started/self-hosting-multi-node.md (First installation). To start over, move it away and re-run. Nothing was written."
+    REPLICA_HOSTS=$(trim_space "${NANO_REPLICA_HOSTS:-}")
+    REPLICA_APP_HOSTNAME=$(trim_space "${NANO_REPLICA_APP_HOSTNAME:-}" | tr '[:upper:]' '[:lower:]')
+    REPLICA_INGEST_HOSTNAME=$(trim_space "${NANO_REPLICA_INGEST_HOSTNAME:-}" | tr '[:upper:]' '[:lower:]')
+    if [[ -n "$REPLICA_APP_HOSTNAME" && ! "$REPLICA_APP_HOSTNAME" =~ $REPLICA_HOSTNAME_RE ]] \
+        || [[ -n "$REPLICA_INGEST_HOSTNAME" && ! "$REPLICA_INGEST_HOSTNAME" =~ $REPLICA_HOSTNAME_RE ]]; then
+        fail "NANO_REPLICA_APP_HOSTNAME and NANO_REPLICA_INGEST_HOSTNAME must be full names like nano.example.com (no http://, no port). Nothing was written."
+    fi
+    if [[ -n "$REPLICA_APP_HOSTNAME" && "$REPLICA_APP_HOSTNAME" == "$REPLICA_INGEST_HOSTNAME" ]]; then
+        fail "NANO_REPLICA_APP_HOSTNAME and NANO_REPLICA_INGEST_HOSTNAME must be different names. Nothing was written."
+    fi
+    if [[ -n "$REPLICA_HOSTS" && -n "$REPLICA_APP_HOSTNAME" && -n "$REPLICA_INGEST_HOSTNAME" ]]; then
+        replica_check_hosts "$probe_port" \
+            || fail "The 3 servers in NANO_REPLICA_HOSTS did not pass the checks above. Nothing was written."
+    elif have_controlling_tty; then
+        trap 'printf "\n" >/dev/tty; warn "Interrupted: nothing was written and nothing was started."; exit 130' INT
+        replica_ask_missing "$probe_port"
+        trap - INT
+    else
+        [[ -n "$REPLICA_HOSTS" ]] || replica_missing+=("NANO_REPLICA_HOSTS (the 3 servers' private addresses, comma-separated)")
+        [[ -n "$REPLICA_APP_HOSTNAME" ]] || replica_missing+=("NANO_REPLICA_APP_HOSTNAME (the web address, e.g. nano.example.com)")
+        [[ -n "$REPLICA_INGEST_HOSTNAME" ]] || replica_missing+=("NANO_REPLICA_INGEST_HOSTNAME (the log sending address, e.g. ingest.nano.example.com)")
+        printf '  - %s\n' "${replica_missing[@]}" >&2
+        fail "NANO_REPLICAS=yes needs the values above ($(noninteractive_reason)). Set them and re-run. Nothing was written."
+    fi
+    if [[ -n "${NANO_DEPLOYMENT_ID:-}" && ! "$NANO_DEPLOYMENT_ID" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]]; then
+        fail "NANO_DEPLOYMENT_ID='$NANO_DEPLOYMENT_ID' cannot name the cluster: use lowercase letters, digits, hyphens or underscores (up to 63), or unset it to get a generated one. Nothing was written."
+    fi
+    err_file=$(mktemp "${TMPDIR:-/tmp}/nano-replica.XXXXXX") || fail "Could not create a temporary file."
+    deployment_id=$(python3 -I scripts/lib/replica_setup.py inventory --hosts "$REPLICA_HOSTS" \
+        --app-hostname "$REPLICA_APP_HOSTNAME" --ingest-hostname "$REPLICA_INGEST_HOSTNAME" \
+        --output "$out" --renderer deploy/compose/render-inventory.py \
+        ${NANO_DEPLOYMENT_ID:+--deployment-id "$NANO_DEPLOYMENT_ID"} </dev/null 2>"$err_file") \
+        || { err=$(cat "$err_file" 2>/dev/null); rm -f "$err_file"; printf '%s\n' "$err" | sed 's/^/  - /' >&2
+             fail "Could not write inventory.yaml (see above). Nothing was installed."; }
+    rm -f "$err_file"
+    # Commas and/or spaces separate the servers (as replica_setup.py reads them).
+    read -r h1 h2 h3 <<< "$(printf '%s' "$REPLICA_HOSTS" | tr ',' ' ')"
+    ok "Wrote $out (deployment $deployment_id): nano-1 ($h1) runs the web app and database; nano-2 ($h2) and nano-3 ($h3) each keep a full copy of your events."
+    cat <<EOF
+
+Nothing was installed on this server yet. Next steps (full guide:
+docs/getting-started/self-hosting-multi-node.md, "First installation"):
+
+  1. Make one TLS certificate, signed by your own CA, whose names (SANs) cover
+     $REPLICA_APP_HOSTNAME and all 3 server addresses: $h1, $h2, $h3.
+     The servers check each other's certificate against these names.
+     Put it, its key and the CA on every server at /var/lib/nano/tls/staged/
+     (server.crt, server.key, ca.crt).
+  2. Copy this nano folder to the same path on nano-2 and nano-3.
+  3. On nano-1, store the inventory and create the shared settings (.env):
+       sudo install -d -m 0755 /etc/nano
+       sudo install -m 0600 -o "\$USER" -g "\$(id -gn)" inventory.yaml /etc/nano/inventory.yaml
+       NANO_HOST_NAME=nano-1 NANO_PREPARE_ONLY=1 ./install.sh --role app --inventory /etc/nano/inventory.yaml
+  4. Copy .env and /etc/nano/inventory.yaml to nano-2 and nano-3 (same paths, mode 0600).
+  5. Start the servers in this order:
+       nano-1:          NANO_HOST_NAME=nano-1 ./install.sh --role postgres,keeper --inventory /etc/nano/inventory.yaml
+       nano-2, nano-3:  NANO_HOST_NAME=nano-2 ./install.sh --role clickhouse,keeper --inventory /etc/nano/inventory.yaml
+                        (nano-3: NANO_HOST_NAME=nano-3)
+       nano-1:          NANO_HOST_NAME=nano-1 ./install.sh --role app,postgres,keeper --inventory /etc/nano/inventory.yaml
+       nano-2, nano-3:  NANO_HOST_NAME=nano-2 ./install.sh --role clickhouse,keeper,ingest --inventory /etc/nano/inventory.yaml
+  6. Point $REPLICA_APP_HOSTNAME at nano-1, and $REPLICA_INGEST_HOSTNAME at a load balancer
+     in front of nano-2 and nano-3.
+EOF
+    exit 0
+}
+
+# A run that already carries the first-install answers (scripted, e.g. over
+# `ssh -t` or an Ansible pty) is never stopped by this question: it takes no.
+replica_scripted_install() {
+    [[ -n "${NANO_ADMIN_EMAIL:-}" && -n "${NANO_BASE_URL:-}" ]]
+}
+
+configure_replicas() {
+    local value
+    value=$(replicas_input) || exit
+    if [[ -f .env || "$MULTI_NODE" == "1" ]]; then
+        # Only a fresh single-host install chooses its topology here; re-runs
+        # and upgrades never ask.
+        [[ "$MULTI_NODE" == "1" || "$value" != yes ]] \
+            || fail "NANO_REPLICAS=yes is for a new install, and this server already runs nano. Moving an existing install to 3 servers is not automatic yet: see docs/administration/event-safety.md. Nothing was changed."
+        return 0
+    fi
+    if [[ "$NANO_EDITION" != enterprise ]]; then
+        [[ "$value" != yes ]] \
+            || fail "A second copy on other servers runs nano on 3 servers, which is part of the enterprise edition, and this is the $NANO_EDITION edition. Remove NANO_REPLICAS=yes (--replicas yes), or use the enterprise bundle. Nothing was written."
+        replica_data_safety_note
+        return 0
+    fi
+    if [[ -z "$value" ]]; then
+        if have_controlling_tty && ! replica_scripted_install; then
+            trap 'printf "\n" >/dev/tty; warn "Interrupted: nothing was written and nothing was started."; exit 130' INT
+            replica_ask_question
+            trap - INT
+            value=$REPLICA_ANSWER
+        else
+            value=no
+        fi
+    fi
+    if [[ "$value" == yes ]]; then
+        replica_setup_cluster
+    fi
+    replica_data_safety_note
+}
+# <<< second copy of the event data (NAN-5929) <<<
+
+configure_replicas
+
 # NAN-5508: every interactive question, then the review screen, before
 # anything below writes .env, generates a secret or starts a container.
 if [[ -f .env ]]; then
@@ -4862,7 +5218,7 @@ if [[ -f .env ]]; then
     fi
     if [[ ",${NANO_ROTATED_SECRET_KEYS// /}," == *,NANOSIEM_ENCRYPTION_KEY,* ]]; then
         warn "NANOSIEM_ENCRYPTION_KEY was a publicly known example key. Moved .env to a key ring: a new generated active key, with the old key kept decrypt-only (legacy-0) so every stored credential still opens."
-        warn "nano re-encrypts stored credentials in the background. Check progress with: docker compose -f $COMPOSE_FILE exec nano-jobs nanosiem-jobs credential-keys status"
+        warn "nano re-encrypts stored credentials in the background. Check progress with: docker exec \$(docker ps -qf label=com.docker.compose.service=nano-jobs) nanosiem-jobs credential-keys status"
         warn "When it reports nothing pending, and no backup older than today still needs restoring, retire the old key: ... credential-keys retire legacy-0"
     fi
     if [[ ",${NANO_ROTATED_SECRET_KEYS// /}," == *,NANO_VECTOR_CONFIG_DELIVERY_TOKEN,* ]]; then
@@ -5458,12 +5814,12 @@ if [[ "$MULTI_NODE" != "1" ]]; then
 fi
 
 # NAN-3322 / NAN-4909: the unauthenticated ingest ports (raw OTLP
-# :4317/:4318, Fluent :24224, bundled Tenzir :9095) bind 127.0.0.1 unless the
+# :4317/:4318, bundled Tenzir :9095) bind 127.0.0.1 unless the
 # operator opts in. NAN-5515: Vector native :6000 is mutual-TLS only and binds
 # the ingest interface; NANO_VECTOR_NATIVE_BIND_ADDRESS only narrows it. A
 # bind override given to the installer must survive a later plain
 # `docker compose up`, which reads only .env, so persist it there.
-for key in NANO_VECTOR_NATIVE_BIND_ADDRESS NANO_VECTOR_NATIVE_SANS NANO_VECTOR_NATIVE_PUBLIC_HOST NANO_OTLP_BIND_ADDRESS NANO_FLUENT_BIND_ADDRESS NANO_TENZIR_BIND_ADDRESS; do
+for key in NANO_VECTOR_NATIVE_BIND_ADDRESS NANO_VECTOR_NATIVE_SANS NANO_VECTOR_NATIVE_PUBLIC_HOST NANO_OTLP_BIND_ADDRESS NANO_TENZIR_BIND_ADDRESS; do
     if [[ -n "${!key:-}" ]]; then
         # Set in place (NAN-5251): re-runs used to append one more line each.
         nano_env_set_keys .env "$key=${!key}" || fail "Could not record $key in .env."
@@ -5980,6 +6336,17 @@ if [[ -f scripts/lib/compose_stale_mounts.py ]]; then
 fi
 
 ACTIVE_IMAGES=$(docker compose "${COMPOSE_ARGS[@]}" config --images </dev/null)
+# NAN-5937: enterprise images are private, and this run's registry login ends
+# with it. Pull nano-backup with the release even while automatic backups are
+# off (their `backup` profile), so a later `scripts/nano backup-schedule
+# --configure` finds it. Open core keeps pulling it only with the profile.
+if [[ "$NANO_EDITION" == "enterprise" ]] && { [[ "$MULTI_NODE" != "1" ]] || [[ ",${ROLE_ARG}," == *,app,* ]]; }; then
+    backup_image=$(docker compose "${COMPOSE_ARGS[@]}" --profile backup config --images nano-backup </dev/null 2>/dev/null) \
+        || backup_image=""
+    if [[ -n "$backup_image" ]]; then
+        ACTIVE_IMAGES=$(printf '%s\n%s\n' "$ACTIVE_IMAGES" "$backup_image" | awk 'NF && !seen[$0]++')
+    fi
+fi
 
 # NAN-5509: the host ports this graph publishes (overlays and profiles
 # included). A port another process holds failed `up` after the whole pull,
@@ -6451,7 +6818,7 @@ drain_refused_restore_env() {
     # nano_vq_reopen warns but returns 0 when Vector's gate did not open: say so here too.
     if declare -F nano_vq_running >/dev/null && nano_vq_running vector \
         && [[ "$(nano_vq_compose exec -T vector sh /etc/vector/.nano/ingest-gate.sh status </dev/null 2>/dev/null)" == closed* ]]; then
-        gate_state=" Vector's published ingest ports are STILL CLOSED: run docker compose exec vector sh /etc/vector/.nano/ingest-gate.sh open."
+        gate_state=" Vector's published ingest ports are STILL CLOSED: run $(nano_vq_compose_text) exec vector sh /etc/vector/.nano/ingest-gate.sh open."
     fi
     env_state="it was not changed"
     if [[ -z "${PRE_RUN_ENV_COPY:-}" || ! -f "$PRE_RUN_ENV_COPY" ]]; then
@@ -6530,6 +6897,13 @@ for name in ("vector", "vector-netns", "clickhouse"):
 # END nano-vector-pipeline-stop
 if [[ "$MULTI_NODE" != "1" ]]; then
     if [[ -r scripts/lib/vector-quiesce.sh ]]; then
+        # NAN-5966: the lib's "run: ..." hints print this install's full
+        # Compose command (a bare `docker compose` finds no stack here).
+        nano_vq_compose_text() {
+            local argument
+            printf 'cd %q && docker compose' "$PWD"
+            for argument in "${COMPOSE_ARGS[@]}"; do printf ' %q' "$argument"; done
+        }
         # shellcheck source=scripts/lib/vector-quiesce.sh
         . scripts/lib/vector-quiesce.sh
         nano_vq_compose() { ${NANO_VQ_LIMIT:+timeout "$NANO_VQ_LIMIT"} docker compose "${COMPOSE_ARGS[@]}" "$@"; }
@@ -6621,7 +6995,7 @@ compose_up_hint() {
         # ERROR / exception lines whole (bounded) and trim only the rest.
         docker compose "${COMPOSE_ARGS[@]}" logs --no-color --tail 15 "$service" </dev/null 2>&1 \
             | sed -e 's/\x1b\[[0-9;]*m//g' \
-            | awk '{ max = ($0 ~ /ERROR|Exception|Code: [0-9]+/) ? 4000 : 400
+            | awk '{ max = ($0 ~ /FATAL|ERROR|Exception|Code: [0-9]+/) ? 4000 : 400
                      if (length($0) > max) print substr($0, 1, max) " ..."; else print }' >&2 || true
         if [[ "$service" == clickhouse-migrate ]]; then
             docker compose "${COMPOSE_ARGS[@]}" logs --no-color --tail 40 "$service" </dev/null 2>&1 \
@@ -6753,7 +7127,7 @@ fi
 # NAN-5566: reopen ingest (closed above while Vector drained, or left closed by
 # an earlier run that failed) once the new Vector reports healthy.
 if [[ "$(type -t nano_vq_reopen)" == function ]]; then
-    nano_vq_reopen || warn "Ingest may still be closed at nginx: docker compose exec nginx rm -f /run/nano-ingest/closed"
+    nano_vq_reopen || warn "Ingest may still be closed at nginx: $(nano_vq_compose_text) exec nginx rm -f /run/nano-ingest/closed"
 fi
 
 # NAN-5404: ClickHouse cannot confine a user to a listener. Since NAN-5880 the

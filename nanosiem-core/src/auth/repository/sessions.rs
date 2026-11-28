@@ -62,6 +62,34 @@ impl SessionRepository {
         Ok(session)
     }
 
+    /// NAN-5973: create a session with a caller-chosen id, so its first
+    /// refresh token can carry the session id (`sid`) before the row exists.
+    pub async fn create_session_with_id(
+        &self,
+        id: Uuid,
+        user_id: Uuid,
+        refresh_token_hash: &str,
+        ip_address: Option<&str>,
+        user_agent: Option<&str>,
+        expires_at: DateTime<Utc>,
+    ) -> Result<Session, SessionRepositoryError> {
+        Ok(sqlx::query_as::<_, Session>(
+            r#"
+            INSERT INTO sessions (id, user_id, refresh_token_hash, ip_address, user_agent, expires_at)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING *
+            "#,
+        )
+        .bind(id)
+        .bind(user_id)
+        .bind(refresh_token_hash)
+        .bind(ip_address)
+        .bind(user_agent)
+        .bind(expires_at)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
     /// Get a session by its refresh token hash
     pub async fn get_session_by_token_hash(
         &self,
@@ -304,25 +332,47 @@ impl SessionRepository {
         Ok(session)
     }
 
-    /// NAN-2453: the session whose IMMEDIATELY PREVIOUS refresh token hash is
-    /// `token_hash`, if it was rotated less than `grace_secs` ago and has not
-    /// expired. Two browser tabs refreshing at the same moment present the same
-    /// cookie; the loser is served from this lookup instead of a 401 whose
-    /// cookie-clearing response would wipe the winner's new cookie.
-    pub async fn get_session_in_refresh_grace(
+    /// NAN-2453 / NAN-5973: the live session whose IMMEDIATELY PREVIOUS
+    /// refresh token hash is `token_hash`, plus whether that rotation happened
+    /// less than `grace_secs` ago (database clock, the same clock that stamped
+    /// `rotated_at`). Inside the window the caller replays the session's
+    /// current token (reuse interval); outside it the presentation is reuse
+    /// and the caller revokes the session.
+    pub async fn find_session_by_previous_token_hash(
         &self,
         token_hash: &str,
         grace_secs: i64,
-    ) -> Result<Option<Session>, SessionRepositoryError> {
-        Ok(sqlx::query_as::<_, Session>(
-            "SELECT * FROM sessions WHERE previous_refresh_token_hash = $1 \
-             AND rotated_at > clock_timestamp() - make_interval(secs => $2::double precision) \
-             AND expires_at > NOW()",
+    ) -> Result<Option<(Session, bool)>, SessionRepositoryError> {
+        use sqlx::{FromRow, Row};
+        let row = sqlx::query(
+            "SELECT *, (rotated_at > clock_timestamp() - make_interval(secs => $2::double precision)) \
+                 AS in_refresh_grace \
+             FROM sessions WHERE previous_refresh_token_hash = $1 AND expires_at > NOW()",
         )
         .bind(token_hash)
         .bind(grace_secs as f64)
         .fetch_optional(&self.pool)
-        .await?)
+        .await?;
+        let Some(row) = row else { return Ok(None) };
+        let in_grace: Option<bool> = row.try_get("in_refresh_grace")?;
+        Ok(Some((Session::from_row(&row)?, in_grace.unwrap_or(false))))
+    }
+
+    /// NAN-5973: revoke a whole refresh-token family (the session row, which
+    /// holds the current and previous token hashes) after refresh-token reuse
+    /// was detected. Scoped to `user_id` so a token can only ever revoke its
+    /// own owner's session. Returns whether a session was deleted.
+    pub async fn revoke_session_family(
+        &self,
+        id: Uuid,
+        user_id: Uuid,
+    ) -> Result<bool, SessionRepositoryError> {
+        let result = sqlx::query("DELETE FROM sessions WHERE id = $1 AND user_id = $2")
+            .bind(id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     /// Cleanup expired sessions

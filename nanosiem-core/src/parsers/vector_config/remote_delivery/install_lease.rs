@@ -328,19 +328,38 @@ pub async fn fence_legacy_scope(pool: &PgPool) -> Result<(), sqlx::Error> {
 /// be upgraded first ([`VECTOR_UPGRADE_HOLDER`], NAN-5810 review r2: a v2.0.35
 /// consumer logs that holder as "must be 0.62.0-nano.2 or later", while it
 /// does not know `install-lease-v3-required`).
+///
+/// A custom or upstream build is sent to v3 only when [`ALLOW_CUSTOM_VECTOR_ENV`]
+/// is set, the same rule [`request`] applies, so it is never redirected to a
+/// path that would refuse it (NAN-5891).
 async fn refuse_on_superseded_path(
     pool: &PgPool,
     holder: &str,
     generation: i64,
     vector_release: Option<&str>,
 ) -> Result<LeaseOutcome, LeaseError> {
+    refuse_on_superseded_path_with(pool, holder, generation, vector_release, custom_vector_allowed()).await
+}
+
+/// [`refuse_on_superseded_path`] with the custom-build opt-in passed in
+/// (testable without the process environment).
+async fn refuse_on_superseded_path_with(
+    pool: &PgPool,
+    holder: &str,
+    generation: i64,
+    vector_release: Option<&str>,
+    allow_custom: bool,
+) -> Result<LeaseOutcome, LeaseError> {
     validate_holder(holder).map_err(LeaseError::Request)?;
     if generation <= 0 {
         return Err(LeaseError::Request(LeaseRequestError::InvalidGeneration));
     }
     fence_legacy_scope(pool).await?;
-    let holder_named =
-        if vector_release_allows_install(vector_release) { LEASE_V3_HOLDER } else { VECTOR_UPGRADE_HOLDER };
+    let holder_named = if vector_release_allows_install_with(vector_release, allow_custom) {
+        LEASE_V3_HOLDER
+    } else {
+        VECTOR_UPGRADE_HOLDER
+    };
     Ok(LeaseOutcome::Busy {
         holder: holder_named.to_string(),
         generation,

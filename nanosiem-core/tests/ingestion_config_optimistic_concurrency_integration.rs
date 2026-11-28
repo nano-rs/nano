@@ -18,7 +18,7 @@ use nanosiem_core::{
 use uuid::Uuid;
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn source_config_expected_updated_at_allows_exactly_one_concurrent_writer() {
     let pool = common::migrated_pool().await;
     let id = Uuid::now_v7();
@@ -91,7 +91,7 @@ async fn source_config_expected_updated_at_allows_exactly_one_concurrent_writer(
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn log_source_expected_updated_at_allows_exactly_one_concurrent_writer() {
     let pool = common::migrated_pool().await;
     let id = Uuid::now_v7();

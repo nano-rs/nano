@@ -20,6 +20,7 @@
 //   E2E_UI_HEADED=1 to watch it
 
 import fs from 'node:fs';
+import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
@@ -42,6 +43,216 @@ try {
   LAYOUT_ALLOW = loadAllowlist(process.env.E2E_LAYOUT_ALLOWLIST || '');
 } catch (e) {
   process.stderr.write(`layout allowlist unreadable: ${e}\n`);
+  throw e;
+}
+
+// Inline WCAG 2.0/2.1 A/AA accessibility hook (mirrors NAN-5762 layout hook).
+// Default is `off` so existing e2e runs are unaffected unless opted in.
+// One strict parser, the same as ui.py a11y_mode(): off, report or enforce in
+// any case, surrounding spaces ignored, unset or empty = off. Any other value
+// is an error, so a typo never silently turns the scan on or off.
+const A11Y_MODES = new Set(['off', 'report', 'enforce']);
+export function parseA11yMode(raw) {
+  const mode = String(raw ?? '').trim().toLowerCase() || 'off';
+  if (!A11Y_MODES.has(mode)) {
+    throw new Error(`NANO_E2E_A11Y=${JSON.stringify(String(raw))}: expected enforce, report or off`);
+  }
+  return mode;
+}
+const A11Y_MODE = parseA11yMode(process.env.NANO_E2E_A11Y);
+const A11Y_WCAG_TAGS = ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa'];
+const A11Y_BLOCKING_IMPACTS = new Set(['critical', 'serious']);
+const A11Y_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const A11Y_RULE_RE = /^[a-z][a-z0-9-]*$/;
+const A11Y_ISSUE_RE = /^NAN-\d+$/;
+const _AXE_CACHE = new Map();
+
+// Why an allowlist selector or within is too broad, or null when it is
+// specific. Mirrors ui.py a11y_selector_problem() exactly: CSS escapes,
+// quoted strings, [attribute] bodies and (...) arguments are blanked first;
+// then a universal "*" or a selector list is refused, and the last compound
+// (the element the rule applies to) needs a non-empty id, class or
+// attribute. So *, html, body, :root, div, ".", "div, *", "body *" and
+// :not(.x) are all refused. Nor may the last part be the document root
+// (html[lang], body.dark, :root:not(.x), html > body), whatever its
+// qualifiers: as a within every element is inside it.
+export function a11ySelectorProblem(sel) {
+  let s = String(sel).replace(/\\./g, '_');
+  s = s.replace(/"[^"]*"|'[^']*'/g, '"x"');
+  s = s.replace(/\[([^\]]*)\]/g, (_, inner) => (inner.trim() ? '[a]' : '[]'));
+  for (let prev = ''; prev !== s;) { prev = s; s = s.replace(/\([^()]*\)/g, '()'); }
+  if (s.includes('*')) return 'uses the universal "*" selector';
+  if (s.includes(',')) return 'is a selector list; use one selector per entry';
+  const parts = s.trim().split(/\s*[>+~]\s*|\s+/).filter(Boolean);
+  const subject = parts.length ? parts[parts.length - 1] : '';
+  if (!/#[A-Za-z0-9_-]|\.[A-Za-z0-9_-]|\[a\]/.test(subject)) {
+    return 'is too broad; its last part needs an id (#x), a class (.x) or an attribute ([x=y])';
+  }
+  if (/^(?:html|body)(?![A-Za-z0-9_-])/i.test(subject) || /:root(?![A-Za-z0-9_-])/i.test(subject)) {
+    return 'is the whole page; every element is inside html, body or :root';
+  }
+  return null;
+}
+
+// ui-surfaces.json key -> regex source; the same as ui.py _a11y_route_regex().
+export function a11yRouteRegex(route) {
+  const esc = route.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/:[A-Za-z_][A-Za-z0-9_]*/g, '[^/]+');
+  return `^${esc}/?$`;
+}
+
+// In-page allowlist matcher (self-contained: puppeteer serializes it). For
+// each item returns the first matching entry id or null. An entry matches when
+// the rule is the same, a surface (if any) matches the path or path+query, the
+// element matches "selector" (if set) and has an ancestor-or-self matching
+// "within" (if set). ui.py match_a11y_allowlist() applies the same rules to
+// selector strings; e2e/selftest/fixtures/a11y-allowlist-parity.json pins them.
+export function a11yMatchAll({ allow, items }) {
+  const route = location.pathname;
+  const full = route + location.search;
+  const errors = [];
+  const safe = (fn, sel) => {
+    try { return fn(); } catch (err) { errors.push(`${sel}: ${err.message}`); return false; }
+  };
+  const ids = items.map(({ rule, target }) => {
+    let el = null;
+    if (typeof target === 'string' && target) {
+      try { el = document.querySelector(target); } catch { el = null; }
+    }
+    if (!el) return null;
+    for (const a of allow) {
+      if (a.rule !== rule) continue;
+      if (a.routes.length && !a.routes.some((rx) => new RegExp(rx).test(route) || new RegExp(rx).test(full))) continue;
+      if (a.selector && !safe(() => el.matches(a.selector), a.selector)) continue;
+      if (a.within && !safe(() => Boolean(el.closest(a.within)), a.within)) continue;
+      return a.id;
+    }
+    return null;
+  });
+  return { ids, errors };
+}
+
+// A page URL safe to log: no user:password, no #fragment, and query values
+// dropped (the keys stay, so ?tab= is still readable).
+export function a11ySafeUrl(raw) {
+  try {
+    const u = new URL(String(raw));
+    const keys = [...new Set([...u.searchParams.keys()])];
+    return `${u.origin}${u.pathname}${keys.length ? `?${keys.map((k) => `${encodeURIComponent(k)}=`).join('&')}` : ''}`;
+  } catch {
+    return '';
+  }
+}
+
+export function loadA11yAllowlist(file) {
+  if (!file || !fs.existsSync(file)) return [];
+  const doc = JSON.parse(fs.readFileSync(file, 'utf8'));
+  if (!doc || typeof doc !== 'object' || !Array.isArray(doc.entries)) {
+    throw new Error('a11y allowlist must be a JSON object with an "entries" array');
+  }
+  const seen = new Set();
+  const out = [];
+  for (let i = 0; i < doc.entries.length; i += 1) {
+    const e = doc.entries[i];
+    const where = `a11y allowlist entry ${i}`;
+    if (!e || typeof e !== 'object') throw new Error(`${where}: must be an object`);
+    if (typeof e.id !== 'string' || !A11Y_ID_RE.test(e.id)) {
+      throw new Error(`${where}: requires "id" matching [A-Za-z0-9][A-Za-z0-9._-]*`);
+    }
+    if (seen.has(e.id)) throw new Error(`${where}: duplicate id ${JSON.stringify(e.id)}`);
+    seen.add(e.id);
+    if (typeof e.rule !== 'string' || !A11Y_RULE_RE.test(e.rule) || e.rule === 'any' || e.rule === 'all') {
+      throw new Error(`${where} (${e.id}): requires exact axe rule id in "rule" (wildcards forbidden)`);
+    }
+    const selector = typeof e.selector === 'string' && e.selector.trim() ? e.selector.trim() : null;
+    const within = typeof e.within === 'string' && e.within.trim() ? e.within.trim() : null;
+    if (!selector && !within) {
+      throw new Error(`${where} (${e.id}): requires at least one of "selector" or "within"`);
+    }
+    for (const [name, value] of [['selector', selector], ['within', within]]) {
+      const problem = value ? a11ySelectorProblem(value) : null;
+      if (problem) throw new Error(`${where} (${e.id}): "${name}" ${JSON.stringify(value)} ${problem}`);
+    }
+    if (typeof e.reason !== 'string' || !e.reason.trim()) {
+      throw new Error(`${where} (${e.id}): requires a non-empty "reason"`);
+    }
+    const surfaces = e.surfaces === undefined ? [] : e.surfaces;
+    if (
+      !Array.isArray(surfaces)
+      || surfaces.some((s) => typeof s !== 'string' || !s.trim() || s !== s.trim() || s.includes('*') || !s.startsWith('/'))
+    ) {
+      throw new Error(`${where} (${e.id}): "surfaces" must be an array of concrete "/..." ui-surfaces.json keys without wildcards`);
+    }
+    if (e.temporary !== undefined && typeof e.temporary !== 'boolean') {
+      throw new Error(`${where} (${e.id}): "temporary" must be a boolean`);
+    }
+    if (e.issue !== undefined && e.issue !== null) {
+      if (typeof e.issue !== 'string' || !A11Y_ISSUE_RE.test(e.issue)) {
+        throw new Error(`${where} (${e.id}): "issue" must match NAN-<id>`);
+      }
+    }
+    if (e.temporary === true && !(typeof e.issue === 'string' && A11Y_ISSUE_RE.test(e.issue))) {
+      throw new Error(`${where} (${e.id}): temporary entry requires "issue": "NAN-<id>"`);
+    }
+    out.push({
+      id: e.id,
+      rule: e.rule,
+      routes: surfaces.map(a11yRouteRegex),
+      selector,
+      within,
+    });
+  }
+  return out;
+}
+
+export function resolveAxeSource(explicitPath = '') {
+  const configured = String(explicitPath || process.env.NANO_E2E_AXE_PATH || '').trim();
+  const candidates = [];
+  if (configured) {
+    if (!fs.existsSync(configured)) {
+      return {
+        available: false,
+        reason: `axe-core path does not exist: ${configured}`,
+      };
+    }
+    candidates.push(configured);
+  } else {
+    const resolvers = [createRequire(import.meta.url)];
+    try {
+      resolvers.push(createRequire(path.join(process.cwd(), 'package.json')));
+    } catch { /* cwd has no package.json */ }
+    for (const req of resolvers) {
+      for (const spec of ['axe-core/axe.min.js', 'axe-core']) {
+        try {
+          const resolved = req.resolve(spec);
+          if (resolved && fs.existsSync(resolved)) {
+            const minSibling = path.join(path.dirname(resolved), 'axe.min.js');
+            candidates.push(fs.existsSync(minSibling) ? minSibling : resolved);
+          }
+        } catch { /* try next resolver */ }
+      }
+    }
+  }
+  for (const cand of candidates) {
+    if (_AXE_CACHE.has(cand)) return { available: true, path: cand, source: _AXE_CACHE.get(cand) };
+    try {
+      const source = fs.readFileSync(cand, 'utf8');
+      if (source.trim()) {
+        _AXE_CACHE.set(cand, source);
+        return { available: true, path: cand, source };
+      }
+    } catch { /* try next candidate */ }
+  }
+  return {
+    available: false,
+    reason: 'axe-core not found (set NANO_E2E_AXE_PATH or install axe-core in node_modules)',
+  };
+}
+
+let A11Y_ALLOW = [];
+try {
+  A11Y_ALLOW = loadA11yAllowlist(process.env.E2E_A11Y_ALLOWLIST || '');
+} catch (e) {
+  process.stderr.write(`a11y allowlist unreadable: ${e}\n`);
   throw e;
 }
 
@@ -894,6 +1105,208 @@ const OPS = {
       // A navigation tore the context down mid-scan: the next op re-measures.
       if (/Execution context was destroyed|Cannot find context|Target closed|detached/i.test(String(e))) {
         return { violations: [], allowed: [] };
+      }
+      throw e;
+    }
+  },
+  // WCAG 2.0/2.1 A/AA accessibility scan via axe-core (mirrors layout_check).
+  // Resolves axe-core cleanly from NANO_E2E_AXE_PATH or node_modules; if
+  // absent, returns a structured unavailable result without crashing Chrome.
+  async a11y_scan({ sid, force = false, after = '', tags = A11Y_WCAG_TAGS, axe_path: axePath = '', mode = '' }) {
+    const s = sess(sid);
+    // The page's own mode (UiPage.a11y) wins over the driver's start-up env, so
+    // a page that opts in works on the session-scoped driver.
+    const effectiveMode = mode ? parseA11yMode(mode) : A11Y_MODE;
+    if (effectiveMode === 'off' && !force) {
+      return {
+        available: true,
+        skipped: true,
+        reason: 'NANO_E2E_A11Y=off',
+        route: '',
+        theme: '',
+        blocking: [],
+        warnings: [],
+        allowed: [],
+        violations: [],
+        incomplete_count: 0,
+        passes_count: 0,
+      };
+    }
+    const { page } = s;
+    s.a11ySeen = s.a11ySeen || new Set();
+    try {
+      const sig = await page.evaluate(layoutSignature);
+      if (!force && sig === s.a11ySig) {
+        return {
+          available: true,
+          skipped: true,
+          reason: 'unchanged',
+          route: '',
+          theme: '',
+          blocking: [],
+          warnings: [],
+          allowed: [],
+          violations: [],
+          incomplete_count: 0,
+          passes_count: 0,
+        };
+      }
+      const axeResolved = resolveAxeSource(axePath);
+      if (!axeResolved.available) {
+        const meta = await page.evaluate(() => ({
+          route: location.pathname,
+          theme: document.documentElement.classList.contains('dark') ? 'dark' : 'light',
+        })).catch(() => ({ route: '', theme: '' }));
+        return JSON.parse(scrub(JSON.stringify({
+          available: false,
+          reason: axeResolved.reason,
+          route: redactTokens(scrub(meta.route)),
+          theme: meta.theme,
+          blocking: [],
+          warnings: [],
+          allowed: [],
+          violations: [],
+          incomplete_count: 0,
+          passes_count: 0,
+        })));
+      }
+      await settleBodies(s);
+      await inject(page);
+      const sensitive = await page.evaluate(pageMayShowSecret, {
+        vals: [...SECRETS],
+        fields: s.secretFields,
+        reveal: SECRET_REVEAL,
+      });
+      await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+      const hasAxe = await page.evaluate(() => Boolean(window.axe && typeof window.axe.run === 'function'));
+      if (!hasAxe) {
+        await page.evaluate(axeResolved.source);
+      }
+      const runTags = Array.isArray(tags) && tags.length ? tags : A11Y_WCAG_TAGS;
+      const scan = await page.evaluate(async ({ evalTags, allow, noText }) => {
+        const route = location.pathname;
+        const root = document.documentElement;
+        let theme = 'light';
+        try {
+          const stored = localStorage.getItem('nanosiem-theme');
+          if (stored === 'dark' || stored === 'light') theme = stored;
+          else if (root.classList.contains('dark')) theme = 'dark';
+        } catch {
+          if (root.classList.contains('dark')) theme = 'dark';
+        }
+        if (!window.axe || typeof window.axe.run !== 'function') {
+          return { missingAxe: true, route, theme, findings: [], allowErrors: [], incomplete_count: 0, passes_count: 0 };
+        }
+        const res = await window.axe.run(document, {
+          runOnly: { type: 'tag', values: evalTags },
+        });
+        const findings = [];
+        for (const v of (res.violations || [])) {
+          const impact = String(v.impact || 'minor').toLowerCase();
+          for (const node of (v.nodes || [])) {
+            const targets = Array.isArray(node.target) ? node.target : [];
+            const selector = targets.map((t) => (Array.isArray(t) ? t.join(' >> ') : String(t))).join(', ');
+            const target = targets.length === 1 && typeof targets[0] === 'string' ? targets[0] : '';
+            findings.push({
+              target,
+              key: `${v.id}|${impact}|${route}|${theme}|${selector}`,
+              rule: v.id,
+              impact,
+              route,
+              theme,
+              selector,
+              help: v.help || '',
+              description: v.description || '',
+              help_url: v.helpUrl || '',
+              tags: Array.isArray(v.tags) ? v.tags : [],
+              html: noText ? '' : String(node.html || '').slice(0, 400),
+              failure_summary: noText ? '' : String(node.failureSummary || '').slice(0, 400),
+            });
+          }
+        }
+        return {
+          missingAxe: false,
+          route,
+          theme,
+          findings,
+          incomplete_count: (res.incomplete || []).length,
+          passes_count: (res.passes || []).length,
+        };
+      }, { evalTags: runTags, noText: sensitive });
+      if (scan.missingAxe) {
+        return JSON.parse(scrub(JSON.stringify({
+          available: false,
+          reason: 'axe-core script loaded without exposing window.axe.run()',
+          route: redactTokens(scrub(scan.route)),
+          theme: scan.theme,
+          blocking: [],
+          warnings: [],
+          allowed: [],
+          violations: [],
+          incomplete_count: 0,
+          passes_count: 0,
+        })));
+      }
+      const matched = await page.evaluate(a11yMatchAll, {
+        allow: A11Y_ALLOW,
+        items: scan.findings.map((f) => ({ rule: f.rule, target: f.target })),
+      });
+      if (matched.errors.length) {
+        throw new Error(`a11y allowlist selector error: ${matched.errors.join('; ')}`);
+      }
+      scan.findings.forEach((f, i) => { f.allowed = matched.ids[i]; });
+      s.a11ySig = await page.evaluate(layoutSignature);
+      // Every text field leaves through the same scrub (registered secrets +
+      // token shapes); ui.py then runs nano_e2e.redact over the whole result.
+      const clean = (t) => (t == null ? t : redactTokens(scrub(t)));
+      const fresh = scan.findings
+        .filter((f) => !s.a11ySeen.has(f.key))
+        .map(({ target, ...f }) => ({
+          ...f,
+          key: clean(f.key),
+          route: clean(f.route),
+          selector: clean(f.selector),
+          help: clean(f.help),
+          description: clean(f.description),
+          help_url: clean(f.help_url),
+          html: clean(f.html),
+          failure_summary: clean(f.failure_summary),
+          severity: A11Y_BLOCKING_IMPACTS.has(f.impact) ? 'blocking' : 'warning',
+        }));
+      for (const f of scan.findings) s.a11ySeen.add(f.key);
+      const allowed = fresh.filter((f) => Boolean(f.allowed));
+      const blocking = fresh.filter((f) => !f.allowed && f.severity === 'blocking');
+      const warnings = fresh.filter((f) => !f.allowed && f.severity !== 'blocking');
+      // a11y.jsonl lines; ui.py redacts and writes them (one redaction path).
+      const url = clean(a11ySafeUrl(page.url()));
+      const records = fresh.map((f) => ({ t: Date.now(), test: s.name, after, url, ...f }));
+      return JSON.parse(scrub(JSON.stringify({
+        available: true,
+        records,
+        route: clean(scan.route),
+        theme: scan.theme,
+        blocking,
+        warnings,
+        allowed,
+        violations: [...blocking, ...warnings],
+        incomplete_count: scan.incomplete_count,
+        passes_count: scan.passes_count,
+      })));
+    } catch (e) {
+      if (/Execution context was destroyed|Cannot find context|Target closed|detached/i.test(String(e))) {
+        return {
+          available: true,
+          skipped: true,
+          reason: 'navigation_context_destroyed',
+          route: '',
+          theme: '',
+          blocking: [],
+          warnings: [],
+          allowed: [],
+          violations: [],
+          incomplete_count: 0,
+          passes_count: 0,
+        };
       }
       throw e;
     }

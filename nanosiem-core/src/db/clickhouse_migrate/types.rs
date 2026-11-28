@@ -151,7 +151,7 @@ mod tests {
         // break construction. We can't introspect clickhouse::Client's
         // options directly (private), so this is the smallest assertion
         // we can make in pure-unit-test scope.
-        let client = clickhouse::Client::default().with_url("http://localhost:8123");
+        let client = clickhouse::Client::default().with_url("http://clickhouse.invalid:8123");
         let migrator = ClickHouseMigrator::new(client, "test_db");
         assert_eq!(migrator.database, "test_db");
     }

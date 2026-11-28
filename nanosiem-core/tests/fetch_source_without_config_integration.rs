@@ -317,7 +317,7 @@ async fn scenario(pool: PgPool, owned: Owned) {
 }
 
 #[tokio::test]
-#[ignore = "needs PostgreSQL (DATABASE_URL)"]
+#[ignore = "needs PostgreSQL (NANOSIEM_TEST_DATABASE_URL)"]
 async fn an_unbound_fetch_source_never_breaks_the_render_or_a_delete() {
     let pool = common::migrated_pool().await;
     let owned = Owned::default();
@@ -465,7 +465,7 @@ async fn boot_and_delete_scenario(pool: PgPool, owned: Owned) {
 }
 
 #[tokio::test]
-#[ignore = "needs PostgreSQL (DATABASE_URL)"]
+#[ignore = "needs PostgreSQL (NANOSIEM_TEST_DATABASE_URL)"]
 async fn a_boot_batch_and_a_config_delete_report_once_with_the_real_reason() {
     let pool = common::migrated_pool().await;
     let owned = Owned::default();

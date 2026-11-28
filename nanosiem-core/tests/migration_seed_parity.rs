@@ -84,8 +84,7 @@ const EXPECTED_OPEN_TIER_GROUP_DIVERGENCE: &[&str] = &[
 ];
 
 fn admin_url() -> String {
-    std::env::var("TEST_DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://nanosiem:nanosiem@localhost:5432/postgres".to_string())
+    nanosiem_test_db::require_pg_url()
 }
 
 fn url_for(db: &str) -> String {

@@ -22,7 +22,8 @@
 //!   mode evaluates end-to-end (engine → search → risk grain) and records
 //!   matches WITHOUT creating alerts.
 //!
-//! Requires local PG (:5432) + CH (:8123) with the nanosiem schema (and, for
+//! Requires a throwaway PG + CH named by `DATABASE_URL` and
+//! `CLICKHOUSE_TEST_URL` (no localhost default; skips when unset) with the nanosiem schema (and, for
 //! the cooldown tests, migrations 248/249 applied). Skips cleanly when
 //! unreachable or when `SKIP_DB_TESTS` is set.
 //!   Run: cargo test -p nanosiem-core --test detection_alert_cooldown_integration -- --nocapture
@@ -37,11 +38,10 @@ use nanosiem_core::{DualPool, DualPoolConfig};
 use serde_json::json;
 
 fn pg_url() -> String {
-    std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://nanosiem:nanosiem@localhost:5432/nanosiem".into())
+    nanosiem_test_db::require_pg_url()
 }
 fn ch_url() -> String {
-    std::env::var("CLICKHOUSE_TEST_URL").unwrap_or_else(|_| "http://localhost:8123".into())
+    nanosiem_test_db::require_ch_url()
 }
 
 /// Insert one probe log event (async_insert off + wait_end_of_query so the
@@ -172,6 +172,16 @@ async fn alerts(pool: &sqlx::PgPool, rule_id: uuid::Uuid) -> i64 {
 async fn connect() -> Option<(DetectionService, sqlx::PgPool, DualPool)> {
     if std::env::var("SKIP_DB_TESTS").is_ok() {
         println!("Skipping (SKIP_DB_TESTS set)");
+        return None;
+    }
+    // NAN-5964: these tests write probe rules and rows. Without explicit URLs
+    // they skip; they never fall back to a developer's own localhost stack.
+    if let Err(unset) = nanosiem_test_db::pg_and_ch_urls() {
+        println!("Skipping: {unset}");
+        return None;
+    }
+    if !nanosiem_test_db::destructive_opt_in() {
+        println!("Skipping: set NANOSIEM_ALLOW_DESTRUCTIVE_TESTS=1 to run these write tests");
         return None;
     }
     let config = DualPoolConfig::with_auth(pg_url(), ch_url(), "nanosiem", "nanosiem", "nanosiem");

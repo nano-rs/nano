@@ -6,13 +6,18 @@ fn accepts_only_exact_first_party_catalogs() {
     for ok in [
         "https://github.com/nano-rs/nano-enrichments",
         "https://github.com/nano-rs/nano-integrations.git",
-        "https://GitHub.com/nanos-sh/nano-enrichments/",
+        "https://GitHub.com/NANO-RS/nano-enrichments/",
         "https://github.com:443/nano-rs/parsers",
     ] {
         assert!(is_first_party_repo_url(ok), "{ok}");
     }
     for bad in [
         "https://github.com/acme/marketplace",
+        // NAN-5954: the pre-rename org is unregistered on GitHub, so anyone
+        // could claim it. It is third-party now.
+        "https://github.com/nanos-sh/nano-enrichments",
+        "https://GitHub.com/NANOS-SH/nano-enrichments/",
+        "https://github.com/nanos-sh/parsers.git",
         "https://attacker.example/github.com/nano-rs/rules",
         "https://github.com.attacker.example/nano-rs/rules",
         "https://github.com/nano-rs-evil/rules",

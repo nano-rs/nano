@@ -16,13 +16,14 @@ mod common;
 use std::time::{Duration, Instant};
 
 use nanosiem_core::auth::login_throttle::{
-    self, account_ip_key, ACCOUNT_DELAY_MAX_SECS, CATEGORY_ACCOUNT, CATEGORY_ACCOUNT_IP,
+    self, account_ip_key, normalize_email, ACCOUNT_DELAY_MAX_SECS, CATEGORY_ACCOUNT,
+    CATEGORY_ACCOUNT_IP, CATEGORY_ACCOUNT_SLOT,
 };
 use nanosiem_core::auth::repository::{
     GroupRepository, PrincipalAction, SessionRepository, UserRepository,
 };
 use nanosiem_core::auth::{
-    encrypt_backup_codes, encrypt_secret, generate_totp_secret, hash_backup_codes,
+    dummy_hash_probe, encrypt_backup_codes, encrypt_secret, generate_totp_secret, hash_backup_codes,
     hash_password, AuthConfig, AuthError, AuthService, GrantAuthorityStamp, LoginResult,
     TokenConfig, TokenService,
 };
@@ -103,7 +104,7 @@ async fn fail(svc: &AuthService, email: &str, ip: &str, n: i32) {
 /// NAN-1622: the crossing attempt is signalled exactly once; later attempts
 /// in the window return the plain generic error.
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn lock_signaled_once_on_threshold_crossing() {
     let pool = common::migrated_pool().await;
     let (_, email) = create_active_user(&pool, PASSWORD).await;
@@ -143,7 +144,7 @@ async fn lock_signaled_once_on_threshold_crossing() {
 /// THE scenario: guessing from address A locks A only. The real user signs
 /// in from address B, delayed by at most the cap, never locked out.
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn attacker_address_is_locked_while_the_user_signs_in_from_another() {
     let pool = common::migrated_pool().await;
     let (_, email) = create_active_user(&pool, PASSWORD).await;
@@ -179,7 +180,7 @@ async fn attacker_address_is_locked_while_the_user_signs_in_from_another() {
 /// The (email, address) lock is bounded: after the window the right password
 /// works from that address again.
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn address_lock_recovers_after_window() {
     let pool = common::migrated_pool().await;
     let (_, email) = create_active_user(&pool, PASSWORD).await;
@@ -214,7 +215,7 @@ async fn address_lock_recovers_after_window() {
 /// A successful sign-in resets the counters, so earlier failures do not
 /// carry into a later lock.
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn successful_login_resets_counters() {
     let pool = common::migrated_pool().await;
     let (_, email) = create_active_user(&pool, PASSWORD).await;
@@ -234,8 +235,10 @@ async fn successful_login_resets_counters() {
 
 /// NAN-5066: an unknown email gets the same response and the same delay
 /// curve as an existing one, because state is keyed on the email string.
+/// Timing is checked separately, robustly, in
+/// `unknown_email_costs_the_same_as_an_existing_account` (NAN-5984).
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn unknown_email_matches_existing_account_response_and_delay() {
     let pool = common::migrated_pool().await;
     let (_, email) = create_active_user(&pool, PASSWORD).await;
@@ -246,11 +249,15 @@ async fn unknown_email_matches_existing_account_response_and_delay() {
     // is what grows. Attempts 6 and 7 are delayed 1 s and 2 s.
     for attempt in 1..=threshold() + 2 {
         let ip = format!("192.0.2.{attempt}");
+        // A unique wrong password per call, so the dummy-hash probe counts
+        // exactly this call.
+        let unknown_pw = format!("wrong-unknown-{attempt}-{}", Uuid::now_v7());
+        let known_pw = format!("wrong-known-{attempt}-{}", Uuid::now_v7());
         let t = Instant::now();
-        let unknown_err = svc.login(&unknown, "wrong-password", Some(&ip), None).await.unwrap_err();
+        let unknown_err = svc.login(&unknown, &unknown_pw, Some(&ip), None).await.unwrap_err();
         let unknown_elapsed = t.elapsed();
         let t = Instant::now();
-        let known_err = svc.login(&email, "wrong-password", Some(&ip), None).await.unwrap_err();
+        let known_err = svc.login(&email, &known_pw, Some(&ip), None).await.unwrap_err();
         let known_elapsed = t.elapsed();
 
         assert_eq!(
@@ -259,6 +266,16 @@ async fn unknown_email_matches_existing_account_response_and_delay() {
             "attempt {attempt}: {unknown_err:?} vs {known_err:?}"
         );
         assert!(is_generic_failure(&known_err));
+        // Direct, clock-free proof of the anti-enumeration property: the
+        // unknown email ran exactly one bcrypt against the dummy hash, and the
+        // existing account ran its real hash (one bcrypt, not the dummy).
+        assert_eq!(
+            dummy_hash_probe::burns_for(&unknown_pw),
+            1,
+            "attempt {attempt}: an unknown email must verify against the dummy hash"
+        );
+        assert_eq!(dummy_hash_probe::burns_for(&known_pw), 0, "attempt {attempt}: existing account uses its real hash");
+        // Lower bound only: load can only make these slower.
         let expected = login_throttle::account_delay(attempt);
         for (who, elapsed) in [("unknown", unknown_elapsed), ("known", known_elapsed)] {
             assert!(
@@ -266,11 +283,6 @@ async fn unknown_email_matches_existing_account_response_and_delay() {
                 "attempt {attempt}: {who} took {elapsed:?}, expected at least {expected:?}"
             );
         }
-        let diff = known_elapsed.abs_diff(unknown_elapsed);
-        assert!(
-            diff < Duration::from_millis(750),
-            "attempt {attempt}: known {known_elapsed:?} vs unknown {unknown_elapsed:?}"
-        );
     }
     assert_eq!(
         bucket(&pool, CATEGORY_ACCOUNT, &unknown).await,
@@ -278,10 +290,58 @@ async fn unknown_email_matches_existing_account_response_and_delay() {
     );
 }
 
+/// NAN-5066 / NAN-5984: an unknown email costs the same as a wrong password
+/// on an existing account. Measured as the MEDIAN of interleaved pairs (each
+/// pair a fresh account and a fresh unknown email, so no throttle delay is
+/// involved, order alternating), which one scheduling stall cannot move. The
+/// margin (each median at least half the other) still catches a skipped
+/// dummy hash: without bcrypt the unknown path is ~100x faster.
+#[tokio::test]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
+async fn unknown_email_costs_the_same_as_an_existing_account() {
+    const PAIRS: usize = 11;
+    let pool = common::migrated_pool().await;
+    let svc = auth_service(pool.clone());
+    let mut known = Vec::with_capacity(PAIRS);
+    let mut unknown = Vec::with_capacity(PAIRS);
+    for pair in 0..PAIRS {
+        let (_, email) = create_active_user(&pool, PASSWORD).await;
+        let nobody = format!("nobody-{}@example.com", Uuid::now_v7());
+        let ip = format!("192.0.2.{}", 100 + pair);
+        let time = |who: &'static str| {
+            let (svc, ip) = (&svc, ip.clone());
+            let target = if who == "known" { email.clone() } else { nobody.clone() };
+            async move {
+                let t = Instant::now();
+                let err = svc.login(&target, "wrong-password", Some(&ip), None).await.unwrap_err();
+                assert!(is_generic_failure(&err), "{who}: {err:?}");
+                t.elapsed()
+            }
+        };
+        if pair % 2 == 0 {
+            known.push(time("known").await);
+            unknown.push(time("unknown").await);
+        } else {
+            unknown.push(time("unknown").await);
+            known.push(time("known").await);
+        }
+    }
+    let median = |v: &mut Vec<Duration>| {
+        v.sort();
+        v[v.len() / 2]
+    };
+    let (known_median, unknown_median) = (median(&mut known), median(&mut unknown));
+    assert!(
+        unknown_median * 2 >= known_median && known_median * 2 >= unknown_median,
+        "median login cost differs: existing account {known_median:?} vs unknown email {unknown_median:?} \
+         (known {known:?}, unknown {unknown:?})"
+    );
+}
+
 /// Concurrent guesses from one address cannot all verify against an
 /// unlocked pair: exactly one crossing signal, counter stops at threshold.
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn concurrent_guesses_capped_at_threshold() {
     let pool = common::migrated_pool().await;
     let (_, email) = create_active_user(&pool, PASSWORD).await;
@@ -315,7 +375,7 @@ async fn concurrent_guesses_capped_at_threshold() {
 
 /// The administrator unlock clears every address lock and the delay.
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn admin_unlock_clears_throttle_state() {
     let pool = common::migrated_pool().await;
     let (id, email) = create_active_user(&pool, PASSWORD).await;
@@ -340,12 +400,33 @@ async fn admin_unlock_clears_throttle_state() {
         assert_eq!(bucket(&pool, CATEGORY_ACCOUNT_IP, &account_ip_key(&email, Some(ip))).await, None);
     }
     assert_eq!(bucket(&pool, CATEGORY_ACCOUNT, &email).await, None);
-    let t = Instant::now();
+    // NAN-5984: the delay reservation goes too. It is what login() reserves
+    // first and sleeps on, so with it gone the next attempt starts fresh.
+    assert_eq!(
+        bucket(&pool, CATEGORY_ACCOUNT_SLOT, &normalize_email(&email)).await,
+        None,
+        "unlock must drop the account delay reservation"
+    );
+    let (unlocked, no_failures, active): (bool, bool, bool) = sqlx::query_as(
+        "SELECT locked_until IS NULL, failed_login_attempts = 0, status = 'active' FROM users WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(unlocked && no_failures && active, "unlock must clear the user row's lock state");
+    // The delay the login path would apply now, read from the same atomic
+    // reservation login() makes (not a wall-clock measurement, which a busy
+    // machine turns into a false failure).
+    let wait = login_throttle::LoginThrottle::new(pool.clone())
+        .reserve_account_slot(&email)
+        .await
+        .unwrap();
+    assert_eq!(wait, Duration::ZERO, "no delay after unlock");
     assert!(matches!(
         svc.login(&email, PASSWORD, Some(IP_A), None).await,
         Ok(LoginResult::Success(_))
     ));
-    assert!(t.elapsed() < Duration::from_secs(1), "no delay after unlock");
 }
 
 // === MFA (NAN-5150) ===
@@ -401,7 +482,7 @@ async fn challenge(svc: &AuthService, email: &str, ip: &str) -> Result<String, A
 /// N bad codes from one address lock that (email, address) pair and revoke
 /// the challenge; the user still completes MFA from another address.
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn mfa_bad_codes_lock_the_address_and_revoke_the_challenge() {
     let pool = common::migrated_pool().await;
     let enc = test_encryption();
@@ -451,7 +532,7 @@ async fn mfa_bad_codes_lock_the_address_and_revoke_the_challenge() {
 /// One challenge cannot be guessed from many addresses: its own budget
 /// revokes it after N bad codes, whatever their source.
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn mfa_challenge_budget_holds_across_addresses() {
     let pool = common::migrated_pool().await;
     let enc = test_encryption();
@@ -477,7 +558,7 @@ async fn mfa_challenge_budget_holds_across_addresses() {
 
 /// Re-entering the password does not refill this address's code budget.
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn mfa_failures_accumulate_across_challenges_from_one_address() {
     let pool = common::migrated_pool().await;
     let enc = test_encryption();
@@ -499,7 +580,7 @@ async fn mfa_failures_accumulate_across_challenges_from_one_address() {
 
 /// A valid code inside the limit still completes sign-in and clears state.
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn mfa_valid_code_within_limit_succeeds() {
     let pool = common::migrated_pool().await;
     let enc = test_encryption();
@@ -527,7 +608,7 @@ async fn mfa_valid_code_within_limit_succeeds() {
 /// Reaching the account-wide alert threshold is signalled once (for the
 /// `login_account_throttled` audit) and published to the health bus.
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored (waits the 30 s delay cap)"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored (waits the 30 s delay cap)"]
 async fn account_alert_threshold_signals_once_and_publishes_health_event() {
     let pool = common::migrated_pool().await;
     let (_, email) = create_active_user(&pool, PASSWORD).await;
@@ -584,7 +665,7 @@ async fn account_alert_threshold_signals_once_and_publishes_health_event() {
 /// bcrypt. Only verified failures increment the account-wide counter, so its
 /// value is the number actually verified.
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn concurrent_burst_from_many_addresses_bounds_verifications() {
     let pool = common::migrated_pool().await;
     let (_, email) = create_active_user(&pool, PASSWORD).await;
@@ -622,7 +703,7 @@ async fn concurrent_burst_from_many_addresses_bounds_verifications() {
 /// address) lock, so /64 rotation cannot multiply the lock budget; a
 /// different /64 is independent.
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn ipv6_64_rotation_shares_the_address_lock() {
     let pool = common::migrated_pool().await;
     let (_, email) = create_active_user(&pool, PASSWORD).await;

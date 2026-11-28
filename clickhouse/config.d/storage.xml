@@ -1,6 +1,28 @@
 <?xml version="1.0"?>
-<!-- Temporary storage policy to allow ClickHouse to start -->
-<!-- This will be removed after migrating the table back to default policy -->
+<!--
+  Why this file stays (NAN-5922):
+
+  1. The "tiered" policy is in use. On a cluster install (role-split Compose,
+     where the migrator runs with CLICKHOUSE_CLUSTER=default), the migrator
+     creates logs, signals, ingestion_errors and custom_enrichment_results with
+     storage_policy = 'tiered'. When a table names a policy that the config no
+     longer defines, ClickHouse 26.10 still starts but cannot load that table
+     ("Unknown storage policy `tiered`", code 478), so removing the policy would
+     take those four tables offline after an upgrade. Single-node installs keep
+     their tables on the "default" policy and do not use it.
+
+  2. "warm_disk" is a folder on the same filesystem as "default". It is not a
+     second, cheaper disk, so it adds no capacity. Real hot and cold storage is
+     the object-storage tiering feature (policy nano_tiered on Compose, tiered
+     on Helm; see docs/administration/storage-tiering.md). Helm renders its own
+     storage configuration and does not use this file.
+
+  3. keep_free_space_bytes on the "default" disk is the 1 GiB reserve that the
+     disk-full runbook (docs/administration/disk-full-recovery.md) lowers in an
+     emergency.
+
+  Keep a copy of this file in ludus/roles/nanosiem_stack/files/clickhouse/config.d.
+-->
 <clickhouse>
     <storage_configuration>
         <disks>

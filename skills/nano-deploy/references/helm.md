@@ -297,7 +297,7 @@ scripts/nano vector-client-cert edge-dc1 --pki-dir nano-vn --server-ca nano-vn/l
   --address <ingest address>:6000
 kubectl -n nano create secret generic nano-vector-native-clients \
   --from-file=ca.crt=nano-vn/client-ca.crt --dry-run=client -o yaml | kubectl apply --server-side --force-conflicts -f -
-kubectl -n nano rollout restart deployment/nano-vector
+kubectl -n nano rollout restart statefulset/nano-vector   # deployment/nano-vector before 2.0.37
 ```
 
 `--revoke <name> --pki-dir nano-vn` then the same Secret apply and restart

@@ -79,8 +79,23 @@ pub async fn collect_metrics(
     is_clustered: bool,
     scope: &ScopeSet,
 ) -> CollectedMetrics {
-    let ingestion =
+    let mut ingestion =
         collect_ingestion_metrics(ch_client, system_probe_client, is_clustered, scope).await;
+    // NAN-5976: ClickHouse errors from inside a rollout window that
+    // `scripts/nano upgrade` recorded are shown, not scored. When an error is
+    // still scored, the recorded runs are frozen so no later window can
+    // excuse it.
+    let recorded = super::upgrade_transients::load_recent(pool).await;
+    super::upgrade_transients::set_aside_upgrade_transients(
+        &mut ingestion.insert_integrity,
+        &recorded,
+    );
+    super::upgrade_transients::freeze_runs_if_an_error_is_scored(
+        pool,
+        &ingestion.insert_integrity,
+        &recorded,
+    )
+    .await;
     let parsing = collect_parsing_metrics(ch_client, is_clustered, scope).await;
     let enrichment = collect_enrichment_metrics(pool, ch_client, is_clustered, scope).await;
     let detection = collect_detection_metrics(pool).await;
@@ -340,9 +355,9 @@ const ERROR_COUNTER_BOOT_GRACE: &str = "INTERVAL 5 MINUTE";
 /// The counters are cumulative for the life of the server and never reset, so
 /// recency has to come from `last_error_time`.
 ///
-/// NAN-1728 (M-3): sum per-name across all nodes so an error spiking on any one
-/// shard surfaces (`system.errors` is per-node); single-node emits the original
-/// ungrouped SQL.
+/// NAN-1728 (M-3): read every node so an error spiking on any one shard
+/// surfaces (`system.errors` is per-node). NAN-5976: one row per node; the
+/// collector sums per name.
 ///
 /// NAN-2360: a 24h window alone is not enough. On a server up for LESS than 24h
 /// every startup transient is trivially "within 24h", so a freshly installed
@@ -371,20 +386,34 @@ fn build_error_counters_sql(cluster: Option<&str>) -> String {
              OR last_error_time >= now() - uptime() + {ERROR_COUNTER_BOOT_GRACE} \
            )"
     );
-    match cluster {
-        Some(cl) => format!(
-            "SELECT name, sum(value) AS value FROM {} \
-             WHERE name IN ('MEMORY_LIMIT_EXCEEDED', 'CACHE_DICTIONARY_UPDATE_FAIL') \
-               AND {recency} \
-             GROUP BY name",
-            probe_source(Some(cl), "errors")
-        ),
-        None => format!(
-            "SELECT name, value FROM system.errors \
-               WHERE name IN ('MEMORY_LIMIT_EXCEEDED', 'CACHE_DICTIONARY_UPDATE_FAIL') \
-                 AND {recency}"
-        ),
-    }
+    // NAN-5976: one row per node (no cluster sum: the rollout rule must judge
+    // each node's own last occurrence), with the node's own last_error_time
+    // as Unix seconds, taken in this same query. The upgrade records its
+    // windows on ClickHouse's clock, so no other clock and no derived "now"
+    // enters the comparison. The per-name totals are summed in Rust.
+    format!(
+        "SELECT hostName() AS host, name, value, \
+                toUInt64(toUnixTimestamp(last_error_time)) AS last_error_unix \
+         FROM {} \
+         WHERE name IN ('MEMORY_LIMIT_EXCEEDED', 'CACHE_DICTIONARY_UPDATE_FAIL') \
+           AND {recency}",
+        probe_source(cluster, "errors")
+    )
+}
+
+/// NAN-5976: unhealthy dictionaries per ClickHouse node. Unhealthy is the
+/// wider of the upgrade gate's rule and `dict_is_unhealthy` (FAILED*, or any
+/// `last_exception`, which clears on recovery: NAN-1667). Per node with the
+/// total row count, because `system.dictionaries` hides rows without the
+/// SHOW DICTIONARIES grant instead of failing (NAN-1437): a node with no rows
+/// is unchecked, not healthy.
+fn build_failing_dictionaries_sql(cluster: Option<&str>) -> String {
+    format!(
+        "SELECT hostName() AS host, count() AS total, \
+                countIf(startsWith(toString(status), 'FAILED') OR last_exception != '') AS unhealthy \
+         FROM {} GROUP BY host",
+        probe_source(cluster, "dictionaries")
+    )
 }
 
 /// Durable refresh activations that have failed, or have remained pending
@@ -615,19 +644,46 @@ async fn collect_insert_integrity(
 
     // 2) Error-counter tells from system.errors.
     let sql = build_error_counters_sql(cluster_ref);
-    match ch.query(&sql).fetch_all::<(String, u64)>().await {
+    match ch.query(&sql).fetch_all::<(String, String, u64, u64)>().await {
         Ok(rows) => {
             m.probes_available = true;
-            for (name, value) in rows {
+            for (host, name, value, last_error_unix) in rows {
                 match name.as_str() {
-                    "MEMORY_LIMIT_EXCEEDED" => m.memory_limit_errors = value,
-                    "CACHE_DICTIONARY_UPDATE_FAIL" => m.cache_dictionary_update_fails = value,
-                    _ => {}
+                    "MEMORY_LIMIT_EXCEEDED" => m.memory_limit_errors += value,
+                    "CACHE_DICTIONARY_UPDATE_FAIL" => m.cache_dictionary_update_fails += value,
+                    _ => continue,
                 }
+                m.error_counter_samples.push(ErrorCounterSample {
+                    host,
+                    name,
+                    value,
+                    last_error_unix,
+                });
             }
         }
         Err(e) => warn!(
             "Insert-integrity probe: system.errors unavailable (grant missing? NAN-1405): {}",
+            e
+        ),
+    }
+    match ch
+        .query(&build_failing_dictionaries_sql(cluster_ref))
+        .fetch_all::<(String, u64, u64)>()
+        .await
+    {
+        Ok(rows) => {
+            m.dictionary_check = Some(DictionaryCheck {
+                hosts: rows
+                    .iter()
+                    .filter(|(_, total, _)| *total > 0)
+                    .map(|(host, _, _)| host.clone())
+                    .collect(),
+                unhealthy: rows.iter().map(|(_, _, unhealthy)| *unhealthy).sum(),
+            })
+        }
+        Err(e) => warn!(
+            "Insert-integrity probe: system.dictionaries on every node unavailable; \
+             upgrade-transient ClickHouse errors stay counted: {}",
             e
         ),
     }
@@ -2168,33 +2224,31 @@ mod tests {
         }
     }
 
-    /// The cluster shape must still aggregate per name across replicas (NAN-1728
-    /// M-3) — the boot-window fix must not quietly drop the `sum`/`GROUP BY`.
+    /// The cluster shape must read every replica (NAN-1728 M-3). NAN-5976:
+    /// one row per node (hostName), summed per name in Rust, so the upgrade
+    /// rollout rule judges each node's own last occurrence.
     #[test]
-    fn error_counter_sql_keeps_cluster_aggregation() {
+    fn error_counter_sql_reads_every_replica_per_node() {
         let sql = build_error_counters_sql(Some("nanosiem_cluster"));
-        assert!(
-            sql.contains("sum(value)"),
-            "cluster shape lost sum(): {sql}"
-        );
-        assert!(
-            sql.contains("GROUP BY name"),
-            "cluster shape lost GROUP BY: {sql}"
-        );
-        assert!(
-            sql.contains("clusterAllReplicas"),
-            "cluster shape must read every replica: {sql}"
-        );
+        assert!(sql.contains("clusterAllReplicas"), "cluster shape must read every replica: {sql}");
+        assert!(sql.contains("hostName() AS host"), "{sql}");
+        assert!(!sql.contains("sum(value)") && !sql.contains("max(last_error_time)"), "{sql}");
+        assert!(sql.contains("toUnixTimestamp(last_error_time)) AS last_error_unix"), "{sql}");
+        assert!(!sql.contains("dateDiff"), "no derived age: {sql}");
 
         let single = build_error_counters_sql(None);
-        assert!(
-            !single.contains("GROUP BY"),
-            "single-node shape should stay ungrouped: {single}"
-        );
-        assert!(
-            single.contains("FROM system.errors"),
-            "single-node shape should read the local table: {single}"
-        );
+        assert!(single.contains("FROM system.errors"), "single-node shape should read the local table: {single}");
+        assert!(single.contains("hostName() AS host"), "{single}");
+    }
+
+    /// NAN-5976: a dictionary failing on any node blocks the upgrade rule.
+    #[test]
+    fn failing_dictionaries_sql_reads_every_replica() {
+        let sql = build_failing_dictionaries_sql(Some("nanosiem_cluster"));
+        assert!(sql.contains("clusterAllReplicas('nanosiem_cluster', system.dictionaries)"), "{sql}");
+        assert!(sql.contains("startsWith(toString(status), 'FAILED') OR last_exception != ''"), "{sql}");
+        assert!(sql.contains("hostName() AS host, count() AS total"), "{sql}");
+        assert!(build_failing_dictionaries_sql(None).contains("FROM system.dictionaries"));
     }
 
     #[test]
@@ -2249,8 +2303,7 @@ mod tests {
     async fn ingestion_query_excludes_denied_rows_in_clickhouse() {
         let ch = ClickHouseClient::default()
             .with_url(
-                std::env::var("CLICKHOUSE_TEST_URL")
-                    .unwrap_or_else(|_| "http://localhost:8123".to_string()),
+                nanosiem_test_db::require_ch_url(),
             )
             .with_user("nanosiem")
             .with_password("nanosiem")
@@ -2260,8 +2313,7 @@ mod tests {
         // 2026-11-08), so the fixture table is created and dropped as the admin.
         let admin = ClickHouseClient::default()
             .with_url(
-                std::env::var("CLICKHOUSE_TEST_URL")
-                    .unwrap_or_else(|_| "http://localhost:8123".to_string()),
+                nanosiem_test_db::require_ch_url(),
             )
             .with_user("nanosiem_admin")
             .with_password(

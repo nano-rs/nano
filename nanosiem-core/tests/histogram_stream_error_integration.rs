@@ -39,17 +39,16 @@ use nanosiem_core::search::ClickHouseQuerySettings;
 use nanosiem_core::{DualPool, DualPoolConfig, SearchService, TimeRangeInput};
 
 fn pg_url() -> String {
-    std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://nanosiem:nanosiem@localhost:5432/nanosiem".into())
+    nanosiem_test_db::require_pg_url()
 }
 fn ch_url() -> String {
-    std::env::var("CLICKHOUSE_TEST_URL").unwrap_or_else(|_| "http://localhost:8123".into())
+    nanosiem_test_db::require_ch_url()
 }
 fn ch_user() -> String {
-    std::env::var("CLICKHOUSE_TEST_USER").unwrap_or_else(|_| "nanosiem".into())
+    nanosiem_test_db::ch_user().unwrap_or_else(|| "nanosiem".into())
 }
 fn ch_pass() -> String {
-    std::env::var("CLICKHOUSE_TEST_PASSWORD").unwrap_or_else(|_| "nanosiem".into())
+    nanosiem_test_db::ch_password().unwrap_or_else(|| "nanosiem".into())
 }
 fn ch_db() -> String {
     std::env::var("CLICKHOUSE_TEST_DB").unwrap_or_else(|_| "nanosiem".into())

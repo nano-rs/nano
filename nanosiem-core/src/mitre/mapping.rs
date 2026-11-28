@@ -298,8 +298,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires migrated PostgreSQL"]
     async fn validate_verdict_matches_the_write_trigger() {
-        let database_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://nanosiem:nanosiem@localhost:5432/nanosiem".into());
+        let database_url = nanosiem_test_db::require_pg_url();
         let pool = sqlx::PgPool::connect(&database_url).await.unwrap();
         let s = |values: &[&str]| values.iter().map(|v| v.to_string()).collect::<Vec<_>>();
         // (tactics, techniques, accepted)
@@ -344,8 +343,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires migrated PostgreSQL"]
     async fn database_contract_covers_unknown_deprecated_mismatch_and_subtechniques() {
-        let database_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://nanosiem:nanosiem@localhost:5432/nanosiem".into());
+        let database_url = nanosiem_test_db::require_pg_url();
         let pool = sqlx::PgPool::connect(&database_url).await.unwrap();
         let mut transaction = pool.begin().await.unwrap();
 
@@ -471,8 +469,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires migrated PostgreSQL"]
     async fn malformed_ids_are_rejected_even_without_a_catalog() {
-        let database_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://nanosiem:nanosiem@localhost:5432/nanosiem".into());
+        let database_url = nanosiem_test_db::require_pg_url();
         let pool = sqlx::PgPool::connect(&database_url).await.unwrap();
         let mut transaction = pool.begin().await.unwrap();
 

@@ -3355,6 +3355,41 @@ export function Search() {
     }, 0);
   }, [query, timeRange, search, pageSize, updateUrl, beginRunScope, addToSearchHistory, refreshHistory, captureSearch, startBackgroundFieldStats, dataset]);
 
+  // NAN-5950: the timeline's callbacks keep one identity across renders, so
+  // typing in the query editor (which re-renders this page per key) does not
+  // re-render the memoized TimelineVisualization or its recharts store.
+  // handleDrilldown and schemaFields are read through refs: handleDrilldown
+  // changes with every keystroke (it closes over the draft query).
+  const handleDrilldownRef = useRef(handleDrilldown);
+  handleDrilldownRef.current = handleDrilldown;
+  const schemaFieldsRef = useRef(schemaFields);
+  schemaFieldsRef.current = schemaFields;
+  const handleTimelineToggleCollapsed = useCallback(() => setTimelineCollapsed(c => !c), []);
+  const handleTimelineChartTypeChange = useCallback((type: 'bar' | 'line' | 'area') => {
+    localStorage.setItem('nanosiem-chart-type', type);
+    setChartType(type);
+  }, []);
+  const handleTimelineArtifactFilter = useCallback(
+    (artifact: string, artifactType: 'hash' | 'domain') => {
+      // Route through handleDrilldown so the artifact filter reuses the
+      // proven stats-drill path (deferred setQuery → updateUrl → search).
+      // Calling handleSearch synchronously here raced the URL-sync effect,
+      // which restored the pre-drill query and clobbered the filter.
+      // Escape like the field=value drilldown builder — a log-derived
+      // artifact with `"`/`\` must not break out of the quoted comparison.
+      // Profile-aware columns (OCSF: file.hashes / process.file.hashes;
+      // dst_endpoint.hostname, query.hostname, http_request.url.hostname)
+      // — different classes keep the artifact in different fields.
+      const fields = schemaFieldsRef.current;
+      const artifactQuery =
+        artifactType === 'hash'
+          ? fields.filterAny(['fileHash', 'processHash'], artifact)
+          : fields.filterAny(['destHost', 'dnsQuery', 'domain'], artifact);
+      handleDrilldownRef.current({ _rawClause: artifactQuery });
+    },
+    [],
+  );
+
   // Toggle functions
   const toggleField = useCallback((field: string) => {
     setExpandedFields(prev => {
@@ -5159,9 +5194,9 @@ export function Search() {
           timelineData={timelineData}
           eventCount={histogramEventCount}
           collapsed={timelineCollapsed}
-          onToggleCollapsed={() => setTimelineCollapsed(!timelineCollapsed)}
+          onToggleCollapsed={handleTimelineToggleCollapsed}
           chartType={chartType}
-          onChartTypeChange={(type) => { localStorage.setItem('nanosiem-chart-type', type); setChartType(type); }}
+          onChartTypeChange={handleTimelineChartTypeChange}
           onZoomIn={handleZoomIn}
           onZoomOut={handleZoomOut}
           onResetZoom={handleResetZoom}
@@ -5173,22 +5208,7 @@ export function Search() {
           onMouseUp={handleChartMouseUp}
           results={searchResults}
           hasSearched={hasSearched}
-          onArtifactFilter={(artifact, artifactType, _ts) => {
-            // Route through handleDrilldown so the artifact filter reuses the
-            // proven stats-drill path (deferred setQuery → updateUrl → search).
-            // Calling handleSearch synchronously here raced the URL-sync effect,
-            // which restored the pre-drill query and clobbered the filter.
-            // Escape like the field=value drilldown builder — a log-derived
-            // artifact with `"`/`\` must not break out of the quoted comparison.
-            // Profile-aware columns (OCSF: file.hashes / process.file.hashes;
-            // dst_endpoint.hostname, query.hostname, http_request.url.hostname)
-            // — different classes keep the artifact in different fields.
-            const artifactQuery =
-              artifactType === 'hash'
-                ? schemaFields.filterAny(['fileHash', 'processHash'], artifact)
-                : schemaFields.filterAny(['destHost', 'dnsQuery', 'domain'], artifact);
-            handleDrilldown({ _rawClause: artifactQuery });
-          }}
+          onArtifactFilter={handleTimelineArtifactFilter}
           assetContext={assetContext}
           timeWindow="24h"
           resultCount={displayTotalCount}

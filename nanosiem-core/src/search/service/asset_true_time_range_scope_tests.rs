@@ -128,11 +128,10 @@ mod pg {
     use tokio::sync::OnceCell;
     use uuid::Uuid;
 
-    const DEFAULT_URL: &str = "postgres://nanosiem:nanosiem@localhost:5432/nanosiem";
     static MIGRATED: OnceCell<()> = OnceCell::const_new();
 
     async fn migrated_pool() -> PgPool {
-        let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
+        let url = nanosiem_test_db::require_pg_url();
         let pool = PgPool::connect(&url).await.unwrap_or_else(|error| {
             panic!(
                 "connect to test Postgres at {url}: {error}\n\

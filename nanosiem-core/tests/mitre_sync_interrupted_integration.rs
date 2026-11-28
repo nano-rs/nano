@@ -20,8 +20,7 @@ use nanosiem_core::content_bundle::store::{CappedFile, ContentStore, READ_SLICE_
 use nanosiem_core::mitre::{MitreRepository, MitreSync, MitreSyncError, MitreSyncOutcome};
 
 async fn fresh_pg() -> sqlx::PgPool {
-    let url = std::env::var("NANOSIEM_TEST_DATABASE_URL")
-        .expect("NANOSIEM_TEST_DATABASE_URL must target a disposable PostgreSQL");
+    let url = nanosiem_test_db::require_pg_url();
     let admin = sqlx::PgPool::connect(&url).await.unwrap();
     let name = format!("mi_{}", &uuid::Uuid::now_v7().simple().to_string()[18..]);
     sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))

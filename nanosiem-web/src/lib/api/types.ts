@@ -2141,6 +2141,9 @@ export interface UpdateAgentModelConfigRequest {
 }
 
 // Available Models types
+/** NAN-5974: how nano talks to an OpenAI or self-hosted model. */
+export type ModelApiType = 'chat_completions' | 'responses';
+
 export interface AvailableModel {
   model_id: string;
   provider: string;
@@ -2151,6 +2154,10 @@ export interface AvailableModel {
   supports_vision: boolean;
   supports_function_calling: boolean;
   deprecated: boolean;
+  /** null = the model-id default (Responses for openai/gpt-6*). */
+  api?: ModelApiType | null;
+  /** True when an admin picked `api`; catalog syncs keep it. */
+  api_overridden?: boolean;
 }
 
 export interface CreateAvailableModelRequest {
@@ -2162,6 +2169,8 @@ export interface CreateAvailableModelRequest {
   output_price_per_million?: number;
   supports_vision: boolean;
   supports_function_calling: boolean;
+  /** OpenAI and self-hosted only; omit for the default. */
+  api?: ModelApiType;
 }
 
 export interface UpdateAvailableModelRequest {
@@ -2172,6 +2181,8 @@ export interface UpdateAvailableModelRequest {
   supports_vision?: boolean;
   supports_function_calling?: boolean;
   deprecated?: boolean;
+  /** Omit = unchanged; null = clear the admin's choice. */
+  api?: ModelApiType | null;
 }
 
 // Model Catalog Sync types
@@ -3947,9 +3958,12 @@ export interface ApiKeyListResponse {
 export interface CreateApiKeyRequest {
   name: string;
   description?: string;
+  /** Must be empty when `preset` is set; the server fills it from the preset. */
   permissions: string[];
   expires_at?: string;
   rate_limit?: number;
+  /** NAN-5900: `'admin'` = every permission that exists now. Needs `expires_at`. */
+  preset?: 'admin';
 }
 
 // Tri-state partial update: omit a field to leave it unchanged, send `null`

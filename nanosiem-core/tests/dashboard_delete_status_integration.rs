@@ -47,7 +47,7 @@ async fn dashboard(repo: &DashboardRepository, owner: Uuid, visibility: &str) ->
 }
 
 #[tokio::test]
-#[ignore = "requires a disposable Postgres (DATABASE_URL)"]
+#[ignore = "requires a disposable Postgres (NANOSIEM_TEST_DATABASE_URL)"]
 async fn deleting_a_missing_dashboard_is_not_found_for_a_non_admin() {
     let pool = common::migrated_pool().await;
     let repo = DashboardRepository::new(pool.clone());
@@ -65,7 +65,7 @@ async fn deleting_a_missing_dashboard_is_not_found_for_a_non_admin() {
 }
 
 #[tokio::test]
-#[ignore = "requires a disposable Postgres (DATABASE_URL)"]
+#[ignore = "requires a disposable Postgres (NANOSIEM_TEST_DATABASE_URL)"]
 async fn deleting_someone_elses_private_dashboard_does_not_reveal_it() {
     let pool = common::migrated_pool().await;
     let repo = DashboardRepository::new(pool.clone());
@@ -81,7 +81,7 @@ async fn deleting_someone_elses_private_dashboard_does_not_reveal_it() {
 }
 
 #[tokio::test]
-#[ignore = "requires a disposable Postgres (DATABASE_URL)"]
+#[ignore = "requires a disposable Postgres (NANOSIEM_TEST_DATABASE_URL)"]
 async fn deleting_someone_elses_visible_dashboard_is_forbidden() {
     let pool = common::migrated_pool().await;
     let repo = DashboardRepository::new(pool.clone());

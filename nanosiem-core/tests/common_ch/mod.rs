@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Minimal ClickHouse HTTP harness for the observability SQL suites that run
-//! generated SQL against a disposable ClickHouse (`NANOSIEM_TEST_CLICKHOUSE_URL`,
-//! optional `NANOSIEM_TEST_CLICKHOUSE_USER` / `_PASSWORD`).
+//! generated SQL against a disposable ClickHouse. URL and credentials come from
+//! the shared `nanosiem-test-db` helper (`CLICKHOUSE_TEST_URL`, or the older
+//! `NANOSIEM_TEST_CLICKHOUSE_URL`; NAN-5967).
 #![allow(dead_code)]
 
 pub struct Ch {
@@ -15,10 +16,9 @@ impl Ch {
     pub fn from_env() -> Self {
         Self {
             http: reqwest::Client::new(),
-            url: std::env::var("NANOSIEM_TEST_CLICKHOUSE_URL")
-                .expect("NANOSIEM_TEST_CLICKHOUSE_URL must target a disposable ClickHouse"),
-            user: std::env::var("NANOSIEM_TEST_CLICKHOUSE_USER").ok(),
-            password: std::env::var("NANOSIEM_TEST_CLICKHOUSE_PASSWORD").ok(),
+            url: nanosiem_test_db::require_ch_url(),
+            user: nanosiem_test_db::ch_user(),
+            password: nanosiem_test_db::ch_password(),
         }
     }
 
@@ -68,9 +68,5 @@ pub fn ts(t: chrono::DateTime<chrono::Utc>) -> String {
 
 /// Refuse to TRUNCATE unless the operator opted in (same guard as the PG suites).
 pub fn assert_destructive_opt_in() {
-    assert_eq!(
-        std::env::var("NANOSIEM_ALLOW_DESTRUCTIVE_TESTS").as_deref(),
-        Ok("1"),
-        "this suite truncates tables: set NANOSIEM_ALLOW_DESTRUCTIVE_TESTS=1 against a disposable ClickHouse"
-    );
+    nanosiem_test_db::assert_destructive_opt_in("the test ClickHouse (this suite truncates tables)");
 }

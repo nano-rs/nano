@@ -5,7 +5,7 @@
 //! key and the runner's claim path (`PgFeedStore::claim_due`) still opens it
 //! with a ring that no longer holds the old key.
 //!
-//! `#[ignore]`d: needs a disposable migrated Postgres at DATABASE_URL and
+//! `#[ignore]`d: needs a disposable migrated Postgres at NANOSIEM_TEST_DATABASE_URL and
 //! NANOSIEM_ALLOW_DESTRUCTIVE_TESTS=1 (it claims every due feed).
 
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -26,23 +26,20 @@ fn ring(active: &str, keys: &[(&str, u8)]) -> EncryptionService {
 
 async fn declared(key: &str) -> PgPool {
     rotation::declare_write_key(sqlx::postgres::PgPoolOptions::new().max_connections(3), key.to_owned())
-        .connect(&std::env::var("DATABASE_URL").expect("DATABASE_URL"))
+        .connect(&nanosiem_test_db::require_pg_url())
         .await
         .unwrap()
 }
 
 async fn pool() -> PgPool {
-    assert!(
-        std::env::var("NANOSIEM_ALLOW_DESTRUCTIVE_TESTS").is_ok_and(|v| v == "1" || v == "true"),
-        "set NANOSIEM_ALLOW_DESTRUCTIVE_TESTS=1 against a disposable database"
-    );
-    let pool = PgPool::connect(&std::env::var("DATABASE_URL").expect("DATABASE_URL")).await.unwrap();
+    nanosiem_test_db::assert_destructive_opt_in("the test Postgres");
+    let pool = nanosiem_test_db::require_pg_pool(10).await;
     nanosiem_core::db::run_postgres_migrations(&pool).await.unwrap();
     pool
 }
 
 #[tokio::test]
-#[ignore = "requires a disposable Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a disposable Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn feed_secret_rewraps_and_still_opens_at_claim() {
     let pool = pool().await;
     let s = &Uuid::new_v4().simple().to_string()[..10];

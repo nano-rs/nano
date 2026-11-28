@@ -278,7 +278,7 @@ pub fn spawn_license_listener(
 }
 
 async fn listen(pool: &sqlx::PgPool) -> Result<sqlx::postgres::PgListener, sqlx::Error> {
-    let mut listener = sqlx::postgres::PgListener::connect_with(pool).await?;
+    let mut listener = crate::db::listener::dedicated_listener(pool).await?;
     listener.listen(credential::LICENSE_CHANGED_CHANNEL).await?;
     Ok(listener)
 }

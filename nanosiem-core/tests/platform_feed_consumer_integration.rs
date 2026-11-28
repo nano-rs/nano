@@ -61,13 +61,12 @@ fn ring() -> KeyRing {
 }
 
 fn ch() -> clickhouse::Client {
-    let url = std::env::var("NANOSIEM_TEST_CLICKHOUSE_URL")
-        .expect("NANOSIEM_TEST_CLICKHOUSE_URL must target a disposable ClickHouse");
+    let url = nanosiem_test_db::require_ch_url();
     let mut client = nanosiem_core::db::clickhouse_transport::client().with_url(url);
-    if let Ok(user) = std::env::var("NANOSIEM_TEST_CLICKHOUSE_USER") {
+    if let Some(user) = nanosiem_test_db::ch_user() {
         client = client.with_user(user);
     }
-    if let Ok(password) = std::env::var("NANOSIEM_TEST_CLICKHOUSE_PASSWORD") {
+    if let Some(password) = nanosiem_test_db::ch_password() {
         client = client.with_password(password);
     }
     client
@@ -126,8 +125,7 @@ fn migration_184_schema(db: &str, tables: &[&str]) -> Vec<String> {
 
 
 async fn fresh_pg() -> (sqlx::PgPool, String) {
-    let url = std::env::var("NANOSIEM_TEST_DATABASE_URL")
-        .expect("NANOSIEM_TEST_DATABASE_URL must target a disposable PostgreSQL");
+    let url = nanosiem_test_db::require_pg_url();
     let admin = sqlx::PgPool::connect(&url).await.unwrap();
     let name = format!("pf_{}", &uuid::Uuid::now_v7().simple().to_string()[18..]);
     sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}"))).execute(&admin).await.unwrap();
@@ -516,7 +514,7 @@ async fn install_policy_against_real_clickhouse_and_postgres() {
 
     ch.query(&format!("DROP DATABASE {db}")).execute().await.unwrap();
     pool.close().await;
-    let admin = sqlx::PgPool::connect(&std::env::var("NANOSIEM_TEST_DATABASE_URL").unwrap()).await.unwrap();
+    let admin = sqlx::PgPool::connect(&nanosiem_test_db::require_pg_url()).await.unwrap();
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE {pg_name}"))).execute(&admin).await.unwrap();
 }
 

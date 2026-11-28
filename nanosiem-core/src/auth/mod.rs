@@ -25,6 +25,8 @@ pub mod mfa;
 #[cfg(feature = "enterprise")]
 pub mod oidc;
 #[cfg(feature = "enterprise")]
+pub mod oidc_claims;
+#[cfg(feature = "enterprise")]
 pub mod oidc_userinfo;
 pub mod oidc_trust;
 pub mod password;
@@ -59,6 +61,8 @@ mod session_binding_tests;
 mod sso_admission_tests;
 #[cfg(all(test, feature = "enterprise"))]
 mod oidc_userinfo_tests;
+#[cfg(all(test, feature = "enterprise"))]
+mod oidc_claims_tests;
 #[cfg(test)]
 mod reserved_source_types_tests;
 #[cfg(test)]
@@ -74,6 +78,8 @@ pub use grant_authority::*;
 pub use mfa::*;
 #[cfg(feature = "enterprise")]
 pub use oidc::*;
+#[cfg(feature = "enterprise")]
+pub use oidc_claims::ClaimShapeError;
 #[cfg(feature = "enterprise")]
 pub use oidc_userinfo::{merge_userinfo, UserInfoClaims};
 pub use oidc_trust::OidcTrustChange;

@@ -147,7 +147,7 @@ fn schema_create_message_names_the_user_and_both_fixes() {
 /// server; creates and drops its own role and database.
 #[tokio::test]
 async fn preflight_refuses_a_role_without_create_on_public() {
-    let Ok(url) = std::env::var("NANOSIEM_TEST_DATABASE_URL") else {
+    let Ok(url) = nanosiem_test_db::pg_url() else {
         return;
     };
     let admin = sqlx::postgres::PgPoolOptions::new()
@@ -224,7 +224,7 @@ async fn preflight_refuses_a_role_without_create_on_public() {
 
 #[tokio::test]
 async fn preflight_passes_on_a_stock_server_and_installs_nothing() {
-    let Ok(url) = std::env::var("NANOSIEM_TEST_DATABASE_URL") else {
+    let Ok(url) = nanosiem_test_db::pg_url() else {
         return;
     };
     let pool = sqlx::postgres::PgPoolOptions::new()

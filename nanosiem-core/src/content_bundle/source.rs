@@ -5,7 +5,7 @@
 //! Every repository sync (parsers, rules, playbooks, model catalog through
 //! `GitHubClient`; the marketplace through its own working tree) asks this
 //! module for first-party repositories instead of the network. A first-party
-//! repository (`nano-rs/*`, `nanos-sh/*`) is NEVER fetched from GitHub: when
+//! repository (`nano-rs/*` only, NAN-5954) is NEVER fetched from GitHub: when
 //! its channel is not installed yet the read fails with a clear error that is
 //! recorded on the repository row, and the next sync after the channel
 //! installs picks it up.
@@ -18,7 +18,7 @@
 use std::sync::OnceLock;
 
 use super::channels::{self, Channel};
-use super::store::{ContentStore, StoredFile};
+use super::store::{self as content_store, ContentStore, SnapshotFiles, StoredFile};
 use super::tree::{self, Files};
 
 static STORE: OnceLock<ContentStore> = OnceLock::new();
@@ -172,4 +172,26 @@ pub async fn materialize(
     .map_err(|e| SourceError::Io(e.to_string()))?
     .map_err(|e| SourceError::Io(e.to_string()))?;
     Ok(commit)
+}
+
+/// The installed commit of `owner/repo@branch` and the files at `paths`,
+/// read in one statement on the caller's connection (NAN-5956). For a
+/// caller that holds a lock on `conn` and must not check out a second pooled
+/// connection (the model catalog sync); first-party only, like every read
+/// here. Each file is refused over `cap` bytes.
+pub async fn files_on(
+    conn: &mut sqlx::PgConnection,
+    owner: &str,
+    repo: &str,
+    branch: &str,
+    paths: &[&str],
+    cap: u64,
+) -> Result<SnapshotFiles, SourceError> {
+    if !is_first_party(owner) {
+        return Err(SourceError::UnknownChannel(format!("{owner}/{repo}@{branch}")));
+    }
+    let ch = channel(owner, repo, branch)?;
+    content_store::read_snapshot_files_on(conn, ch.id, paths, cap)
+        .await?
+        .ok_or_else(|| SourceError::NotInstalled(ch.id.to_string()))
 }

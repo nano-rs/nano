@@ -31,7 +31,7 @@ static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const TEST_DB_NAME: &str = "nanosiem_nan5269_test";
 
 fn admin_url() -> String {
-    std::env::var("TEST_DATABASE_URL").expect("checked by disposable_server_url")
+    nanosiem_test_db::require_pg_url()
 }
 
 /// The disposable server, or None (skip) when none is configured.
@@ -39,7 +39,12 @@ fn disposable_server_url() -> Option<String> {
     if std::env::var("SKIP_DB_TESTS").is_ok() {
         return None;
     }
-    match std::env::var("TEST_DATABASE_URL") {
+    // NAN-5964: it drops a database and runs ALTER SYSTEM, so it needs the opt-in.
+    if !matches!(std::env::var("NANOSIEM_ALLOW_DESTRUCTIVE_TESTS").as_deref(), Ok("1" | "true")) {
+        eprintln!("NANOSIEM_ALLOW_DESTRUCTIVE_TESTS not set; skipping NAN-5269 test");
+        return None;
+    }
+    match nanosiem_test_db::pg_url() {
         Ok(url) if !url.trim().is_empty() => Some(url),
         _ => {
             eprintln!("TEST_DATABASE_URL is not set (a disposable PostgreSQL superuser); skipping NAN-5269 test");

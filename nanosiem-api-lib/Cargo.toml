@@ -26,6 +26,8 @@ tokio.workspace = true
 tower-http.workspace = true
 
 [dev-dependencies]
+# NAN-5967: the one place DB-backed tests get their database URLs and pools.
+nanosiem-test-db = { path = "../nanosiem-test-db" }
 tokio = { workspace = true, features = ["test-util"] }
 tower = { workspace = true, features = ["util"] }
 futures = "0.3"

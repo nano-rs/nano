@@ -54,7 +54,7 @@ fn outcomes_serialize_for_the_shell_consumer() {
 }
 
 async fn lease_pool() -> Option<PgPool> {
-    let url = std::env::var("NANOSIEM_TEST_DATABASE_URL").ok()?;
+    let url = nanosiem_test_db::pg_url().ok()?;
     let schema = format!("nan5285_{}", uuid::Uuid::new_v4().simple());
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(4)
@@ -336,7 +336,7 @@ async fn the_superseded_paths_never_grant_on_this_version() {
         // Never a grant. A Vector this version could install on is sent to v3;
         // any other is told it must be upgraded (review r2: a v2.0.35 consumer
         // beside 0.61 logs that holder as the actionable reason).
-        for release in ["nano 0.62.0-nano.2 0", "nano 0.62.1-nano.1 0", "custom 0.62.0"] {
+        for release in ["nano 0.62.0-nano.2 0", "nano 0.62.1-nano.1 0"] {
             assert_eq!(
                 ask(Some(release)).await,
                 LeaseOutcome::Busy { holder: LEASE_V3_HOLDER.into(), generation: 7, expires_in_secs: 0 },
@@ -348,6 +348,28 @@ async fn the_superseded_paths_never_grant_on_this_version() {
                 ask(Some(release)).await,
                 LeaseOutcome::Busy { holder: VECTOR_UPGRADE_HOLDER.into(), generation: 7, expires_in_secs: 0 },
                 "{path} {release:?}"
+            );
+        }
+        // The public paths read the opt-in from the environment; nothing in
+        // the test run sets it, so a custom build is refused by default.
+        if !custom_vector_allowed() {
+            assert_eq!(
+                ask(Some("custom 0.62.0")).await,
+                LeaseOutcome::Busy { holder: VECTOR_UPGRADE_HOLDER.into(), generation: 7, expires_in_secs: 0 },
+                "{path} custom 0.62.0 (default: not opted in)"
+            );
+        }
+    }
+    // NAN-5891: a custom or upstream build gets the same answer v3 would give.
+    // Without NANO_ALLOW_CUSTOM_VECTOR v3 refuses it, so it is told to upgrade
+    // rather than sent to a path that refuses it. With the opt-in it is sent
+    // to v3. The opt-in is passed in, not read from the process environment.
+    for (allow_custom, expected) in [(false, VECTOR_UPGRADE_HOLDER), (true, LEASE_V3_HOLDER)] {
+        for release in ["custom 0.62.0", "0.62.0 (x86_64-unknown-linux-gnu 1a2b3c)"] {
+            assert_eq!(
+                refuse_on_superseded_path_with(&pool, "vm-1", 7, Some(release), allow_custom).await.unwrap(),
+                LeaseOutcome::Busy { holder: expected.into(), generation: 7, expires_in_secs: 0 },
+                "allow_custom={allow_custom} {release}"
             );
         }
     }

@@ -357,7 +357,8 @@ ORDER BY (class_uid, source_type, timestamp, `src_endpoint.ip`, cityHash64(id))
 SAMPLE BY cityHash64(id)
 TTL timestamp + toIntervalDay(365) DELETE WHERE timestamp > '2000-01-01'
 SETTINGS index_granularity = 8192, non_replicated_deduplication_window = 1000,
-    merge_max_dynamic_subcolumns_in_wide_part = 64
+    merge_max_dynamic_subcolumns_in_wide_part = 64,
+    materialize_ttl_recalculate_only = 1
 ;
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ocsf_logs_raw_mv

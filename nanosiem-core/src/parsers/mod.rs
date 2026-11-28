@@ -26,6 +26,8 @@ pub mod worker_process;
 pub(crate) mod vrl_verdict_memo;
 #[cfg(test)]
 mod vrl_functions_tests;
+#[cfg(test)]
+mod docs_vrl_examples_tests;
 
 pub use credential_repository::{CredentialRepository, CredentialRepositoryError};
 pub use ocsf_validation::{

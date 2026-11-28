@@ -893,7 +893,7 @@ mod tests {
 
     fn test_sync(body: &[u8], bundle_id: &str, max_bytes: usize) -> MitreSync {
         let pool = PgPoolOptions::new()
-            .connect_lazy("postgres://postgres:postgres@localhost/nanosiem_test")
+            .connect_lazy("postgres://unused@127.0.0.1:1/unused")
             .expect("lazy pool");
         MitreSync {
             repository: MitreRepository::new(pool.clone()),
@@ -1201,7 +1201,7 @@ mod tests {
     #[ignore = "manual verification requiring the reviewed signed MITRE channel in PostgreSQL"]
     async fn pinned_release_digest_and_catalog_shape_match() {
         let pool = PgPoolOptions::new()
-            .connect_lazy("postgres://postgres:postgres@localhost/nanosiem_test")
+            .connect_lazy(&nanosiem_test_db::require_pg_url())
             .expect("lazy pool");
         let sync = MitreSync::new(MitreRepository::new(pool));
 

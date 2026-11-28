@@ -37,7 +37,7 @@ const HINTED: [&str; 2] = ["actor.process.file.name", "dst_endpoint.svc_name"];
 const UNHINTED: [&str; 2] = ["actor.session.uid", "device.os.name"];
 
 fn ch_url() -> String {
-    std::env::var("CLICKHOUSE_TEST_URL").unwrap_or_else(|_| "http://localhost:8123".into())
+    nanosiem_test_db::require_ch_url()
 }
 fn ch_user() -> String {
     std::env::var("CLICKHOUSE_ADMIN_USER").unwrap_or_else(|_| "nanosiem_admin".into())
@@ -114,6 +114,14 @@ fn normalized(body: &str) -> Vec<String> {
 
 #[tokio::test]
 async fn later_stages_read_the_stage0_tail_alias_with_identical_results() {
+    // NAN-5964: no localhost default, and this test writes data, so it
+    // also needs the destructive-test opt-in.
+    if nanosiem_test_db::ch_url().is_err()
+        || !matches!(std::env::var("NANOSIEM_ALLOW_DESTRUCTIVE_TESTS").as_deref(), Ok("1" | "true"))
+    {
+        eprintln!("Skipping: set CLICKHOUSE_TEST_URL to a throwaway ClickHouse and NANOSIEM_ALLOW_DESTRUCTIVE_TESTS=1");
+        return;
+    }
     if std::env::var("SKIP_DB_TESTS").is_ok() {
         eprintln!("Skipping (SKIP_DB_TESTS set)");
         return;

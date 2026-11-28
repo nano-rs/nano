@@ -3,7 +3,7 @@
 //! PostgreSQL integration coverage for NAN-2134 and NAN-2223.
 //!
 //! Run against a disposable, fully migrated database:
-//! `TEST_DATABASE_URL=... cargo test -p nanosiem-api-lib --test grant_authority_integration -- --ignored`
+//! `NANOSIEM_TEST_DATABASE_URL=... cargo test -p nanosiem-api-lib --test grant_authority_integration -- --ignored`
 
 use nanosiem_api_lib::{grant_authz, AuthContext};
 use nanosiem_core::auth::permissions;
@@ -79,13 +79,9 @@ async fn insert_group(pool: &PgPool, id: Uuid, name: &str, role_id: Option<Uuid>
 }
 
 #[tokio::test]
-#[ignore = "requires TEST_DATABASE_URL pointing at a disposable fully migrated PostgreSQL database"]
+#[ignore = "requires NANOSIEM_TEST_DATABASE_URL pointing at a disposable fully migrated PostgreSQL database"]
 async fn changed_role_entitlements_abort_the_real_assignment_write() {
-    let pool = PgPool::connect(
-        &std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL is required"),
-    )
-    .await
-    .unwrap();
+    let pool = nanosiem_test_db::require_pg_pool(10).await;
     let suffix = Uuid::now_v7();
     let caller = Uuid::now_v7();
     let caller_role = Uuid::now_v7();
@@ -209,13 +205,9 @@ async fn changed_role_entitlements_abort_the_real_assignment_write() {
 }
 
 #[tokio::test]
-#[ignore = "requires TEST_DATABASE_URL pointing at a disposable fully migrated PostgreSQL database"]
+#[ignore = "requires NANOSIEM_TEST_DATABASE_URL pointing at a disposable fully migrated PostgreSQL database"]
 async fn committed_scope_revocation_denies_stale_context_and_stale_stamp() {
-    let pool = PgPool::connect(
-        &std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL is required"),
-    )
-    .await
-    .unwrap();
+    let pool = nanosiem_test_db::require_pg_pool(10).await;
     let suffix = Uuid::now_v7();
     let caller = Uuid::now_v7();
     let caller_role = Uuid::now_v7();
@@ -295,9 +287,7 @@ async fn committed_scope_revocation_denies_stale_context_and_stale_stamp() {
 // ---------------------------------------------------------------------------
 
 async fn test_pool() -> PgPool {
-    PgPool::connect(&std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL is required"))
-        .await
-        .unwrap()
+    nanosiem_test_db::require_pg_pool(10).await
 }
 
 async fn insert_user(pool: &PgPool, id: Uuid, email: &str) {
@@ -375,7 +365,7 @@ fn api_key_auth(owner: Uuid, api_key_id: Uuid, perms: &[&str]) -> AuthContext {
 /// grant authority unless the request explicitly disables the provider — could
 /// never satisfy that, and failed 403 permanently.
 #[tokio::test]
-#[ignore = "requires TEST_DATABASE_URL pointing at a disposable fully migrated PostgreSQL database"]
+#[ignore = "requires NANOSIEM_TEST_DATABASE_URL pointing at a disposable fully migrated PostgreSQL database"]
 async fn least_privilege_api_key_can_provision_users_and_rotate_oidc_secrets() {
     let pool = test_pool().await;
     let suffix = Uuid::now_v7();
@@ -448,7 +438,7 @@ async fn least_privilege_api_key_can_provision_users_and_rotate_oidc_secrets() {
 /// EXPLICITLY names — including when Everyone is named alongside it, which must
 /// not launder the privileged group past the check.
 #[tokio::test]
-#[ignore = "requires TEST_DATABASE_URL pointing at a disposable fully migrated PostgreSQL database"]
+#[ignore = "requires NANOSIEM_TEST_DATABASE_URL pointing at a disposable fully migrated PostgreSQL database"]
 async fn explicit_group_grants_are_still_denied_when_the_caller_lacks_their_privileges() {
     let pool = test_pool().await;
     let suffix = Uuid::now_v7();
@@ -531,7 +521,7 @@ async fn explicit_group_grants_are_still_denied_when_the_caller_lacks_their_priv
 /// `ensure_can_grant_groups_exact`, which callers use where the grant does NOT
 /// confer Everyone membership, keeps validating whatever it is handed.
 #[tokio::test]
-#[ignore = "requires TEST_DATABASE_URL pointing at a disposable fully migrated PostgreSQL database"]
+#[ignore = "requires NANOSIEM_TEST_DATABASE_URL pointing at a disposable fully migrated PostgreSQL database"]
 async fn naming_everyone_explicitly_matches_omitting_it() {
     let pool = test_pool().await;
     let suffix = Uuid::now_v7();
@@ -594,7 +584,7 @@ async fn naming_everyone_explicitly_matches_omitting_it() {
 /// source to Everyone — locking out user provisioning entirely on exactly the
 /// grant that makes the source visible to every account anyway.
 #[tokio::test]
-#[ignore = "requires TEST_DATABASE_URL pointing at a disposable fully migrated PostgreSQL database"]
+#[ignore = "requires NANOSIEM_TEST_DATABASE_URL pointing at a disposable fully migrated PostgreSQL database"]
 async fn everyone_source_baseline_does_not_block_provisioning() {
     let pool = test_pool().await;
     let suffix = Uuid::now_v7();

@@ -4,9 +4,12 @@
 //! catalog untouched (one transaction) and leaves `last_sync_schema_version`
 //! unstamped, so the next sync at the same commit retries.
 //!
-//! Needs a disposable, fully migrated nano PostgreSQL at
-//! `NANOSIEM_TEST_DATABASE_URL` (skips otherwise). The test adds its own repo
-//! row, a uniquely named failure trigger, and removes both.
+//! Needs a disposable nano PostgreSQL at `NANOSIEM_TEST_DATABASE_URL` (skips
+//! locally when unset, fails in CI), git and DNS (a failure of either always
+//! fails); `#[ignore]`d, run by pg-integration. The test applies the open
+//! migrations itself (NAN-5988: it must not depend on another suite having
+//! migrated the database first), adds its own repo row and a uniquely named
+//! failure trigger, and removes both.
 
 use std::path::Path;
 use std::process::Command;
@@ -48,6 +51,55 @@ pub(super) fn local_repo(slug: &str, manifests: &[&str]) -> Option<tempfile::Tem
     Some(data_dir)
 }
 
+/// The test Postgres URL, or `None` to skip. NAN-5988: in CI (`CI=true`,
+/// which GitHub Actions sets) a missing URL FAILS the test, so a CI job that
+/// lost its database can never pass it with no assertions. Locally an unset
+/// URL skips.
+pub(super) fn pg_url_or_skip() -> Option<String> {
+    let ci = std::env::var("CI").is_ok_and(|v| v.trim().eq_ignore_ascii_case("true"));
+    pg_url_or_skip_with(ci, nanosiem_test_db::pg_url().map_err(|unset| unset.to_string()))
+}
+
+/// [`pg_url_or_skip`] with the CI flag and the resolved URL passed in
+/// (testable without the process environment).
+fn pg_url_or_skip_with(ci: bool, url: Result<String, String>) -> Option<String> {
+    match url {
+        Ok(url) => Some(url),
+        Err(unset) if ci => panic!("CI=true but the test Postgres is not configured: {unset}"),
+        Err(unset) => {
+            eprintln!("skipped: {unset}");
+            None
+        }
+    }
+}
+
+#[test]
+#[should_panic(expected = "CI=true but the test Postgres is not configured")]
+fn in_ci_a_missing_database_url_fails_instead_of_skipping() {
+    pg_url_or_skip_with(true, Err("the test Postgres URL is not set".into()));
+}
+
+#[test]
+fn outside_ci_a_missing_database_url_skips() {
+    assert_eq!(pg_url_or_skip_with(false, Err("unset".into())), None);
+    assert_eq!(pg_url_or_skip_with(true, Ok("u".into())).as_deref(), Some("u"));
+    assert_eq!(pg_url_or_skip_with(false, Ok("u".into())).as_deref(), Some("u"));
+}
+
+/// A pool on the test database with the open migrations applied, once per
+/// test binary (NAN-5988). `enrichment_marketplace_repos` is open core
+/// (migration 101), so no enterprise overlay is needed.
+pub(super) async fn migrated_pool(url: &str) -> PgPool {
+    static MIGRATED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+    let pool = PgPool::connect(url).await.expect("connect");
+    MIGRATED
+        .get_or_init(|| async {
+            crate::db::run_postgres_migrations(&pool).await.expect("apply open Postgres migrations");
+        })
+        .await;
+    pool
+}
+
 async fn repo_state(pool: &PgPool, id: Uuid) -> (Option<String>, i32) {
     sqlx::query_as("SELECT last_sync_status, last_sync_schema_version FROM enrichment_marketplace_repos WHERE id = $1")
         .bind(id)
@@ -65,27 +117,26 @@ async fn catalog_slugs(pool: &PgPool, repo_id: Uuid) -> Vec<String> {
 }
 
 #[tokio::test]
+#[ignore = "db-backed; runs in pg-integration CI (marketplace::sync_service -- --ignored)"]
 async fn a_failed_reparse_is_not_stamped_and_the_next_sync_retries() {
-    let Ok(url) = std::env::var("NANOSIEM_TEST_DATABASE_URL") else {
-        eprintln!("skipped: NANOSIEM_TEST_DATABASE_URL not set");
-        return;
-    };
-    let pool = PgPool::connect(&url).await.expect("connect");
+    // Locally an unset URL skips; in CI it fails (see pg_url_or_skip). A git
+    // or DNS failure below fails everywhere.
+    let Some(url) = pg_url_or_skip() else { return };
+    let pool = migrated_pool(&url).await;
     let tag = Uuid::new_v4().simple().to_string()[..12].to_string();
     let slug = format!("nan4930-{tag}");
     let ok_slug = format!("nan4930-ok-{tag}");
     let fail_slug = format!("nan4930-zfail-{tag}");
-    let Some(data_dir) = local_repo(&slug, &[&ok_slug, &fail_slug]) else {
-        eprintln!("skipped: git not available");
-        return;
-    };
-    // validate_repo_url resolves the host (SSRF check); skip when offline.
-    let url_ok = super::validate_repo_url("https://github.com/nano-rs/nano-integrations").await;
-    if url_ok.is_err() {
-        eprintln!("skipped: DNS unavailable");
-        return;
-    }
+    let data_dir = local_repo(&slug, &[&ok_slug, &fail_slug]).expect("local git repository fixture (is git installed?)");
+    // validate_repo_url resolves the host (SSRF check), so this needs DNS.
+    super::validate_repo_url("https://github.com/nano-rs/nano-integrations")
+        .await
+        .expect("validate_repo_url (needs DNS for github.com)");
 
+    // NAN-4955: a first-party URL reads the installed content channel in
+    // production. The parse/record logic under test is source-independent, so
+    // drive it through the local git repository (as sync_service_tests does).
+    let _git = super::use_test_git_source();
     let repo_id: Uuid = sqlx::query_scalar(
         "INSERT INTO enrichment_marketplace_repos (name, slug, url, branch, enrichments_path, auto_sync_enabled, sync_interval_hours, enabled)
          VALUES ($1, $1, 'https://github.com/nano-rs/nano-integrations', 'main', 'enrichments/', false, 24, true) RETURNING id",

@@ -42,7 +42,7 @@ fn sample_new() -> NewArtifact {
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn artifact_crud_and_coalesce_partial_update() {
     let pool = common::migrated_pool().await;
     let repo = ArtifactRepository::new(pool.clone());

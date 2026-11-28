@@ -23,7 +23,9 @@ const thirdParty = { id: 'r2', name: 'Acme', url: 'https://github.com/acme/marke
 describe('marketplace inventory projection', () => {
   it('classifies first-party vs third-party repository content', () => {
     expect(isFirstPartyRepo(official)).toBe(true);
-    expect(isFirstPartyRepo({ url: 'https://github.com/nanos-sh/nano-enrichments' })).toBe(true);
+    // NAN-5954: the unregistered pre-rename org is third-party.
+    expect(isFirstPartyRepo({ url: 'https://github.com/nanos-sh/nano-enrichments' })).toBe(false);
+    expect(isFirstPartyRepo({ url: 'https://GitHub.com/NANOS-SH/nano-enrichments/' })).toBe(false);
     expect(isFirstPartyRepo(thirdParty)).toBe(false);
     for (const url of [
       'https://attacker.example/github.com/nano-rs/rules',

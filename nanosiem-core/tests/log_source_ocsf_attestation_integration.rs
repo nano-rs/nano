@@ -28,7 +28,7 @@ async fn source(pool: &sqlx::PgPool) -> Uuid {
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn a_new_source_has_no_receipt() {
     let pool = common::migrated_pool().await;
     let repo = LogSourceRepository::new(pool.clone());
@@ -41,7 +41,7 @@ async fn a_new_source_has_no_receipt() {
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn a_receipt_matches_only_its_version_and_parser_fingerprint() {
     let pool = common::migrated_pool().await;
     let repo = LogSourceRepository::new(pool.clone());
@@ -71,7 +71,7 @@ async fn a_receipt_matches_only_its_version_and_parser_fingerprint() {
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn the_constraint_refuses_a_partial_or_malformed_receipt() {
     let pool = common::migrated_pool().await;
     let repo = LogSourceRepository::new(pool.clone());
@@ -101,7 +101,7 @@ async fn the_constraint_refuses_a_partial_or_malformed_receipt() {
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn setting_a_receipt_on_a_missing_source_is_not_found() {
     let pool = common::migrated_pool().await;
     let repo = LogSourceRepository::new(pool.clone());
@@ -123,7 +123,7 @@ async fn updated_at(pool: &sqlx::PgPool, id: Uuid) -> chrono::DateTime<chrono::U
 /// new revision so a publish pinned to the checked revision can continue at it
 /// instead of 409ing against its own write.
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn a_receipt_written_at_the_checked_revision_returns_the_new_revision() {
     let pool = common::migrated_pool().await;
     let repo = LogSourceRepository::new(pool.clone());
@@ -141,7 +141,7 @@ async fn a_receipt_written_at_the_checked_revision_returns_the_new_revision() {
 /// A concurrent edit between the gate's read and its receipt write is a
 /// conflict, never a receipt stamped onto an unchecked generation.
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn a_receipt_at_a_stale_revision_is_a_conflict_and_writes_nothing() {
     let pool = common::migrated_pool().await;
     let repo = LogSourceRepository::new(pool.clone());

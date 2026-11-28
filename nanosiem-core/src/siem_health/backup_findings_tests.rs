@@ -87,3 +87,40 @@ fn fresh_partial_backup_surfaces_the_missing_lookups() {
     s.enabled = false;
     assert!(backup_recommendations(Some(&s), now()).is_empty());
 }
+
+#[test]
+fn refused_backup_reports_raise_a_high_finding_once() {
+    let metrics = base_zero_metrics_fixture();
+    let mut analysis = fallback_report(&metrics);
+    ensure_backup_report_findings(&mut analysis, false);
+    assert!(analysis.recommendations.is_empty());
+    ensure_backup_report_findings(&mut analysis, true);
+    ensure_backup_report_findings(&mut analysis, true);
+    assert_eq!(analysis.recommendations.len(), 1);
+    let rec = &analysis.recommendations[0];
+    assert_eq!(rec.title, BACKUP_REPORTS_REFUSED_TITLE);
+    assert_eq!(rec.priority, "high");
+    assert!(rec.description.contains("backup-schedule --configure"));
+    assert!(analysis.overall_score <= 79);
+}
+
+#[test]
+fn refused_reports_come_from_database_state_not_the_process_token() {
+    use crate::backup_status::reports_refused;
+    // Healthy install: reports arrive (a row exists), whatever process runs
+    // the check (nano-jobs never has the token): no finding.
+    let healthy = status(true, Some(2));
+    assert!(!reports_refused(Some(&healthy), true));
+    let disabled = status(false, None);
+    assert!(!reports_refused(Some(&disabled), true));
+    // Never configured: no role, no row: no finding.
+    assert!(!reports_refused(None, false));
+    // Misconfigured: the service ran but no report was ever stored.
+    assert!(reports_refused(None, true));
+    let metrics = base_zero_metrics_fixture();
+    let mut analysis = fallback_report(&metrics);
+    ensure_backup_report_findings(&mut analysis, reports_refused(Some(&healthy), true));
+    assert!(analysis.recommendations.is_empty());
+    ensure_backup_report_findings(&mut analysis, reports_refused(None, true));
+    assert_eq!(analysis.recommendations[0].title, BACKUP_REPORTS_REFUSED_TITLE);
+}

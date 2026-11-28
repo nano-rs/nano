@@ -1,0 +1,18 @@
+[package]
+name = "nanosiem-test-db"
+description = "Test-only: the one place DB-backed tests get their Postgres and ClickHouse URLs, pools and throwaway schemas (NAN-5967)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# DEV-DEPENDENCY ONLY. Every crate lists this under [dev-dependencies], never
+# [dependencies], so it is never linked into a release binary. The
+# no_localhost_test_db_urls guard in nanosiem-enterprise/tests checks that.
+
+[dependencies]
+sqlx.workspace = true
+clickhouse.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+# Strict URL parsing for the safety check and redaction.
+url = "2.5"

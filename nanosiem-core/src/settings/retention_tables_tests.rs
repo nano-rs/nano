@@ -105,3 +105,16 @@ fn ttl_days_from_event_table_ddl() {
                ORDER BY timestamp TTL timestamp + toIntervalDay(365) SETTINGS index_granularity = 8192";
     assert_eq!(parse_ttl_days(udm), Some(365));
 }
+
+#[test]
+fn recalc_only_guard_targets_the_same_table_and_cluster_as_the_ttl_change() {
+    // NAN-5907: the guard runs on exactly the table the MODIFY TTL hits.
+    assert_eq!(
+        super::recalc_only_guard_sql("ocsf_logs", " ON CLUSTER 'c'"),
+        "ALTER TABLE ocsf_logs ON CLUSTER 'c' MODIFY SETTING materialize_ttl_recalculate_only = 1"
+    );
+    assert_eq!(
+        super::recalc_only_guard_sql("logs", ""),
+        "ALTER TABLE logs MODIFY SETTING materialize_ttl_recalculate_only = 1"
+    );
+}

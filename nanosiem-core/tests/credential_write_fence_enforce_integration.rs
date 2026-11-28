@@ -40,7 +40,7 @@ async fn insert(pool: &PgPool, cipher: &EncryptionService, name: &str) -> Result
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn undeclared_writers_are_refused_once_enforced() {
     let pool = common::migrated_pool().await;
     common::reset_write_fence(&pool).await;

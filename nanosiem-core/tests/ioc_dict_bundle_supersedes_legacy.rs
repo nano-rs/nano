@@ -72,12 +72,12 @@ fn readers_predicate_gates_only_legacy_marketplace_rows() {
 }
 
 fn ch() -> Option<clickhouse::Client> {
-    let url = std::env::var("NANOSIEM_TEST_CLICKHOUSE_URL").ok()?;
+    let url = nanosiem_test_db::ch_url().ok()?;
     let mut client = nanosiem_core::db::clickhouse_transport::client().with_url(url);
-    if let Ok(user) = std::env::var("NANOSIEM_TEST_CLICKHOUSE_USER") {
+    if let Some(user) = nanosiem_test_db::ch_user() {
         client = client.with_user(user);
     }
-    if let Ok(password) = std::env::var("NANOSIEM_TEST_CLICKHOUSE_PASSWORD") {
+    if let Some(password) = nanosiem_test_db::ch_password() {
         client = client.with_password(password);
     }
     Some(client)

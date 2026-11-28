@@ -42,7 +42,7 @@ async fn seed(svc: &IpAllowlistService) {
 }
 
 #[tokio::test]
-#[ignore = "requires DATABASE_URL (disposable Postgres)"]
+#[ignore = "requires NANOSIEM_TEST_DATABASE_URL (disposable Postgres)"]
 async fn loaded_rules_are_enforced_and_loopback_still_passes() {
     let pool = common::migrated_pool().await;
     reset(&pool).await;
@@ -113,7 +113,7 @@ fn key(component: &str, instance: &str) -> String {
 }
 
 #[tokio::test]
-#[ignore = "requires DATABASE_URL (disposable Postgres)"]
+#[ignore = "requires NANOSIEM_TEST_DATABASE_URL (disposable Postgres)"]
 async fn a_failed_load_refuses_and_a_blip_pages_nobody() {
     let pool = common::migrated_pool().await;
     reset(&pool).await;
@@ -149,7 +149,7 @@ async fn a_failed_load_refuses_and_a_blip_pages_nobody() {
 }
 
 #[tokio::test]
-#[ignore = "requires DATABASE_URL (disposable Postgres)"]
+#[ignore = "requires NANOSIEM_TEST_DATABASE_URL (disposable Postgres)"]
 async fn a_sustained_outage_is_raised_once_and_recovery_only_resolves() {
     let pool = common::migrated_pool().await;
     reset(&pool).await;
@@ -188,7 +188,7 @@ async fn a_sustained_outage_is_raised_once_and_recovery_only_resolves() {
 }
 
 #[tokio::test]
-#[ignore = "requires DATABASE_URL (disposable Postgres)"]
+#[ignore = "requires NANOSIEM_TEST_DATABASE_URL (disposable Postgres)"]
 async fn the_first_load_clears_leftover_and_orphaned_conditions() {
     use nanosiem_core::system_health::{
         HealthCategory, HealthSeverity, PublishHealthEvent, SystemHealthRepository,

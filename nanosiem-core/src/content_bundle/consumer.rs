@@ -324,14 +324,14 @@ impl RepositoryApplier {
     }
 }
 
-/// Case-insensitive pattern of a first-party repository URL (`nano-rs` or the
-/// pre-rename `nanos-sh`; optional scheme, `www.`, `.git`, trailing slash).
+/// Case-insensitive pattern of a first-party repository URL (`nano-rs` only,
+/// NAN-5954; optional scheme, `www.`, `.git`, trailing slash).
 pub fn repo_url_pattern(name: &str) -> String {
     let escaped: String = name
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c.to_string() } else { format!("\\{c}") })
         .collect();
-    format!("^(https?://)?(www[.])?github[.]com/(nano-rs|nanos-sh)/{escaped}([.]git)?/?$")
+    format!("^(https?://)?(www[.])?github[.]com/(nano-rs)/{escaped}([.]git)?/?$")
 }
 
 #[async_trait]
@@ -540,6 +540,10 @@ pub struct ChannelStatus {
     pub installed_at: Option<chrono::DateTime<Utc>>,
     pub applied_at: Option<chrono::DateTime<Utc>>,
     pub apply_error: Option<String>,
+    /// What the last successful apply did, in the applier's words (for
+    /// example that the model catalog was installed but not applied because
+    /// Model Catalog Auto-Sync is off). NAN-5956.
+    pub apply_summary: Option<String>,
     pub last_check_at: Option<chrono::DateTime<Utc>>,
     pub last_check_status: Option<String>,
     pub last_error: Option<String>,
@@ -604,6 +608,7 @@ fn status_of(ch: &'static Channel, row: Option<&ChannelRow>, now: chrono::DateTi
         installed_at: row.and_then(|r| r.installed_at),
         applied_at: row.and_then(|r| r.applied_at),
         apply_error: row.and_then(|r| r.apply_error.clone()),
+        apply_summary: row.and_then(|r| r.apply_summary.clone()),
         last_check_at: row.and_then(|r| r.last_check_at),
         last_check_status: row.and_then(|r| r.last_check_status.clone()),
         last_error: row.and_then(|r| r.last_error.clone()),
@@ -965,7 +970,7 @@ impl ContentConsumer {
     /// it, and the next check or import of the same bundle retries it).
     async fn run_apply(&self, ch: &'static Channel, verified: &VerifiedContent, force: bool) -> Result<String, ChannelError> {
         let applied = self.applier.apply(ch, verified, force).await;
-        let _ = self.store.record_apply(ch.id, applied.as_ref().err().map(String::as_str)).await;
+        let _ = self.store.record_apply(ch.id, applied.as_ref().map(String::as_str).map_err(String::as_str)).await;
         match applied {
             Ok(summary) => {
                 tracing::info!(channel = ch.id, %summary, "content channel applied");

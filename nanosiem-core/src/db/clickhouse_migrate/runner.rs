@@ -48,6 +48,30 @@ const DEFAULT_DISTRIBUTED_DDL_TIMEOUT_SECS: u64 = 900;
 /// that complete well inside the 180s default. Whitelisting the two
 /// known-safe forms is safer than maintaining a deny-list as ClickHouse
 /// grows new DDL grammar.
+/// The first line of a statement that is neither blank nor a `--` comment,
+/// bounded (e.g. `CREATE TABLE IF NOT EXISTS nanosiem.logs`). Names the
+/// failing statement without dragging its column list into the error.
+fn statement_head(sql: &str) -> &str {
+    let line = sql
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with("--"))
+        .unwrap_or("");
+    crate::text_bounds::prefix_at_most(line, 120)
+}
+
+/// NAN-6000: the error a failed init.sql statement returns. ClickHouse's
+/// reason is the part an operator needs, so it is never shortened, and only
+/// the statement's head precedes it. Before this, 120 bytes of the SQL (with
+/// its escaped newlines) came first and log viewers cut the reason off.
+fn init_statement_failure(sql: &str, error: &impl std::fmt::Display) -> String {
+    format!(
+        "Failed to execute init SQL `{}` - Error: {}",
+        statement_head(sql),
+        error
+    )
+}
+
 fn ensure_distributed_ddl_timeout(sql: &str) -> String {
     let sql_upper = sql.to_uppercase();
     if !sql_upper.contains(" ON CLUSTER ") {
@@ -683,11 +707,7 @@ impl ClickHouseMigrator {
                     } else {
                         return Err(self
                             .with_unreachable_replicas(ClickHouseMigrateError::ClickHouse(
-                                format!(
-                                    "Failed to execute init SQL: {} - Error: {}",
-                                    crate::text_bounds::prefix_at_most(&sql_stmt, 120),
-                                    e
-                                ),
+                                init_statement_failure(&sql_stmt, &e),
                             ))
                             .await);
                     }
@@ -1165,5 +1185,33 @@ mod tests {
         let out = ensure_distributed_ddl_timeout(sql);
         assert!(out.ends_with("distributed_ddl_task_timeout = 900"));
         assert!(!out.contains("; SETTINGS"));
+    }
+
+    #[test]
+    fn init_failure_names_the_statement_and_keeps_the_full_clickhouse_error() {
+        // NAN-6000: the reason a customer host failed (simdjson had no usable
+        // kernel) sat behind a long scope dump; none of it may be cut.
+        let sql = "-- Main log table\n\nCREATE TABLE IF NOT EXISTS nanosiem.logs\n(\n    `id` UUID DEFAULT generateUUIDv7() CODEC(ZSTD(3)),\n    `ext` JSON(max_dynamic_paths = 512) DEFAULT '{}'\n) ENGINE = MergeTree ORDER BY id";
+        let scope = "x".repeat(20_000);
+        let ch = format!(
+            "bad response: Code: 117. DB::Exception: Cannot parse JSON object here: {{}}: In scope SELECT {scope} (INCORRECT_DATA)"
+        );
+        let msg = init_statement_failure(sql, &ch);
+        assert!(
+            msg.starts_with("Failed to execute init SQL `CREATE TABLE IF NOT EXISTS nanosiem.logs` - Error: bad response: Code: 117."),
+            "{}",
+            &msg[..200]
+        );
+        assert!(msg.ends_with("(INCORRECT_DATA)"));
+        assert!(msg.contains(&scope));
+        assert!(!msg.contains("generateUUIDv7"), "column list must not precede the error");
+    }
+
+    #[test]
+    fn statement_head_is_bounded_and_skips_comments() {
+        assert_eq!(statement_head("\n  -- a\n  ALTER TABLE t ADD COLUMN c String\n"), "ALTER TABLE t ADD COLUMN c String");
+        assert_eq!(statement_head("-- only a comment"), "");
+        let long = format!("CREATE VIEW v AS SELECT {}", "é".repeat(200));
+        assert!(statement_head(&long).len() <= 120);
     }
 }

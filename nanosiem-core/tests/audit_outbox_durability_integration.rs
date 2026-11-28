@@ -44,11 +44,11 @@ async fn healthy_pool() -> DualPool {
     // Apply PG migrations (and enforce the destructive-test opt-in) first.
     common::migrated_pool().await;
     let mut config = DualPoolConfig::with_auth(
-        env("DATABASE_URL"),
-        env("NANOSIEM_TEST_CLICKHOUSE_URL"),
+        nanosiem_test_db::require_pg_url(),
+        nanosiem_test_db::require_ch_url(),
         "nanosiem",
-        env("NANOSIEM_TEST_CLICKHOUSE_USER"),
-        env("NANOSIEM_TEST_CLICKHOUSE_PASSWORD"),
+        nanosiem_test_db::ch_user().expect("CLICKHOUSE_TEST_USER must be set for this live suite"),
+        nanosiem_test_db::ch_password().unwrap_or_default(),
     );
     config.clickhouse_rawsql_password = Some(env("CLICKHOUSE_RAWSQL_PASSWORD"));
     config.clickhouse_rawsql_noaudit_password = Some(env("CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD"));
@@ -382,6 +382,7 @@ fn key_request(name: &str) -> CreateApiKeyRequest {
         permissions: vec!["audit:view".to_string()],
         expires_at: None,
         rate_limit: None,
+        preset: None,
     }
 }
 

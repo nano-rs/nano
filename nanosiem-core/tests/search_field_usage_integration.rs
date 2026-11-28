@@ -44,7 +44,7 @@ async fn history(pool: &PgPool, user: Uuid, query: &str, mode: &str, days_ago: i
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (DATABASE_URL); run with --ignored"]
+#[ignore = "requires a live Postgres (NANOSIEM_TEST_DATABASE_URL); run with --ignored"]
 async fn recent_is_per_user_and_popular_is_workspace_wide() {
     let pool = common::migrated_pool().await;
     let repo = SearchHistoryRepository::new(pool.clone());

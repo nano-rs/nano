@@ -124,7 +124,7 @@ pub struct DeveloperSettingsResponse {
     pub ai_monitoring_enabled: bool,
     /// Feed staleness monitoring (queries ClickHouse)
     pub feed_monitoring_enabled: bool,
-    /// Model catalog auto-sync scheduler (daily GitHub sync + deprecated model notifications)
+    /// Model catalog auto-sync scheduler (daily apply of the signed models.main content channel + deprecated model notifications)
     pub model_catalog_sync_scheduler_enabled: bool,
 }
 

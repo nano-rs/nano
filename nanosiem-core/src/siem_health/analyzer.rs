@@ -288,7 +288,7 @@ fn has_critical_insert_integrity(ii: &InsertIntegrityMetrics) -> bool {
 }
 
 // Simple heuristic scorers for fallback mode
-fn score_ingestion(m: &IngestionMetrics) -> i32 {
+pub(crate) fn score_ingestion(m: &IngestionMetrics) -> i32 {
     // NAN-1405: insert-path integrity first — these signals mean rows are
     // being discarded RIGHT NOW, regardless of what the 24h volume windows
     // show (during the first hours of a NAN-1404-style outage the 24h totals
@@ -451,7 +451,7 @@ fn stuck_async_flush_recommendation(ii: &InsertIntegrityMetrics) -> Option<Recom
 /// heuristic fallback path; the enterprise AI analyzer sees the same metrics
 /// JSON and produces its own. Each maps a signal to the diagnostic recipe
 /// proven during NAN-1404 (dict status → part_log → system.errors).
-fn insert_integrity_recommendations(ii: &InsertIntegrityMetrics) -> Vec<Recommendation> {
+pub(crate) fn insert_integrity_recommendations(ii: &InsertIntegrityMetrics) -> Vec<Recommendation> {
     let mut recs = Vec::new();
     if let Some(rec) = stuck_async_flush_recommendation(ii) {
         recs.push(rec);
@@ -882,6 +882,44 @@ pub fn ensure_backup_findings(
     }
 }
 
+/// Title of the NAN-5938 finding (stable: suppressions key on it).
+pub const BACKUP_REPORTS_REFUSED_TITLE: &str = "Backups run, but nano cannot see their results";
+
+/// NAN-5938: the backup service has run against this database (it created
+/// its `nano_backup` PostgreSQL role) but no status report was ever stored:
+/// nano-api refuses them (no `NANO_BACKUP_STATUS_TOKEN`). The
+/// Settings card and the stale-backup finding are then blind, whether backups
+/// succeed or fail. Happens when nano-api was not recreated after automatic
+/// backups were turned on.
+pub fn backup_report_recommendations(reports_refused: bool) -> Vec<Recommendation> {
+    if !reports_refused {
+        return Vec::new();
+    }
+    vec![Recommendation {
+        title: BACKUP_REPORTS_REFUSED_TITLE.to_string(),
+        description: "The automatic backup service on this host is making backups, but nano-api \
+             started before automatic backups were turned on, so it does not accept the \
+             service's status reports. Settings and SIEM Health cannot show whether backups \
+             succeed or fail. On the host, restart nano-api with the backup settings: \
+             `scripts/nano backup-schedule --configure` again (it restarts nano-api for you), \
+             or `docker compose up -d nano-api` with the same Compose files the install uses. \
+             The next backup then shows on the Last backup card."
+            .to_string(),
+        priority: "high".to_string(),
+    }]
+}
+
+/// NAN-5938: append the refused-reports finding (score capped like other
+/// high findings).
+pub fn ensure_backup_report_findings(analysis: &mut AnalysisResult, reports_refused: bool) {
+    for rec in backup_report_recommendations(reports_refused) {
+        analysis.overall_score = analysis.overall_score.min(79);
+        if !analysis.recommendations.iter().any(|r| r.title == rec.title) {
+            analysis.recommendations.insert(0, rec);
+        }
+    }
+}
+
 /// NAN-5032: surface log sources whose events are stored under a
 /// platform-owned source type. Deterministic; emitted on every report path
 /// (AI, fallback, Fresh), like the audit-durability findings.
@@ -1276,6 +1314,39 @@ fn failing_rule_recommendations(d: &DetectionMetrics) -> Vec<Recommendation> {
     }]
 }
 
+/// NAN-6012: key in a stored report's `metrics` JSON naming the dimensions
+/// that had no data to score. Read by the upgrade's SIEM Health gate
+/// (`scripts/nano-upgrade.py`), which must not treat "no data before, measured
+/// now" as a regression the upgrade caused.
+pub const NO_DATA_DIMENSIONS_KEY: &str = "no_data_dimensions";
+
+/// Parsing has nothing to measure: no source type has field coverage yet and
+/// no lowercase invariant violation was seen. [`score_parsing`] gives it a
+/// neutral score instead of a measured one.
+pub(crate) fn parsing_has_no_data(m: &ParsingMetrics) -> bool {
+    m.field_coverage.is_empty() && m.lowercase_invariant_violations.is_empty()
+}
+
+/// Enrichment has nothing to measure: no events in the last 24 hours.
+/// [`score_enrichment`] gives it a neutral score instead of a measured one.
+pub(crate) fn enrichment_has_no_data(m: &EnrichmentMetrics) -> bool {
+    m.total_events_24h == 0
+}
+
+/// NAN-6012: the dimensions whose score in this report is a neutral
+/// placeholder because there was no data to measure, by dimension name.
+/// Derived from the collected metrics, so it holds for AI-scored reports too.
+pub fn no_data_dimensions(metrics: &CollectedMetrics) -> Vec<&'static str> {
+    let mut names = Vec::new();
+    if parsing_has_no_data(&metrics.parsing) {
+        names.push("parsing");
+    }
+    if enrichment_has_no_data(&metrics.enrichment) {
+        names.push("enrichment");
+    }
+    names
+}
+
 fn score_parsing(m: &ParsingMetrics) -> i32 {
     // NAN-1643: active ingest-lowercase invariant drift means raw-compare
     // queries are silently missing rows RIGHT NOW — a hard drag on the score
@@ -1287,6 +1358,7 @@ fn score_parsing(m: &ParsingMetrics) -> i32 {
         30
     };
     if m.field_coverage.is_empty() {
+        // `parsing_has_no_data` is this branch with no invariant penalty.
         return (50 - invariant_penalty).clamp(0, 100);
     }
     let avg_coverage: f64 = m
@@ -1306,7 +1378,7 @@ fn score_parsing(m: &ParsingMetrics) -> i32 {
 }
 
 fn score_enrichment(m: &EnrichmentMetrics) -> i32 {
-    if m.total_events_24h == 0 {
+    if enrichment_has_no_data(m) {
         // No events yet — don't penalize an empty deployment.
         return 50;
     }
@@ -2033,6 +2105,38 @@ pub(crate) mod tests {
             "the rec must say rows keep landing: {}",
             rec.description
         );
+    }
+
+    /// NAN-6012: the no-data marker names exactly the dimensions that got a
+    /// neutral score, and a measured dimension (even one scoring 0) is not in it.
+    #[test]
+    fn no_data_dimensions_mark_neutral_scores_only() {
+        let mut m = base_zero_metrics_fixture();
+        assert_eq!(no_data_dimensions(&m), vec!["parsing", "enrichment"]);
+        assert_eq!(score_parsing(&m.parsing), 50);
+        assert_eq!(score_enrichment(&m.enrichment), 50);
+
+        // CT122: the first real json_generic traffic scores parsing 0.
+        m.parsing.field_coverage = vec![FieldCoverageMetric {
+            source_type: "json_generic".to_string(),
+            total_events: 472,
+            user_filled_pct: 0.0,
+            src_ip_filled_pct: 0.0,
+            message_filled_pct: 0.0,
+            event_type_filled_pct: 0.0,
+        }];
+        m.enrichment.total_events_24h = 43;
+        assert_eq!(score_parsing(&m.parsing), 0);
+        assert!(no_data_dimensions(&m).is_empty());
+
+        // Invariant drift with no coverage is measured, not neutral.
+        let mut drift = base_zero_metrics_fixture();
+        drift.parsing.lowercase_invariant_violations = vec![LowercaseInvariantViolation {
+            column: "src_ip".to_string(),
+            violation_count: 3,
+        }];
+        assert_eq!(score_parsing(&drift.parsing), 20);
+        assert_eq!(no_data_dimensions(&drift), vec!["enrichment"]);
     }
 
     /// NAN-1643: ingest-lowercase invariant drift must drag the parsing score

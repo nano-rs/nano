@@ -156,16 +156,30 @@ impl DualPoolConfig {
     /// - `PG_CONNECT_TIMEOUT`: PostgreSQL connection timeout in seconds (default: 30)
     /// - `CH_CONNECT_TIMEOUT`: ClickHouse connection timeout in seconds (default: 30)
     pub fn from_env() -> Result<Self, DualPoolError> {
-        let postgres_url = std::env::var("DATABASE_URL").map_err(|_| {
-            DualPoolError::ConfigError("DATABASE_URL environment variable is required".to_string())
-        })?;
-
         let clickhouse_url = std::env::var("CLICKHOUSE_URL").map_err(|_| {
             DualPoolError::ConfigError(
                 "CLICKHOUSE_URL environment variable is required".to_string(),
             )
         })?;
+        Self::from_env_with_clickhouse_url(clickhouse_url)
+    }
 
+    /// [`Self::from_env`] with the ClickHouse URL given by the caller instead
+    /// of read from `CLICKHOUSE_URL`. Tests use it so their own
+    /// `CLICKHOUSE_TEST_URL` wins over a `CLICKHOUSE_URL` the shell may export
+    /// for a developer's local stack (NAN-5964). `DATABASE_URL` is still required.
+    pub fn from_env_with_clickhouse_url(clickhouse_url: String) -> Result<Self, DualPoolError> {
+        let postgres_url = std::env::var("DATABASE_URL").map_err(|_| {
+            DualPoolError::ConfigError("DATABASE_URL environment variable is required".to_string())
+        })?;
+        Ok(Self::from_env_with_urls(postgres_url, clickhouse_url))
+    }
+
+    /// [`Self::from_env`] with both database URLs given by the caller; every
+    /// other setting still comes from the environment. Tests pass URLs from
+    /// the `nanosiem-test-db` helper, so `DATABASE_URL` / `CLICKHOUSE_URL`
+    /// exported for a developer's local stack are never read (NAN-5967).
+    pub fn from_env_with_urls(postgres_url: String, clickhouse_url: String) -> Self {
         let clickhouse_database =
             std::env::var("CLICKHOUSE_DATABASE").unwrap_or_else(|_| "nanosiem".to_string());
 
@@ -234,7 +248,7 @@ impl DualPoolConfig {
             .and_then(|s| s.parse().ok())
             .unwrap_or(true);
 
-        Ok(Self {
+        Self {
             postgres_url,
             clickhouse_url,
             clickhouse_database,
@@ -256,7 +270,7 @@ impl DualPoolConfig {
             pg_idle_timeout_secs,
             pg_max_lifetime_secs,
             pg_test_before_acquire,
-        })
+        }
     }
 
     /// Create configuration with explicit values (useful for testing)

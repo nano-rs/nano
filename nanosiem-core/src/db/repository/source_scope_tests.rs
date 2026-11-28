@@ -14,10 +14,8 @@
 
 use super::*;
 
-const DEFAULT_URL: &str = "postgres://nanosiem:nanosiem@localhost:5432/nanosiem";
-
 async fn pool() -> PgPool {
-    let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
+    let url = nanosiem_test_db::require_pg_url();
     let pool = PgPool::connect(&url)
         .await
         .unwrap_or_else(|e| panic!("connect to test Postgres at {url}: {e}"));

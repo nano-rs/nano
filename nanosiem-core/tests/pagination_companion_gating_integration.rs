@@ -42,9 +42,17 @@ async fn connect() -> Option<DualPool> {
         eprintln!("Skipping (SKIP_DB_TESTS set)");
         return None;
     }
+    // NAN-5964: no localhost default. Skip unless both URLs name a stack.
+    let (pg_url, ch_url) = match nanosiem_test_db::pg_and_ch_urls() {
+        Ok(urls) => urls,
+        Err(unset) => {
+            eprintln!("Skipping: {unset}");
+            return None;
+        }
+    };
     let config = DualPoolConfig::with_auth(
-        "postgres://nanosiem:nanosiem@localhost:5432/nanosiem",
-        "http://localhost:8123",
+        pg_url,
+        ch_url,
         "nanosiem",
         "nanosiem",
         "nanosiem",

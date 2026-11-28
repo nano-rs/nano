@@ -12,6 +12,16 @@ sees it:
 - `password=` / `password: ` values, quoted or not, become `<redacted>`;
 - `Authorization: Bearer|Basic|Splunk <token>` and `X-API-Key: <key>` values
   become `<redacted>`;
+- `Cookie:` / `Set-Cookie:` header values become `<redacted>`: the whole
+  quoted value in a JSON or dict repr, or every name=value pair up to the end
+  of the line in a raw header;
+- tokens nano issues become `<redacted>` by shape even when no registry
+  lists them: ingest tokens `nit_` (nanosiem-core/src/ingest_tokens/mod.rs
+  TOKEN_MARKER), Agent Lane tokens `nal_` (nanosiem-enterprise/src/agentlane/
+  token.rs TOKEN_PREFIX) and SCIM tokens `nscim_` (nanosiem-enterprise/src/
+  scim/token.rs TOKEN_PREFIX); plus `nsk_` (the API-key shape the e2e fixtures
+  and docs use) and Sentry auth tokens `sntrys_` / `sntryu_` (the e2e Sentry
+  lane's);
 - every known secret value becomes `<redacted>`: the same set the artifact
   guard scrubs (the process env, the run's 0600 registry, the run's
   compose.env and admin.env, and the C05 license file).
@@ -53,6 +63,35 @@ _AUTH_HEADER = re.compile(
     r"(?P<head>\bauthorization\\?[\"']?\s*[=:]\s*\\?[\"']?(?:bearer|basic|splunk)\s+)(?P<tok>[A-Za-z0-9._~+/=\-]+)", re.I
 )
 
+_COOKIE_HEADER = re.compile(
+    r"(?P<head>\b(?:set-)?cookie\\?[\"']?\s*:\s*)"
+    r"(?:(?P<bs>\\+)(?P<q>[\"'])(?:(?!\\+(?P=q)).)*\\+(?P=q)"
+    r"|(?P<q2>[\"'])(?:\\.|(?!(?P=q2))[^\\])*(?P=q2)"
+    r"|(?P<bare>[^\s\"'\\\[][^\r\n\"'\\]*))",
+    re.I,
+)
+# The array form of a header dict: "set-cookie": ["a=b", "c=d"].
+_COOKIE_ARRAY = re.compile(r"(?P<head>\b(?:set-)?cookie\\?[\"']?\s*:\s*)\[(?P<body>[^\]]*)\]", re.I)
+_QUOTED = re.compile(r"(?P<q>\\*[\"'])(?:\\.|(?!(?P=q))[^\\])*(?P=q)")
+# nano's own tokens use [A-Za-z0-9_-] only (ingest: Alphanumeric; Agent Lane:
+# typeid + alphanumeric secret; SCIM: base64url, no padding). Sentry tokens
+# carry standard base64 (+ / =), so theirs runs through the end of that set.
+_TOKEN_PREFIX = re.compile(r"\b(?:nit|nal|nscim|nsk)_[A-Za-z0-9_-]{12,}|\bsntry[su]_[A-Za-z0-9+/=_-]{12,}")
+
+
+def _cookie_array(m: re.Match[str]) -> str:
+    body = _QUOTED.sub(lambda q: f"{q.group('q')}{REDACTED}{q.group('q')}", m.group("body"))
+    return f"{m.group('head')}[{body}]"
+
+
+def _cookie(m: re.Match[str]) -> str:
+    if m.group("q") is not None:
+        quote = m.group("bs") + m.group("q")
+        return f"{m.group('head')}{quote}{REDACTED}{quote}"
+    if m.group("q2") is not None:
+        return f"{m.group('head')}{m.group('q2')}{REDACTED}{m.group('q2')}"
+    return m.group("head") + REDACTED
+
 
 def _strip_quotes(value: str) -> str:
     value = value.strip()
@@ -93,6 +132,9 @@ def redact_text(text: str, secrets: Iterable[str] = ()) -> str:
             text = text.replace(value, REDACTED)
     text = _URL_USERINFO.sub(lambda m: m.group("head") + REDACTED, text)
     text = _AUTH_HEADER.sub(lambda m: m.group("head") + REDACTED, text)
+    text = _COOKIE_ARRAY.sub(_cookie_array, text)
+    text = _COOKIE_HEADER.sub(_cookie, text)
+    text = _TOKEN_PREFIX.sub(REDACTED, text)
     return _KV_PASSWORD.sub(_kv, text)
 
 

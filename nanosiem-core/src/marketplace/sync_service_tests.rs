@@ -88,7 +88,7 @@ async fn run_sync_reparses_at_same_commit_only_when_the_version_changed() {
     // The parse/record logic is source-independent; drive it through the
     // local git repository (first-party URLs read content channels in
     // production, NAN-4955).
-    super::TEST_GIT_SOURCE.with(|f| f.set(true));
+    let _git = super::use_test_git_source();
     let pool = sqlx::postgres::PgPoolOptions::new()
         .acquire_timeout(std::time::Duration::from_millis(200))
         .connect_lazy("postgres://nobody@127.0.0.1:1/none")

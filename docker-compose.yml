@@ -474,7 +474,6 @@ services:
       - "127.0.0.1:8088:8088"
       - "127.0.0.1:4317:4317"
       - "127.0.0.1:4318:4318"
-      - "127.0.0.1:24224:24224"
 
   vector:
     # Pinned, not `latest-alpine`: a floating tag silently drifts local dev away
@@ -588,6 +587,8 @@ services:
       - no-new-privileges:true
     volumes:
       - ./clickhouse/config.d:/config.d
+      # NAN-6000: the preflight honors an allow_simdjson=0 drop-in here.
+      - ./clickhouse/users.d:/users.d:ro
       - ./clickhouse/preflight:/preflight:ro
     restart: "no"
 

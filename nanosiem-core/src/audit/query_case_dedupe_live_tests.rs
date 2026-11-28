@@ -25,13 +25,12 @@ use crate::audit::{AuditEvent, AuditSource};
 use serde_json::{json, Value};
 
 fn ch() -> clickhouse::Client {
-    let url = std::env::var("NANOSIEM_TEST_CLICKHOUSE_URL")
-        .expect("NANOSIEM_TEST_CLICKHOUSE_URL must target a disposable ClickHouse");
+    let url = nanosiem_test_db::require_ch_url();
     let mut client = crate::db::clickhouse_transport::client().with_url(url);
-    if let Ok(user) = std::env::var("NANOSIEM_TEST_CLICKHOUSE_USER") {
+    if let Some(user) = nanosiem_test_db::ch_user() {
         client = client.with_user(user);
     }
-    if let Ok(password) = std::env::var("NANOSIEM_TEST_CLICKHOUSE_PASSWORD") {
+    if let Some(password) = nanosiem_test_db::ch_password() {
         client = client.with_password(password);
     }
     client

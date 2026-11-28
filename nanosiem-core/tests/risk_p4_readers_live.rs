@@ -35,7 +35,7 @@ use nanosiem_core::risk::clickhouse_sql::{
 use nanosiem_core::risk::{RiskDecayConfig, RiskTimeWindow};
 
 fn ch_url() -> String {
-    std::env::var("CLICKHOUSE_TEST_URL").unwrap_or_else(|_| "http://localhost:8123".into())
+    nanosiem_test_db::require_ch_url()
 }
 
 fn ch_client() -> Client {
